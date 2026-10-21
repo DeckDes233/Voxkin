@@ -116,7 +116,7 @@
 
 - 消息入口 `respondFunc` 未 await `handleMessage`（`src/agent/agent.js:173`；socket 侧同样未 await，`src/agent/mindserver_proxy.js:64-70`）。
 - 全仓搜索 `AbortController`、`abortSignal` 无结果；没有 mutex/semaphore。
-- 因此“普通聊天被建造任务阻塞”的机制不是队列，而是回合内部的串行等待。
+- 因此「普通聊天被建造任务阻塞」发生在回合内部：消息入口本身没有排队，阻塞来自回合内对完整生成的串行等待。
 
 ### 6.2 实际存在的串行化/互斥点
 
