@@ -6,10 +6,10 @@ S0_STEPS: tuple[StepSpec, ...] = (
     StepSpec(
         "收集 3 个橡木",
         "collect_blocks",
-        {"block": "oak_log", "count": 3},
+        {"block": "oak_log", "count": 3, "range": 64},
         {"type": "inventory", "items": {"oak_log": 3}},
         retries=1,
-        timeout_s=90,
+        timeout_s=120,
     ),
     StepSpec(
         "合成木板",

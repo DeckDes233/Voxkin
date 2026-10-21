@@ -269,9 +269,12 @@ async function runAction(message) {
         message.tool
       )
     ) {
-      stopFollow();
-      wanderToken += 1;
-      wanderActive = false;
+      if (followSession) stopFollow();
+      if (wanderActive) {
+        wanderToken += 1;
+        wanderActive = false;
+        bot.pathfinder.stop();
+      }
     }
     let detail = '';
     switch (message.tool) {
@@ -342,7 +345,7 @@ async function runAction(message) {
         detail = await goTo(Number(args.x), Number(args.y), Number(args.z));
         break;
       case 'collect_blocks':
-        detail = await collectBlocks(String(args.block), Number(args.count || 1));
+        detail = await collectBlocks(String(args.block), Number(args.count || 1), Number(args.range) || 32);
         break;
       case 'break_block':
         detail = await breakBlock(args);
@@ -456,25 +459,29 @@ async function goTo(x, y, z) {
 }
 
 async function collectDrops(range = 6) {
-  for (let index = 0; index < 8; index += 1) {
-    const item = bot.nearestEntity(
-      (entity) =>
-        entity.type === 'item' &&
-        entity.position.distanceTo(bot.entity.position) <= range
-    );
-    if (!item) break;
-    try {
-      await bot.pathfinder.goto(
-        new goals.GoalNear(item.position.x, item.position.y, item.position.z, 1)
+  for (let pass = 0; pass < 2; pass += 1) {
+    for (let index = 0; index < 8; index += 1) {
+      const item = bot.nearestEntity(
+        (entity) =>
+          entity.type === 'item' &&
+          entity.position.distanceTo(bot.entity.position) <= range
       );
-    } catch {
-      break;
+      if (!item) break;
+      try {
+        await bot.pathfinder.goto(
+          new goals.GoalNear(item.position.x, item.position.y, item.position.z, 1)
+        );
+      } catch {
+        break;
+      }
+      await sleep(600);
     }
-    await sleep(200);
+    await sleep(300);
   }
 }
 
-async function collectBlocks(blockName, count) {
+async function collectBlocks(blockName, count, range = 32) {
+  const radius = Math.min(Math.max(Number(range) || 32, 8), 64);
   const blockIds = bot.registry.blocksByName[blockName];
   if (!blockIds) throw new Error(`未知方块 ${blockName}`);
   const owned = countItem(blockName);
@@ -484,10 +491,10 @@ async function collectBlocks(blockName, count) {
   }
   const positions = bot.findBlocks({
     matching: blockIds.id,
-    maxDistance: 32,
+    maxDistance: radius,
     count: need,
   });
-  if (positions.length === 0) throw new Error(`附近 32 格内没有 ${blockLabel(blockName)}`);
+  if (positions.length === 0) throw new Error(`附近 ${radius} 格内没有 ${blockLabel(blockName)}`);
   let collected = 0;
   for (const position of positions) {
     if (interrupted) throw new Error('被新的指令打断');
@@ -669,7 +676,9 @@ async function craftItem(args) {
     throw new Error(`没有 ${blockLabel(name)} 的配方或材料不够`);
   }
   const before = countItem(name);
-  await bot.craft(recipes[0], count, table);
+  const yieldCount = Math.max(1, Number(recipes[0].result?.count) || 1);
+  const operations = Math.max(1, Math.ceil(count / yieldCount));
+  await bot.craft(recipes[0], operations, table);
   const after = countItem(name);
   if (placed && table) {
     try {
@@ -1945,6 +1954,11 @@ function createBot() {
   bot.once('spawn', () => {
     log('已进入世界');
     const movements = new Movements(bot);
+    const originalStop = bot.pathfinder.stop.bind(bot.pathfinder);
+    bot.pathfinder.stop = (...args) => {
+      log('pathfinder.stop', currentTool || 'none');
+      return originalStop(...args);
+    };
     movements.canDig = true;
     movements.allow1by1towers = true;
     movements.allowParkour = true;

@@ -7,12 +7,18 @@ MINECRAFT_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "collect_blocks",
-            "description": "走到附近的方块并挖掘指定数量，返回实际挖到的数量。",
+            "description": "走到附近的方块并挖掘指定数量，返回实际挖到的数量；可以指定搜索半径。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "block": {"type": "string", "description": "方块 ID，例如 dirt、oak_log、stone"},
                     "count": {"type": "integer", "description": "需要挖掘的数量", "minimum": 1},
+                    "range": {
+                        "type": "number",
+                        "description": "搜索半径，默认 32 格，最大 64",
+                        "minimum": 8,
+                        "maximum": 64,
+                    },
                 },
                 "required": ["block", "count"],
             },
