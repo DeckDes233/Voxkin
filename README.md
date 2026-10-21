@@ -54,7 +54,7 @@ API Key 只从环境变量 `DEEPSEEK_API_KEY` 或 `config/local.yaml` 读取，�
 llm:
   base_url: "https://opencode.ai/inference/go/openai/v1"
   model: "deepseek-v4.1-flash"
-  api_key: "oc_sk_..."
+  api_key: "<你的密钥>"
   headers:
     x-opencode-session: "voxkin-deepseek-chan-01"
 ```
