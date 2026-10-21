@@ -177,7 +177,7 @@ async function runAction(message) {
   lastActivity = Date.now();
   try {
     if (
-      ['goto', 'come_to_player', 'collect_blocks', 'attack_nearest', 'stop', 'break_block', 'place_block', 'goto_block', 'pickup_items'].includes(
+      ['goto', 'come_to_player', 'collect_blocks', 'attack_nearest', 'stop', 'break_block', 'place_block', 'goto_block', 'pickup_items', 'craft'].includes(
         message.tool
       )
     ) {
@@ -255,6 +255,9 @@ async function runAction(message) {
         break;
       case 'pickup_items':
         detail = await pickupItems(args);
+        break;
+      case 'craft':
+        detail = await craftItem(args);
         break;
       case 'look_at_player': {
         const player = bot.players[args.player];
@@ -451,6 +454,82 @@ async function pickupItems(args) {
     new goals.GoalNear(item.position.x, item.position.y, item.position.z, 1)
   );
   return '走到了掉落物旁边';
+}
+
+function countItem(name) {
+  return bot.inventory
+    .items()
+    .filter((item) => item.name === name)
+    .reduce((total, item) => total + item.count, 0);
+}
+
+function nearbyBlock(name, range) {
+  const block = bot.registry.blocksByName[name];
+  if (!block) return null;
+  return bot.findBlock({ matching: block.id, maxDistance: range });
+}
+
+async function placeCraftingTable() {
+  const base = bot.entity.position;
+  const offsets = [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+    [1, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+  ];
+  for (const [dx, dz] of offsets) {
+    const x = Math.floor(base.x) + dx;
+    const z = Math.floor(base.z) + dz;
+    for (let dy = 1; dy >= -2; dy -= 1) {
+      const ground = bot.blockAt(vec(x, Math.floor(base.y) + dy, z));
+      if (!ground || ground.boundingBox !== 'block') continue;
+      const above = bot.blockAt(ground.position.offset(0, 1, 0));
+      const above2 = bot.blockAt(ground.position.offset(0, 2, 0));
+      if (above?.boundingBox === 'empty' && above2?.boundingBox === 'empty') {
+        const target = above.position;
+        await placeBlock({ block: 'crafting_table', x: target.x, y: target.y, z: target.z });
+        return bot.blockAt(target);
+      }
+    }
+  }
+  throw new Error('附近没有地方放工作台');
+}
+
+async function craftItem(args) {
+  const name = String(args.item || '');
+  const count = Math.max(1, Math.min(Number(args.count) || 1, 64));
+  const item = bot.registry.itemsByName[name];
+  if (!item) throw new Error(`未知物品 ${name}`);
+  let table = null;
+  let placed = false;
+  let recipes = bot.recipesFor(item.id, null, count, null);
+  if (recipes.length === 0) {
+    table = nearbyBlock('crafting_table', 4);
+    if (!table) {
+      table = await placeCraftingTable();
+      placed = true;
+    }
+    recipes = bot.recipesFor(item.id, null, count, table);
+  }
+  if (recipes.length === 0) {
+    throw new Error(`没有 ${blockLabel(name)} 的配方或材料不够`);
+  }
+  const before = countItem(name);
+  await bot.craft(recipes[0], count, table);
+  const after = countItem(name);
+  if (placed && table) {
+    try {
+      await bot.dig(table);
+      await sleep(300);
+    } catch (error) {
+      log('回收工作台失败', error.message);
+    }
+  }
+  return `合成 ${after - before} 个 ${blockLabel(name)}`;
 }
 
 async function approach(target) {
