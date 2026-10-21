@@ -47,6 +47,10 @@ async def completions(request: web.Request) -> web.StreamResponse:
     await response.prepare(request)
     delay = request.app["delay_ms"] / 1000.0
     text = request.app["reply"]
+    messages = body.get("messages") or []
+    wants_action = bool(messages) and "ACTION" in str(messages[-1].get("content", ""))
+    if wants_action:
+        text = "我先去砍点木头。"
     chunk_size = 2
     for index in range(0, len(text), chunk_size):
         payload = {
@@ -56,6 +60,29 @@ async def completions(request: web.Request) -> web.StreamResponse:
             await response.write(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
         except ConnectionResetError:
             return response
+        await asyncio.sleep(delay)
+    if wants_action:
+        call = {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_dev_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "collect_blocks",
+                                    "arguments": json.dumps({"block": "oak_log", "count": 3}),
+                                },
+                            }
+                        ]
+                    },
+                    "index": 0,
+                }
+            ]
+        }
+        await response.write(f"data: {json.dumps(call, ensure_ascii=False)}\n\n".encode())
         await asyncio.sleep(delay)
     await response.write(b"data: [DONE]\n\n")
     await response.write_eof()

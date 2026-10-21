@@ -125,6 +125,46 @@ async def test_bridge_chat_triggers_turn(stack):
     assert finished["summary"]["first_audible_ms"] is not None
 
 
+async def test_action_runs_while_speech_completes(stack):
+    harness, client = stack
+    ws = await client.ws_connect("/ws/bridge?name=test")
+    await ws.receive_json()
+
+    async def answer_actions() -> None:
+        while True:
+            message = await ws.receive_json()
+            if message.get("type") == "action":
+                await ws.send_json(
+                    {
+                        "type": "action_result",
+                        "action_id": message["action_id"],
+                        "ok": True,
+                        "detail": "collected 3 oak_log",
+                    }
+                )
+
+    responder = asyncio.create_task(answer_actions())
+    events = harness.hub.subscribe()
+    try:
+        summary = await harness.pipeline.respond("ACTION 去砍三块木头")
+        finished = None
+        for _ in range(40):
+            event = await asyncio.wait_for(events.get(), timeout=2)
+            if event.get("type") == "action_finished":
+                finished = event
+                break
+    finally:
+        harness.hub.unsubscribe(events)
+        responder.cancel()
+        await ws.close()
+    assert summary["first_audible_ms"] is not None
+    assert summary["meta"]["tool_calls"] == 1
+    assert "t7_action_start" in summary["marks"]
+    assert finished is not None
+    assert finished["tool"] == "collect_blocks"
+    assert finished["detail"] == "collected 3 oak_log"
+
+
 async def test_second_bridge_is_rejected(stack):
     harness, client = stack
     first = await client.ws_connect("/ws/bridge?name=first")
