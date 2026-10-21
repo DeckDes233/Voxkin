@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from voxkin.agent.actions import ActionDispatcher
+from voxkin.agent.run_manager import RunManager
+from voxkin.agent.tasks import TaskStore
 from voxkin.audio.sinks import AudioSink, build_sink
 from voxkin.audio.capture import Microphone
 from voxkin.config import VoxkinConfig
@@ -61,6 +63,7 @@ class Runtime:
     pipeline: ConversationPipeline
     supervisor: ServiceSupervisor
     memory: MemoryStore | None = None
+    run_manager: RunManager | None = None
     voice_loop: VoiceLoop | None = None
     voice_task: asyncio.Task | None = None
     mic_state: str = "stopped"
@@ -116,6 +119,14 @@ class Runtime:
 
         pipeline.set_action_handler(handle_action)
         pipeline.set_state_provider(dispatcher.state_snapshot)
+        task_store = TaskStore(Path("data") / "tasks.db")
+        task_store.initialize()
+        run_manager = RunManager(
+            dispatch=dispatcher.dispatch,
+            state_provider=dispatcher.state_snapshot,
+            announce=pipeline.announce,
+            store=task_store,
+        )
         supervisor = ServiceSupervisor(Path("logs") / "services")
         if config.tts.manage_service:
             supervisor.register(
@@ -139,6 +150,7 @@ class Runtime:
             pipeline=pipeline,
             supervisor=supervisor,
             memory=store,
+            run_manager=run_manager,
         )
         return runtime
 
@@ -242,6 +254,8 @@ class Runtime:
     async def close(self) -> None:
         try:
             await self.stop_mic()
+            if self.run_manager is not None:
+                await self.run_manager.close()
             await self.pipeline.close()
         finally:
             await self.supervisor.close()

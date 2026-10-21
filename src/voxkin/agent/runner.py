@@ -97,6 +97,7 @@ class TaskRunner:
         self._paused = False
         self._cancelled = False
         self.cursor = 0
+        self.task_id: int | None = None
 
     def pause(self) -> None:
         self._paused = True
@@ -119,6 +120,7 @@ class TaskRunner:
         from_checkpoint: bool = True,
     ) -> RunResult:
         task = self._store.get_task(task_id) if task_id is not None else self._store.create_task(objective)
+        self.task_id = task.id
         start = self._store.resume_cursor(task.id) if from_checkpoint else 0
         self.cursor = start
         self._store.set_status(task.id, "active")
