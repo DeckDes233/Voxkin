@@ -17,6 +17,8 @@
 
 当前版本在本机完成了完整闭环：玩家在游戏里说一句话，沃心在 1 到 4 秒内开始说话，同时决定并执行游戏动作，动作结果会在完成后播报。
 
+> **最终里程碑**：沃心独立通关 Minecraft 一次，全流程，玩家只负责旁观。定义见 [最终里程碑](docs/MILESTONE.md)，阶段计划见 [独立通关路线图](docs/plans/INDEPENDENT_RUN_ROADMAP.md)。
+
 > 第一次接触这个项目，建议先读 [小白版说明](docs/GETTING_STARTED_CN.md)。<br>
 > English documentation: [README.en.md](README.en.md).
 
