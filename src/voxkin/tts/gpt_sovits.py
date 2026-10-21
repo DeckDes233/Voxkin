@@ -56,12 +56,14 @@ class GPTSoVITSClient:
     def describe(self) -> dict[str, Any]:
         return {
             "engine": "gpt_sovits",
+            "character": self.config.character,
             "base_url": self.base_url,
             "reference_audio": self.config.reference_audio,
             "text_lang": self.config.text_lang,
             "prompt_lang": self.config.prompt_lang,
             "sample_rate": self.sample_rate,
             "capability": self.capability,
+            "loaded": self._session is not None and not self._session.closed,
             "adapter_ready": self._session is not None,
         }
 
