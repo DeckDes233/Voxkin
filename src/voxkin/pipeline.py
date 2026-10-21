@@ -71,6 +71,10 @@ class ConversationPipeline:
     def is_speaking(self) -> bool:
         return self._active_turn is not None
 
+    @property
+    def is_audible(self) -> bool:
+        return self.is_speaking or self.sink.is_playing()
+
     async def start(self) -> None:
         if self._started:
             return

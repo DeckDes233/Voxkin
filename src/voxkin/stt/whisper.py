@@ -44,6 +44,7 @@ class WhisperSTT:
             self.config.model,
             device=self.config.device,
             compute_type=self.config.compute_type,
+            local_files_only=self.config.local_files_only,
         )
         self.load_seconds = round(time.perf_counter() - started, 3)
 
