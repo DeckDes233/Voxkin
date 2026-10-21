@@ -60,6 +60,78 @@ function blockLabel(name) {
   return BLOCK_NAMES[name] || name;
 }
 
+const ITEM_SUFFIX_LABELS = [
+  ['_helmet', '头盔'],
+  ['_chestplate', '胸甲'],
+  ['_leggings', '护腿'],
+  ['_boots', '靴子'],
+  ['_sword', '剑'],
+  ['_pickaxe', '镐'],
+  ['_shovel', '锹'],
+  ['_axe', '斧'],
+];
+
+const MATERIAL_LABELS = {
+  wooden: '木',
+  stone: '石',
+  iron: '铁',
+  golden: '金',
+  diamond: '钻石',
+  netherite: '下界合金',
+  leather: '皮革',
+  chainmail: '锁链',
+  turtle: '海龟',
+};
+
+const ITEM_NAMES = {
+  bread: '面包',
+  apple: '苹果',
+  golden_apple: '金苹果',
+  enchanted_golden_apple: '附魔金苹果',
+  golden_carrot: '金胡萝卜',
+  carrot: '胡萝卜',
+  baked_potato: '烤土豆',
+  potato: '土豆',
+  cooked_beef: '熟牛肉',
+  beef: '生牛肉',
+  cooked_porkchop: '熟猪排',
+  porkchop: '生猪排',
+  cooked_chicken: '熟鸡肉',
+  chicken: '生鸡肉',
+  cooked_mutton: '熟羊肉',
+  mutton: '生羊肉',
+  cooked_cod: '熟鳕鱼',
+  cod: '生鳕鱼',
+  cooked_salmon: '熟鲑鱼',
+  salmon: '生鲑鱼',
+  cookie: '曲奇',
+  melon_slice: '西瓜片',
+  sweet_berries: '甜浆果',
+  glow_berries: '发光浆果',
+  dried_kelp: '干海带',
+  pumpkin_pie: '南瓜派',
+  mushroom_stew: '蘑菇煲',
+  beetroot_soup: '甜菜汤',
+  rabbit_stew: '兔肉煲',
+  rotten_flesh: '腐肉',
+  spider_eye: '蜘蛛眼',
+  chorus_fruit: '紫颂果',
+  honey_bottle: '蜂蜜瓶',
+};
+
+function itemLabel(name) {
+  const text = String(name || '');
+  const base = blockLabel(text);
+  if (base !== text) return base;
+  if (ITEM_NAMES[text]) return ITEM_NAMES[text];
+  for (const [suffix, label] of ITEM_SUFFIX_LABELS) {
+    if (!text.endsWith(suffix)) continue;
+    const material = MATERIAL_LABELS[text.slice(0, -suffix.length)];
+    if (material) return `${material}${label}`;
+  }
+  return text;
+}
+
 let socket = null;
 let bot = null;
 let reconnectTimer = null;
@@ -177,7 +249,7 @@ async function runAction(message) {
   lastActivity = Date.now();
   try {
     if (
-      ['goto', 'come_to_player', 'collect_blocks', 'attack_nearest', 'stop', 'break_block', 'place_block', 'goto_block', 'pickup_items', 'craft'].includes(
+      ['goto', 'come_to_player', 'collect_blocks', 'attack_nearest', 'stop', 'break_block', 'place_block', 'goto_block', 'pickup_items', 'craft', 'eat', 'sleep'].includes(
         message.tool
       )
     ) {
@@ -220,6 +292,12 @@ async function runAction(message) {
           : '背包是空的';
         break;
       }
+      case 'observe':
+        detail = observeSurroundings(args);
+        break;
+      case 'eat':
+        detail = await eatFood(args);
+        break;
       case 'attack_nearest': {
         const range = Math.min(Math.max(Number(args.range) || 16, 3), 32);
         const target = findHostile(range);
@@ -253,6 +331,12 @@ async function runAction(message) {
       case 'goto_block':
         detail = await gotoBlock(args);
         break;
+      case 'locate_block':
+        detail = locateBlock(args);
+        break;
+      case 'locate_entity':
+        detail = locateEntity(args);
+        break;
       case 'pickup_items':
         detail = await pickupItems(args);
         break;
@@ -266,6 +350,9 @@ async function runAction(message) {
         detail = '已看向玩家';
         break;
       }
+      case 'sleep':
+        detail = await sleepInBed();
+        break;
       default:
         throw new Error(`未知动作 ${message.tool}`);
     }
@@ -530,6 +617,471 @@ async function craftItem(args) {
     }
   }
   return `合成 ${after - before} 个 ${blockLabel(name)}`;
+}
+
+const GOLDEN_FOODS = new Set(['golden_apple', 'enchanted_golden_apple']);
+
+function numberText(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '未知';
+  return Number.isInteger(number) ? String(number) : number.toFixed(1);
+}
+
+function foodInfo(name) {
+  const foods = bot && bot.registry ? bot.registry.foodsByName : null;
+  if (!foods) return null;
+  const info = foods[name];
+  if (!info || !(info.foodPoints > 0)) return null;
+  return info;
+}
+
+function findFoodForEating() {
+  const candidates = bot.inventory
+    .items()
+    .filter((item) => !GOLDEN_FOODS.has(item.name) && foodInfo(item.name));
+  candidates.sort((left, right) => {
+    const leftInfo = foodInfo(left.name);
+    const rightInfo = foodInfo(right.name);
+    return (
+      (rightInfo.effectiveQuality || rightInfo.foodPoints) -
+      (leftInfo.effectiveQuality || leftInfo.foodPoints)
+    );
+  });
+  return candidates[0] || null;
+}
+
+async function eatFood(args) {
+  const requested = String(args.item || '').trim();
+  const count = Math.min(Math.max(Math.trunc(Number(args.count)) || 1, 1), 16);
+  const startFood = Number(bot.food ?? 20);
+  if (startFood >= 20) {
+    throw new Error('现在不饿，饥饿值已经满了，先不吃东西');
+  }
+  let targetName;
+  if (requested) {
+    if (!foodInfo(requested)) throw new Error(`${itemLabel(requested)}不是能吃的食物`);
+    const found = bot.inventory.items().find((item) => item.name === requested);
+    if (!found) throw new Error(`背包里没有${itemLabel(requested)}`);
+    targetName = requested;
+  } else {
+    const food = findFoodForEating();
+    if (!food) throw new Error('背包里没有能吃的食物');
+    targetName = food.name;
+  }
+  const startHealth = Number(bot.health ?? 20);
+  const startCount = countItem(targetName);
+  let eaten = 0;
+  let stoppedBecause = '';
+  for (let index = 0; index < count; index += 1) {
+    if (interrupted) throw new Error('被新的指令打断');
+    if (Number(bot.food ?? 20) >= 20) {
+      stoppedBecause = 'full';
+      break;
+    }
+    const item = bot.inventory.items().find((entry) => entry.name === targetName);
+    if (!item) {
+      stoppedBecause = 'empty';
+      break;
+    }
+    const beforeCount = countItem(targetName);
+    const beforeFood = Number(bot.food ?? 20);
+    const beforeHealth = Number(bot.health ?? 20);
+    try {
+      await bot.equip(item, 'hand');
+      await bot.consume();
+    } catch (error) {
+      if (/food is full/i.test(error.message)) {
+        stoppedBecause = 'full';
+        break;
+      }
+      throw new Error(`吃${itemLabel(targetName)}失败：${error.message}`);
+    }
+    let verified = false;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      if (
+        countItem(targetName) < beforeCount ||
+        Number(bot.food ?? 20) > beforeFood ||
+        Number(bot.health ?? 20) > beforeHealth
+      ) {
+        verified = true;
+        break;
+      }
+      await sleep(100);
+    }
+    if (!verified) {
+      throw new Error(`吃了${itemLabel(targetName)}，但没有检测到数量、饥饿或血量变化`);
+    }
+    eaten += 1;
+  }
+  if (eaten === 0) {
+    if (stoppedBecause === 'full') throw new Error('还没吃就饱了，没有消耗食物');
+    throw new Error(`背包里没有${itemLabel(targetName)}了，没能吃成`);
+  }
+  const endFood = Number(bot.food ?? 20);
+  const endHealth = Number(bot.health ?? 20);
+  const endCount = countItem(targetName);
+  const parts = [`吃了 ${eaten} 个${itemLabel(targetName)}`];
+  if (endFood !== startFood) parts.push(`饥饿值从 ${startFood} 变成 ${endFood}`);
+  else if (endCount !== startCount) parts.push(`背包里还剩 ${endCount} 个`);
+  if (endHealth !== startHealth) parts.push(`血量从 ${startHealth} 变成 ${endHealth}`);
+  if (eaten < count) {
+    parts.push(stoppedBecause === 'full' || endFood >= 20 ? '已经吃饱了' : '背包里的份数不够');
+  }
+  return parts.join('，');
+}
+
+const FACING_LABELS = ['南', '西南', '西', '西北', '北', '东北', '东', '东南'];
+
+function facingLabel(yaw) {
+  const degrees = ((((Number(yaw) * 180) / Math.PI) % 360) + 360) % 360;
+  return FACING_LABELS[Math.round(degrees / 45) % 8];
+}
+
+function dimensionLabel(dimension) {
+  const text = String(dimension || '').toLowerCase();
+  if (text.includes('nether')) return '下界';
+  if (text.includes('end')) return '末地';
+  if (text.includes('overworld')) return '主世界';
+  return text || '未知维度';
+}
+
+function clockLabel(timeOfDay) {
+  const ticks = (((Number(timeOfDay) || 0) % 24000) + 24000) % 24000;
+  const hours = (Math.floor(ticks / 1000) + 6) % 24;
+  const minutes = Math.floor(((ticks % 1000) / 1000) * 60);
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+}
+
+function weatherLabel() {
+  if (Number(bot.thunderState || 0) > 0) return '雷雨';
+  if (Number(bot.rainState || 0) > 0) return '下雨';
+  return '晴';
+}
+
+function playerNameOf(entity) {
+  const entry = Object.values(bot.players).find((player) => player.entity === entity);
+  if (entry && entry.username) return entry.username;
+  return entity.username || entity.name || '玩家';
+}
+
+function armorSummary() {
+  const names = [5, 6, 7, 8]
+    .map((slot) => bot.inventory.slots[slot])
+    .filter(Boolean)
+    .map((item) => itemLabel(item.name));
+  return names.length > 0 ? names.join('、') : '没有穿护甲';
+}
+
+function nearbyPlayers(radius, limit = 4) {
+  const origin = bot.entity.position;
+  return Object.values(bot.entities)
+    .filter((entity) => entity !== bot.entity && entity.type === 'player' && entity.position)
+    .map((entity) => ({
+      name: playerNameOf(entity),
+      distance: entity.position.distanceTo(origin),
+    }))
+    .filter((entry) => entry.distance <= radius)
+    .sort((left, right) => left.distance - right.distance)
+    .slice(0, limit);
+}
+
+function nearbyHostiles(radius, limit = 4) {
+  const origin = bot.entity.position;
+  return Object.values(bot.entities)
+    .filter(
+      (entity) =>
+        entity !== bot.entity &&
+        entity.position &&
+        HOSTILE_MOBS.has(entity.name) &&
+        (entity.type === 'hostile' || entity.type === 'mob')
+    )
+    .map((entity) => ({
+      name: blockLabel(entity.name),
+      distance: entity.position.distanceTo(origin),
+    }))
+    .filter((entry) => entry.distance <= radius)
+    .sort((left, right) => left.distance - right.distance)
+    .slice(0, limit);
+}
+
+function observeSurroundings(args) {
+  const radius = Math.min(Math.max(Number(args.radius) || 16, 1), 64);
+  const position = bot.entity.position;
+  const parts = [];
+  parts.push(
+    `我在${dimensionLabel(bot.game.dimension)} (${Math.floor(position.x)}, ${Math.floor(
+      position.y
+    )}, ${Math.floor(position.z)})，面向${facingLabel(bot.entity.yaw)}`
+  );
+  parts.push(`血量 ${numberText(bot.health)}/20，饥饿 ${numberText(bot.food)}/20`);
+  parts.push(
+    `第 ${bot.time.day ?? '?'} 天 ${clockLabel(bot.time.timeOfDay)}，${
+      bot.time.isDay ? '白天' : '夜晚'
+    }，${weatherLabel()}`
+  );
+  parts.push(`手持${bot.heldItem ? itemLabel(bot.heldItem.name) : '空手'}`);
+  parts.push(`护甲：${armorSummary()}`);
+  const items = bot.inventory.items();
+  const inventoryText = items
+    .slice(0, 8)
+    .map((item) => `${itemLabel(item.name)} x${item.count}`)
+    .join('、');
+  parts.push(
+    items.length > 0
+      ? `背包：${inventoryText}${items.length > 8 ? ` 等 ${items.length} 种` : ''}`
+      : '背包是空的'
+  );
+  const players = nearbyPlayers(radius);
+  parts.push(
+    players.length > 0
+      ? `附近玩家：${players
+          .map((entry) => `${entry.name} ${entry.distance.toFixed(1)} 格`)
+          .join('、')}`
+      : '附近没有玩家'
+  );
+  const hostiles = nearbyHostiles(radius);
+  parts.push(
+    hostiles.length > 0
+      ? `敌对生物：${hostiles
+          .map((entry) => `${entry.name} ${entry.distance.toFixed(1)} 格`)
+          .join('、')}`
+      : '附近没有敌对生物'
+  );
+  const filter = String(args.block || '').trim();
+  if (filter) {
+    const block = bot.registry.blocksByName[filter];
+    if (!block) throw new Error(`未知方块 ${filter}`);
+    const positions = bot.findBlocks({ matching: block.id, maxDistance: radius, count: 3 });
+    parts.push(
+      positions.length > 0
+        ? `附近${blockLabel(filter)}：${positions
+            .map((entry) => `(${entry.x}, ${entry.y}, ${entry.z})`)
+            .join('、')}`
+        : `附近没有${blockLabel(filter)}`
+    );
+  }
+  return parts.join('；');
+}
+
+function signedDistance(value) {
+  const rounded = Math.round(Number(value) * 10) / 10;
+  if (rounded === 0) return '0';
+  return `${rounded > 0 ? '+' : ''}${rounded}`;
+}
+
+function locateBlock(args) {
+  const name = String(args.block || '').trim();
+  if (!name) throw new Error('需要方块 ID');
+  const block = bot.registry.blocksByName[name];
+  if (!block) throw new Error(`未知方块 ${name}`);
+  const radius = Math.min(Math.max(Number(args.radius) || 32, 1), 64);
+  const limit = Math.min(Math.max(Math.trunc(Number(args.limit)) || 5, 1), 16);
+  const positions = bot.findBlocks({ matching: block.id, maxDistance: radius, count: limit });
+  if (positions.length === 0) {
+    throw new Error(`附近 ${radius} 格内没有${blockLabel(name)}`);
+  }
+  const origin = bot.entity.position;
+  const candidates = positions
+    .map((position) => ({
+      position,
+      distance: position.distanceTo(origin),
+      vertical: position.y - origin.y,
+    }))
+    .sort((left, right) => left.distance - right.distance);
+  const nearest = candidates[0];
+  const nearestText = `最近的是 (${nearest.position.x}, ${nearest.position.y}, ${
+    nearest.position.z
+  })，距离 ${nearest.distance.toFixed(1)} 格，垂直差 ${signedDistance(nearest.vertical)}`;
+  const others = candidates
+    .slice(1)
+    .map(
+      (entry) =>
+        `(${entry.position.x}, ${entry.position.y}, ${entry.position.z}) 距离 ${entry.distance.toFixed(
+          1
+        )} 格，垂直差 ${signedDistance(entry.vertical)}`
+    )
+    .join('；');
+  return `找到 ${candidates.length} 个${blockLabel(name)}，${nearestText}${
+    others ? `；还有 ${others}` : ''
+  }`;
+}
+
+const ENTITY_TYPE_LABELS = {
+  player: '玩家',
+  mob: '生物',
+  animal: '动物',
+  hostile: '敌对生物',
+  item: '掉落物',
+  object: '物体',
+  projectile: '投掷物',
+  vehicle: '载具',
+};
+
+function entityMatches(entity, type, name) {
+  if (type) {
+    const wanted = type.toLowerCase();
+    const rawType = String(entity.type || '').toLowerCase();
+    const entityName = String(entity.name || '').toLowerCase();
+    const username = entity.type === 'player' ? playerNameOf(entity).toLowerCase() : '';
+    const matched =
+      rawType === wanted ||
+      entityName === wanted ||
+      username === wanted ||
+      (wanted === 'hostile' && HOSTILE_MOBS.has(entity.name));
+    if (!matched) return false;
+  }
+  if (name) {
+    const wanted = name.toLowerCase();
+    const names = [entity.name, entity.username];
+    if (entity.type === 'player') names.push(playerNameOf(entity));
+    if (
+      !names.filter(Boolean).some((entry) => String(entry).toLowerCase() === wanted)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function entityTypeLabel(entity) {
+  if (entity.type === 'player') return '玩家';
+  if (HOSTILE_MOBS.has(entity.name)) return '敌对生物';
+  return ENTITY_TYPE_LABELS[entity.type] || entity.type || '实体';
+}
+
+function entityDisplayName(entity) {
+  if (entity.type === 'player') return playerNameOf(entity);
+  return blockLabel(String(entity.name || entity.displayName || entity.type || '实体'));
+}
+
+function locateEntity(args) {
+  const type = String(args.type || '').trim();
+  const name = String(args.name || '').trim();
+  const radius = Math.min(Math.max(Number(args.radius) || 32, 1), 64);
+  const limit = Math.min(Math.max(Math.trunc(Number(args.limit)) || 5, 1), 16);
+  const origin = bot.entity.position;
+  const results = Object.values(bot.entities)
+    .filter((entity) => entity !== bot.entity && entity.position)
+    .filter((entity) => entity.position.distanceTo(origin) <= radius)
+    .filter((entity) => entityMatches(entity, type, name))
+    .map((entity) => ({
+      name: entityDisplayName(entity),
+      type: entityTypeLabel(entity),
+      distance: entity.position.distanceTo(origin),
+      position: entity.position,
+    }))
+    .sort((left, right) => left.distance - right.distance)
+    .slice(0, limit);
+  if (results.length === 0) {
+    const conditions = [type ? `类型 ${type}` : '', name ? `名字 ${name}` : ''].filter(Boolean);
+    throw new Error(
+      `附近 ${radius} 格内没有${
+        conditions.length > 0 ? `符合条件的实体（${conditions.join('、')}）` : '实体'
+      }`
+    );
+  }
+  return `附近 ${radius} 格内有 ${results.length} 个实体：${results
+    .map(
+      (entry) =>
+        `${entry.name}（${entry.type}，${entry.distance.toFixed(1)} 格，位于 ${Math.floor(
+          entry.position.x
+        )}, ${Math.floor(entry.position.y)}, ${Math.floor(entry.position.z)}）`
+    )
+    .join('；')}`;
+}
+
+function isSleepTime() {
+  const timeOfDay = Number(bot.time.timeOfDay);
+  return timeOfDay >= 12541 && timeOfDay <= 23458;
+}
+
+function isThunderstorm() {
+  return Boolean(bot.isRaining) && Number(bot.thunderState || 0) > 0;
+}
+
+function findNearbyBed(range) {
+  return bot.findBlock({
+    matching: (block) => block != null && (block.name === 'bed' || block.name.endsWith('_bed')),
+    maxDistance: range,
+  });
+}
+
+function sleepErrorText(message) {
+  const text = String(message || '');
+  if (/too far/i.test(text)) return '床太远了，走不到能点击床的位置';
+  if (/occupied/i.test(text)) return '床已经被占用了';
+  if (/monsters nearby/i.test(text)) return '床附近有敌对生物';
+  if (/not night/i.test(text)) return '现在不是夜晚，也不是雷暴';
+  if (/not sleeping/i.test(text)) return '躺下后没有进入睡眠，可能被服务器拒绝了';
+  if (/already sleeping/i.test(text)) return '已经在睡觉了';
+  if (/only half bed/i.test(text)) return '这张床只剩下一半';
+  if (/cant click/i.test(text)) return '现在点不到这张床';
+  if (/wrong block/i.test(text)) return '目标不是床';
+  return text || '未知原因';
+}
+
+function sleepAdvancedTime(beforeTime, beforeDay) {
+  if (bot.time.day !== beforeDay) return true;
+  return Math.abs(Number(bot.time.timeOfDay) - Number(beforeTime)) >= 1000;
+}
+
+async function sleepInBed() {
+  const dimension = String(bot.game.dimension || '').toLowerCase();
+  if (dimension.includes('nether')) {
+    throw new Error('这里是下界，不能正常睡觉，床会爆炸');
+  }
+  if (dimension.includes('end')) throw new Error('这里是末地，不能正常睡觉');
+  if (bot.isSleeping) throw new Error('我已经在睡觉了');
+  if (!isSleepTime() && !isThunderstorm()) {
+    throw new Error(`现在是 ${clockLabel(bot.time.timeOfDay)}，不是夜晚也没有雷暴，不能睡觉`);
+  }
+  const bed = findNearbyBed(16);
+  if (!bed) throw new Error('附近 16 格内没有床，先放一张床再睡');
+  const bedPosition = `(${bed.position.x}, ${bed.position.y}, ${bed.position.z})`;
+  const hostile = findHostile(8);
+  if (hostile) {
+    const distance = bot.entity.position.distanceTo(hostile.position);
+    throw new Error(`附近有${blockLabel(hostile.name)}，距离 ${distance.toFixed(1)} 格，先清掉再睡`);
+  }
+  if (bot.entity.position.distanceTo(bed.position) > 2.5) {
+    try {
+      await travelTo(bed.position.x, bed.position.y, bed.position.z, 2);
+    } catch (error) {
+      throw new Error(`床在 ${bedPosition}，但走不到床边：${error.message}`);
+    }
+  }
+  if (interrupted) throw new Error('被新的指令打断');
+  const bedDistance = bot.entity.position.distanceTo(bed.position);
+  if (bedDistance > 4) {
+    throw new Error(`床在 ${bedPosition}，但还差 ${bedDistance.toFixed(1)} 格，走不到床边`);
+  }
+  const nearbyHostile = findHostile(8);
+  if (nearbyHostile) {
+    const distance = bot.entity.position.distanceTo(nearbyHostile.position);
+    throw new Error(`附近有${blockLabel(nearbyHostile.name)}，距离 ${distance.toFixed(1)} 格，先清掉再睡`);
+  }
+  if (!isSleepTime() && !isThunderstorm()) {
+    throw new Error(`走到床边时天已经亮了，现在是 ${clockLabel(bot.time.timeOfDay)}，不能睡觉`);
+  }
+  const beforeTime = Number(bot.time.timeOfDay);
+  const beforeDay = bot.time.day;
+  try {
+    await bot.sleep(bed);
+  } catch (error) {
+    throw new Error(`没能睡到床上：${sleepErrorText(error.message)}`);
+  }
+  if (bot.isSleeping) {
+    return `已经躺在床上睡着了，床在 ${bedPosition}`;
+  }
+  await sleep(500);
+  if (sleepAdvancedTime(beforeTime, beforeDay)) {
+    const now = clockLabel(bot.time.timeOfDay);
+    if (bot.time.isDay) {
+      return `天亮了，现在是第 ${bot.time.day} 天 ${now}，床在 ${bedPosition}`;
+    }
+    return `睡了一会儿，时间到了第 ${bot.time.day} 天 ${now}，床在 ${bedPosition}`;
+  }
+  throw new Error('躺下后没有进入睡眠，可能床被占用或被服务器拒绝');
 }
 
 async function approach(target) {
@@ -887,7 +1439,7 @@ function onDamaged(source) {
 }
 
 function survivalTick() {
-  if (!bot || !bot.entity || combatBusy || actionBusy) return;
+  if (!bot || !bot.entity || bot.isSleeping || combatBusy || actionBusy) return;
   if (bot.health <= 8) return;
   if (bot.health <= 12 && findFood() && Date.now() - lastEatAt > 8000) {
     eatIfPossible();
@@ -1042,7 +1594,7 @@ async function startWander() {
 }
 
 function idleTick() {
-  if (!bot || !bot.entity || followSession || actionBusy || wanderActive || combatBusy) return;
+  if (!bot || !bot.entity || bot.isSleeping || followSession || actionBusy || wanderActive || combatBusy) return;
   if (Date.now() - lastActivity < IDLE_WANDER_MS) return;
   if (bot.health < 10) return;
   const player = nearestPlayer(64);

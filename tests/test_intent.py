@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from voxkin.intent import classify
+from voxkin.intent import classify, is_stop
 
 
 @pytest.mark.parametrize(
@@ -33,3 +33,10 @@ def test_unknown_or_small_talk_returns_none() -> None:
 
 def test_question_about_ability_is_not_an_action() -> None:
     assert classify("你会挖矿吗") is None
+
+
+def test_is_stop() -> None:
+    assert is_stop("不用跟着我了")
+    assert is_stop("站住")
+    assert not is_stop("跟我来")
+    assert not is_stop("今天天气不错")

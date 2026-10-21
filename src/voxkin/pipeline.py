@@ -335,6 +335,11 @@ class ConversationPipeline:
             "craft": "好，我合成。",
             "attack_nearest": "好，我打它。",
             "inventory": "好，我看看背包。",
+            "observe": "好，我看看四周。",
+            "eat": "好，我吃点东西。",
+            "locate_block": "好，我去找找。",
+            "locate_entity": "好，我看看附近有谁。",
+            "sleep": "好，我去睡觉。",
             "look_at_player": "好，我看你。",
             "stop": "好，我停下。",
         }.get(name, "好的，我这就去。")

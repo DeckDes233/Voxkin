@@ -40,3 +40,8 @@ def classify(text: str) -> Intent | None:
         if pattern.search(value):
             return Intent(name=name, text=value, confidence=confidence)
     return None
+
+
+def is_stop(text: str) -> bool:
+    intent = classify(text)
+    return intent is not None and intent.name == "stop_movement"

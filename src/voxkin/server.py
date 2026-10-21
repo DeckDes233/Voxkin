@@ -16,6 +16,7 @@ from voxkin.audio.websocket import WebSocketAudioSink
 from voxkin.agent.actions import ActionError
 from voxkin.bridge.protocol import ActionResult, parse_chat
 from voxkin.config import load_config, save_config
+from voxkin.intent import is_stop
 from voxkin.logging_setup import tail_log
 from voxkin.runtime import Runtime
 from voxkin.services import ServiceError
@@ -297,6 +298,12 @@ class StudioServer:
                 kind = data.get("type")
                 if kind == "chat":
                     chat = parse_chat(data)
+                    if (
+                        is_stop(chat["text"])
+                        and self.runtime.run_manager is not None
+                        and self.runtime.run_manager.running
+                    ):
+                        await self.runtime.run_manager.stop()
                     asyncio.create_task(self.runtime.pipeline.respond(chat["text"]))
                 elif kind == "action_result":
                     self.runtime.dispatcher.resolve(ActionResult.from_message(data))
