@@ -276,6 +276,7 @@ class StudioServer:
                     self.runtime.dispatcher.bridge_name = str(data.get("bridge", name))
                     await send({"type": "welcome", "name": self.runtime.dispatcher.bridge_name})
                 elif kind == "state":
+                    self.runtime.dispatcher.update_state(data.get("data", {}))
                     await self.runtime.hub.publish(
                         {"type": "bridge_state", "data": data.get("data", {})}
                     )

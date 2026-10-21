@@ -115,6 +115,7 @@ class Runtime:
             return await dispatcher.dispatch(call["name"], call.get("arguments") or {})
 
         pipeline.set_action_handler(handle_action)
+        pipeline.set_state_provider(dispatcher.state_snapshot)
         supervisor = ServiceSupervisor(Path("logs") / "services")
         if config.tts.manage_service:
             supervisor.register(
