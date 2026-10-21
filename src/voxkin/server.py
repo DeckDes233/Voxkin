@@ -47,6 +47,9 @@ class StudioServer:
         app.router.add_get("/api/mic", self.mic_status)
         app.router.add_post("/api/mic/start", self.mic_start)
         app.router.add_post("/api/mic/stop", self.mic_stop)
+        app.router.add_get("/api/run/status", self.run_status)
+        app.router.add_post("/api/run/start", self.run_start)
+        app.router.add_post("/api/run/stop", self.run_stop)
         app.router.add_post("/api/config", self.update_config)
         app.router.add_post("/api/llm/test", self.llm_test)
         app.router.add_get("/ws", self.websocket)
@@ -155,6 +158,31 @@ class StudioServer:
 
     async def mic_stop(self, request: web.Request) -> web.Response:
         return web.json_response(await self.runtime.stop_mic())
+
+    async def run_status(self, request: web.Request) -> web.Response:
+        manager = self.runtime.run_manager
+        return web.json_response(manager.status() if manager is not None else {"running": False})
+
+    async def run_start(self, request: web.Request) -> web.Response:
+        manager = self.runtime.run_manager
+        if manager is None:
+            raise web.HTTPServiceUnavailable(text="没有可用的任务执行器")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        stage = str(body.get("stage") or "S0")
+        try:
+            await manager.start(stage)
+        except KeyError as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+        return web.json_response(manager.status())
+
+    async def run_stop(self, request: web.Request) -> web.Response:
+        manager = self.runtime.run_manager
+        if manager is None:
+            raise web.HTTPServiceUnavailable(text="没有可用的任务执行器")
+        return web.json_response(await manager.stop())
 
     async def services(self, request: web.Request) -> web.Response:
         return web.json_response(await self.runtime.services_status())
