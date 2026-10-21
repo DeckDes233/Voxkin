@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+work/
+logs/
+*.log
+config/local.yaml
+config/secrets.yaml
+.env
+data/
+studio_dist/

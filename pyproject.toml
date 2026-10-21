@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voxkin"
+version = "0.1.0"
+description = "沃心 Voxkin：Minecraft 实时 AI 伙伴系统的核心编排与语音链路"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9",
+    "numpy>=1.26",
+    "PyYAML>=6.0",
+    "soundfile>=0.12",
+]
+
+[project.optional-dependencies]
+stt = ["faster-whisper>=1.0"]
+tts = ["genie-tts>=2.0"]
+audio = ["sounddevice>=0.4"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+voxkin = "voxkin.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+voxkin = ["studio/*.html", "studio/*.css", "studio/*.js"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]

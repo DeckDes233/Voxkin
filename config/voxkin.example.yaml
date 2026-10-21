@@ -1,0 +1,52 @@
+llm:
+  provider: openai_compat
+  base_url: "https://api.deepseek.com/v1"
+  model: "deepseek-chat"
+  api_key_env: "DEEPSEEK_API_KEY"
+  temperature: 0.7
+  max_tokens: 512
+  timeout_s: 60
+  stream: true
+
+tts:
+  engine: "genie"
+  character: "Theresa"
+  model_dir: "models/Theresa"
+  reference_audio: "models/reference/xiaote.wav"
+  reference_text: ""
+  language: "zh"
+  sample_rate: 32000
+  max_chars_per_request: 40
+
+stt:
+  engine: "faster_whisper"
+  model: "small"
+  device: "cpu"
+  compute_type: "int8"
+  language: "zh"
+  beam_size: 1
+  vad_threshold: 0.5
+  vad_min_speech_ms: 320
+  vad_min_silence_ms: 640
+  sample_rate: 16000
+  max_utterance_s: 20
+
+audio:
+  output: "speaker"
+  device: ""
+  volume: 1.0
+  minecraft_audio_dir: ""
+  wav_dir: "data/audio_out"
+  segment_lead_s: 0.05
+
+server:
+  host: "127.0.0.1"
+  port: 8765
+
+persona:
+  name: "DeepSeek-chan"
+  system_prompt: |
+    你是沃心，一个生活在 Minecraft 世界里的伙伴。说话简短自然，像一个熟悉的朋友。
+    你只描述已经发生或正在发生的事，没有执行完的动作不要声称完成。
+    你的回复会被直接朗读，因此不要输出代码块、列表符号或表情符号。
+  max_history_turns: 12
