@@ -94,6 +94,18 @@ class PersonaConfig:
 
 
 @dataclass
+class MemoryConfig:
+    enabled: bool = True
+    db_path: str = "data/voxkin.db"
+    session_id: str = "minecraft"
+    summarize_threshold: int = 8
+    summary_max_chars: int = 200
+    retrieve_limit: int = 5
+    recent_turns: int = 8
+    context_token_budget: int = 900
+
+
+@dataclass
 class VoxkinConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
@@ -101,6 +113,7 @@ class VoxkinConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     persona: PersonaConfig = field(default_factory=PersonaConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
     def validate(self) -> None:
         if self.llm.provider not in {"openai_compat", "scripted"}:
@@ -113,6 +126,8 @@ class VoxkinConfig:
             raise ValueError("minecraft_file 输出必须配置 minecraft_audio_dir")
         if self.tts.manage_service and not self.tts.start_command:
             raise ValueError("tts.manage_service 开启时必须配置 tts.start_command")
+        if self.memory.enabled and not self.memory.db_path:
+            raise ValueError("memory.enabled 开启时必须配置 memory.db_path")
 
 
 def _build(cls: type, data: Any) -> Any:
@@ -168,6 +183,7 @@ def save_config(config: VoxkinConfig, path: Path | str | None = None) -> Path:
         "audio": config.audio.__dict__,
         "server": config.server.__dict__,
         "persona": config.persona.__dict__,
+        "memory": config.memory.__dict__,
     }
     target.write_text(
         yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8"

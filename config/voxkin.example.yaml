@@ -58,3 +58,13 @@ persona:
     你只描述已经发生或正在发生的事，没有执行完的动作不要声称完成。
     你的回复会被直接朗读，因此不要输出代码块、列表符号或表情符号。
   max_history_turns: 12
+
+memory:
+  enabled: true
+  db_path: "data/voxkin.db"
+  session_id: "minecraft"
+  summarize_threshold: 8
+  summary_max_chars: 200
+  retrieve_limit: 5
+  recent_turns: 8
+  context_token_budget: 900
