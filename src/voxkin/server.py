@@ -17,6 +17,7 @@ from voxkin.bridge.protocol import ActionResult, parse_chat
 from voxkin.config import load_config, save_config
 from voxkin.logging_setup import tail_log
 from voxkin.runtime import Runtime
+from voxkin.services import ServiceError
 
 STATIC_DIR = Path(__file__).with_name("studio")
 
@@ -40,6 +41,8 @@ class StudioServer:
         app.router.add_get("/api/metrics", self.metrics)
         app.router.add_get("/api/logs", self.logs)
         app.router.add_get("/api/audio/devices", self.audio_devices)
+        app.router.add_get("/api/services", self.services)
+        app.router.add_post("/api/services/{name}/{action}", self.service_action)
         app.router.add_post("/api/config", self.update_config)
         app.router.add_get("/ws", self.websocket)
         app.router.add_get("/ws/bridge", self.bridge_socket)
@@ -136,6 +139,25 @@ class StudioServer:
     async def logs(self, request: web.Request) -> web.Response:
         lines = int(request.query.get("lines", "200"))
         return web.json_response({"lines": tail_log(lines)})
+
+    async def services(self, request: web.Request) -> web.Response:
+        return web.json_response(await self.runtime.services_status())
+
+    async def service_action(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        action = request.match_info["action"]
+        try:
+            if action == "start":
+                result = await self.runtime.supervisor.start(name)
+            elif action == "stop":
+                result = await self.runtime.supervisor.stop(name)
+            elif action == "restart":
+                result = await self.runtime.supervisor.restart(name)
+            else:
+                raise web.HTTPBadRequest(text=f"未知动作: {action}")
+        except ServiceError as error:
+            raise web.HTTPConflict(text=str(error))
+        return web.json_response(result)
 
     async def audio_devices(self, request: web.Request) -> web.Response:
         devices = await asyncio.to_thread(Microphone.list_devices)

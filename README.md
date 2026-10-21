@@ -14,7 +14,7 @@
 | 端点检测与打断 | 可运行 | 能量 VAD、最短语音与静音阈值，检测到新语音即打断当前回复 |
 | Minecraft 桥接 | 协议与客户端已完成，未连真实服务器验证 | WebSocket 协议已通过真实 WebSocket 集成测试；`bridge/minecraft_bridge.js` 需要 Minecraft 服务端才能端到端验证 |
 | Minecraft 音频投递 | 可运行（复用现有 Mod） | 把语音按句写成 WAV 分段到现有 Mod 监听的目录，按音频时长节流以保证顺序 |
-| Voxkin Studio | 可运行 | 状态、试听、实时事件、延迟分解、配置、日志 |
+| Voxkin Studio | 可运行 | 状态、试听、实时事件、延迟分解、配置、日志，以及受管引擎的启动/停止/重启与健康检查 |
 
 ## 环境要求
 

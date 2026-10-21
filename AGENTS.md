@@ -17,6 +17,7 @@
 | `src/voxkin/agent/actions.py` | 动作派发：转发给桥接并等待可验证结果 |
 | `src/voxkin/bridge/protocol.py` | 桥接消息结构 |
 | `src/voxkin/server.py` | Studio HTTP/WebSocket 服务与桥接入口 |
+| `src/voxkin/services.py` | 外部引擎进程的启停、重启与健康检查 |
 | `bridge/minecraft_bridge.js` | mineflayer 客户端，执行动作并回报结果 |
 | `tools/dev_llm_server.py` | 本地测试 LLM，不访问外网 |
 | `docs/` | 事实来源：审计、架构、评估、决策、路线图、状态、基准 |

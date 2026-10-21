@@ -11,6 +11,7 @@ from voxkin.events import EventHub, MetricsStore
 from voxkin.llm.base import LLMAdapter, LLMDelta, LLMError
 from voxkin.llm.openai_compat import OpenAICompatLLM
 from voxkin.pipeline import ConversationPipeline
+from voxkin.services import ServiceSpec, ServiceSupervisor
 from voxkin.stt.vad import VadSegmenter
 from voxkin.stt.whisper import WhisperSTT
 from voxkin.tts import build_tts
@@ -54,6 +55,7 @@ class Runtime:
     hub: EventHub
     dispatcher: ActionDispatcher
     pipeline: ConversationPipeline
+    supervisor: ServiceSupervisor
 
     @classmethod
     async def create(cls, config: VoxkinConfig) -> "Runtime":
@@ -93,6 +95,16 @@ class Runtime:
             return await dispatcher.dispatch(call["name"], call.get("arguments") or {})
 
         pipeline.set_action_handler(handle_action)
+        supervisor = ServiceSupervisor(Path("logs") / "services")
+        if config.tts.manage_service:
+            supervisor.register(
+                ServiceSpec(
+                    name="tts",
+                    command=list(config.tts.start_command),
+                    cwd=config.tts.working_dir or str(Path.cwd()),
+                    health_url=config.tts.health_url,
+                )
+            )
         runtime = cls(
             config=config,
             llm=llm,
@@ -104,8 +116,12 @@ class Runtime:
             hub=hub,
             dispatcher=dispatcher,
             pipeline=pipeline,
+            supervisor=supervisor,
         )
         return runtime
+
+    async def services_status(self) -> dict[str, Any]:
+        return await self.supervisor.status()
 
     async def start(self) -> None:
         await self.pipeline.start()
@@ -128,4 +144,7 @@ class Runtime:
         }
 
     async def close(self) -> None:
-        await self.pipeline.close()
+        try:
+            await self.pipeline.close()
+        finally:
+            await self.supervisor.close()

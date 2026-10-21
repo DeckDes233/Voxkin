@@ -15,6 +15,7 @@ graph TD
         PIPE[ConversationPipeline<br/>回合/队列/打断]
         SPLIT[SentenceSplitter<br/>可朗读文本]
         DISP[ActionDispatcher]
+        SUP[ServiceSupervisor<br/>启停/健康检查]
         HUB[EventHub]
         MET[MetricsStore]
     end
@@ -49,6 +50,8 @@ graph TD
     TTS --> PIPE
     PIPE --> DISP
     DISP -->|action| BR
+    SRV --> SUP
+    SUP -->|start/stop| TTS
     PIPE --> MET
     PIPE --> HUB
 
@@ -154,6 +157,7 @@ sequenceDiagram
 - `TTSAdapter`：`initialize()`、`synthesize(text) -> AsyncIterator[np.ndarray]`、`stop()`、`describe()`。
 - `AudioSink`：`start()`、`play(turn_id, pcm)`、`flush()`、`close()`、`describe()`。
 - `ActionDispatcher`：`attach(sender)`、`dispatch(tool, arguments)`、`resolve(ActionResult)`。
+- `ServiceSupervisor`：`register(spec)`、`start(name)`、`stop(name)`、`restart(name)`、`health(name)`、`status()`。
 - 桥接消息：`hello`、`chat`、`state`（桥接 → Core）；`welcome`、`action`（Core → 桥接）；`action_result`（桥接 → Core）。
 
 ## 5. 并发模型

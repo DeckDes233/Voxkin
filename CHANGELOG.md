@@ -9,7 +9,7 @@
 - 音频输出：扬声器、WAV 目录、Minecraft 文件投递。
 - 动作通道：`ActionDispatcher` 与 Minecraft 桥接 WebSocket 协议，动作完成以桥接返回结果为准。
 - Minecraft 桥接客户端 `bridge/minecraft_bridge.js`，支持聊天转发、移动、挖掘与状态上报。
-- Voxkin Studio：状态、试听、实时事件、延迟分解、配置与日志。
+- Voxkin Studio：状态、试听、实时事件、延迟分解、配置、受管服务启停与健康检查、日志。
 - 本地测试 LLM：`tools/dev_llm_server.py`，OpenAI 兼容流式接口。
 - 文档：仓库审计、MindCraft 源码审计、架构、技术评估、决策、路线图、状态、基准。
 

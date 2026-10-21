@@ -46,6 +46,10 @@ class TTSConfig:
     sample_rate: int = 32000
     max_chars_per_request: int = 40
     timeout_s: float = 120.0
+    manage_service: bool = False
+    start_command: list[str] = field(default_factory=list)
+    working_dir: str = ""
+    health_url: str = "http://127.0.0.1:9880/openapi.json"
 
 
 @dataclass
@@ -104,6 +108,8 @@ class VoxkinConfig:
             raise ValueError(f"未知的音频输出: {self.audio.output}")
         if self.audio.output == "minecraft_file" and not self.audio.minecraft_audio_dir:
             raise ValueError("minecraft_file 输出必须配置 minecraft_audio_dir")
+        if self.tts.manage_service and not self.tts.start_command:
+            raise ValueError("tts.manage_service 开启时必须配置 tts.start_command")
 
 
 def _build(cls: type, data: Any) -> Any:

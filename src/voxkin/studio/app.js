@@ -197,6 +197,48 @@ async function saveConfig() {
   loadStatus();
 }
 
+async function loadServices() {
+  const response = await fetch("/api/services");
+  const data = await response.json();
+  const box = $("services");
+  const names = Object.keys(data);
+  if (names.length === 0) {
+    box.innerHTML = '<span class="legend">未配置受管服务，可在 config 中开启 tts.manage_service</span>';
+    return;
+  }
+  box.innerHTML = names
+    .map((name) => {
+      const service = data[name];
+      const state = service.running ? `运行中 pid ${service.pid}` : "已停止";
+      const reachable = service.health && service.health.reachable;
+      const health = reachable === true ? "健康" : reachable === false ? "不可达" : "未检查";
+      return `<div class="service" data-name="${name}">
+        <strong>${name}</strong>
+        <span>${state} · ${health}</span>
+        <button data-action="start">启动</button>
+        <button data-action="stop">停止</button>
+        <button data-action="restart">重启</button>
+      </div>`;
+    })
+    .join("");
+  box.querySelectorAll("button").forEach((button) => {
+    button.addEventListener("click", () => {
+      const name = button.closest(".service").dataset.name;
+      serviceAction(name, button.dataset.action);
+    });
+  });
+}
+
+async function serviceAction(name, action) {
+  const response = await fetch(`/api/services/${name}/${action}`, { method: "POST" });
+  if (!response.ok) {
+    pushEvent("服务", `${name} ${action} 失败：HTTP ${response.status}`, "error");
+  } else {
+    pushEvent("服务", `${name} 已执行 ${action}`);
+  }
+  loadServices();
+}
+
 async function loadLogs() {
   const response = await fetch("/api/logs?lines=60");
   const data = await response.json();
@@ -215,5 +257,7 @@ connect();
 loadStatus();
 loadMetrics();
 loadLogs();
+loadServices();
 setInterval(loadStatus, 3000);
+setInterval(loadServices, 4000);
 setInterval(loadLogs, 5000);
