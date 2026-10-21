@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from voxkin.config import STTConfig
+from voxkin.stt.filter import drop_reason
 from voxkin.stt.normalize import to_simplified
 
 
@@ -22,6 +23,7 @@ class WhisperSTT:
         self._model: Any = None
         self.load_seconds: float | None = None
         self.last_inference_seconds: float | None = None
+        self.last_dropped_segments: int = 0
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -32,6 +34,8 @@ class WhisperSTT:
             "language": self.config.language,
             "loaded": self._model is not None,
             "load_seconds": self.load_seconds,
+            "hallucination_filter": self.config.hallucination_filter,
+            "last_dropped_segments": self.last_dropped_segments,
         }
 
     def load(self) -> None:
@@ -65,7 +69,25 @@ class WhisperSTT:
             vad_filter=False,
             condition_on_previous_text=False,
         )
-        text = "".join(segment.text for segment in segments).strip()
+        pieces: list[str] = []
+        dropped = 0
+        for segment in segments:
+            if self.config.hallucination_filter:
+                reason = drop_reason(
+                    segment.text,
+                    no_speech_prob=getattr(segment, "no_speech_prob", None),
+                    avg_logprob=getattr(segment, "avg_logprob", None),
+                    compression_ratio=getattr(segment, "compression_ratio", None),
+                )
+                if reason:
+                    dropped += 1
+                    continue
+            pieces.append(segment.text)
+        text = "".join(pieces).strip()
+        if text and self.config.hallucination_filter and drop_reason(text):
+            text = ""
+            dropped += 1
+        self.last_dropped_segments = dropped
         if self.config.to_simplified and self.config.language.lower().startswith("zh"):
             text = to_simplified(text)
         self.last_inference_seconds = round(time.perf_counter() - started, 3)
