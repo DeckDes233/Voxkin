@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from voxkin.agent.actions import ActionDispatcher
 from voxkin.audio.sinks import AudioSink, build_sink
+from voxkin.audio.capture import Microphone
 from voxkin.config import VoxkinConfig
 from voxkin.events import EventHub, MetricsStore
 from voxkin.llm.base import LLMAdapter, LLMDelta, LLMError
@@ -17,6 +19,7 @@ from voxkin.stt.vad import VadSegmenter
 from voxkin.stt.whisper import WhisperSTT
 from voxkin.tts import build_tts
 from voxkin.tts.base import TTSAdapter
+from voxkin.voice.loop import VoiceLoop
 
 
 class MissingKeyLLM:
@@ -58,6 +61,10 @@ class Runtime:
     pipeline: ConversationPipeline
     supervisor: ServiceSupervisor
     memory: MemoryStore | None = None
+    voice_loop: VoiceLoop | None = None
+    voice_task: asyncio.Task | None = None
+    mic_state: str = "stopped"
+    last_mic_reply: str = ""
 
     @classmethod
     async def create(cls, config: VoxkinConfig) -> "Runtime":
@@ -137,6 +144,79 @@ class Runtime:
     async def services_status(self) -> dict[str, Any]:
         return await self.supervisor.status()
 
+    async def _on_mic_status(self, kind: str, payload: dict[str, Any]) -> None:
+        if kind == "transcript":
+            await self.hub.publish({"type": "mic_transcript", **payload})
+        elif kind == "reply":
+            summary = payload["summary"]
+            self.last_mic_reply = summary["meta"].get("spoken", "")
+            await self.hub.publish({"type": "mic_reply", "summary": summary})
+        elif kind == "ready":
+            await self.hub.publish({"type": "mic_status", "state": "ready"})
+        elif kind == "speech_start":
+            await self.hub.publish({"type": "mic_speech_start"})
+        elif kind == "barge_in":
+            await self.hub.publish({"type": "mic_barge_in"})
+
+    def mic_status(self) -> dict[str, Any]:
+        loop = self.voice_loop
+        return {
+            "state": self.mic_state,
+            "running": self.voice_task is not None and not self.voice_task.done(),
+            "last_transcript": loop.last_transcript if loop is not None else "",
+            "last_reply": self.last_mic_reply,
+            "last_stt_ms": loop.last_stt_ms if loop is not None else None,
+            "barge_in": self.config.stt.barge_in,
+        }
+
+    async def start_mic(self) -> dict[str, Any]:
+        if self.voice_task is not None and not self.voice_task.done():
+            return self.mic_status()
+        self.voice_loop = VoiceLoop(
+            pipeline=self.pipeline,
+            stt=self.stt,
+            vad=VadSegmenter.from_config(self.config.stt),
+            microphone=Microphone(
+                sample_rate=self.config.stt.sample_rate, device=self.config.stt.input_device
+            ),
+            emit=self.hub.publish,
+            barge_in=self.config.stt.barge_in,
+            gain=self.config.stt.input_gain,
+            playback_cooldown_s=self.config.stt.playback_cooldown_s,
+            on_status=self._on_mic_status,
+        )
+        self.mic_state = "starting"
+        self.voice_task = asyncio.create_task(self._run_mic(), name="voxkin-mic")
+        return self.mic_status()
+
+    async def _run_mic(self) -> None:
+        try:
+            self.mic_state = "running"
+            await self.voice_loop.run()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.mic_state = f"error: {error}"
+            await self.hub.publish({"type": "mic_error", "error": str(error)})
+            raise
+        finally:
+            if self.mic_state == "running" or self.mic_state == "starting":
+                self.mic_state = "stopped"
+
+    async def stop_mic(self) -> dict[str, Any]:
+        if self.voice_loop is not None:
+            self.voice_loop.stop()
+        task = self.voice_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self.voice_task = None
+        self.mic_state = "stopped"
+        return self.mic_status()
+
     async def start(self) -> None:
         await self.pipeline.start()
 
@@ -160,6 +240,7 @@ class Runtime:
 
     async def close(self) -> None:
         try:
+            await self.stop_mic()
             await self.pipeline.close()
         finally:
             await self.supervisor.close()

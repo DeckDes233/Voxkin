@@ -156,8 +156,12 @@ node minecraft_bridge.js
 
 ### 4. 在游戏里使用
 
-1. 启动 Minecraft 1.21.1 与 Fabric Loader。
-2. 编译客户端 Mod：
+完整流程（专用服务器、桥接、麦克风、客户端 Mod、YSM）见 [让沃心进入 Minecraft：全流程](docs/ENTER_MINECRAFT_CN.md)。最短路径：
+
+1. 开一个 `online-mode=false` 的 Paper 1.21.1 服务器（单机世界对局域网开放会拒绝离线机器人），并把 `spawn-protection` 设为 `0`。
+2. 启动 Studio 与桥接，确认控制台里桥接状态为已连接、机器人 `Voxkin` 进入世界。
+3. 玩家连进服务器，在聊天框里对沃心说话；它会用语音回答，并执行挖掘、移动、转身这类动作。
+4. 想让声音从机器人位置传来，再装客户端 Mod：
 
    ```powershell
    cd mod
@@ -165,11 +169,9 @@ node minecraft_bridge.js
    gradle build
    ```
 
-3. 把 `mod/build/libs/voxkin-audio-0.1.0.jar` 与 Fabric API 放进 `mods/`。
-4. 把 `config/voxkin.yaml` 的 `audio.output` 改成 `websocket`。
-5. 进入世界后，桥接机器人会加入服务器，玩家在聊天框里说话即可。
+   把 `mod/build/libs/voxkin-audio-0.1.0.jar` 与 Fabric API 放进 `mods/`，把 `audio.output` 改成 `websocket`，并在 JVM 参数里加 `-Dvoxkin.audio.url=ws://127.0.0.1:8765/ws/audio -Dvoxkin.audio.bot=Voxkin`。
 
-客户端 Mod 当前的播放不经过游戏混音器，空间音源在后续版本接入。
+客户端 Mod 通过 Minecraft 的流式声源播放，声音定位在机器人实体上，跟随距离衰减；尚未在真实客户端验证空间效果。
 
 ### 5. 用麦克风对话
 
@@ -186,7 +188,7 @@ node minecraft_bridge.js
 | `--no-barge-in` | 外放音箱时关闭打断，避免听到自己的声音 |
 | `--output speaker` | 临时覆盖音频输出方式 |
 
-外放音箱时建议加 `--no-barge-in`，播放结束后的 0.9 秒内会忽略麦克风输入，避免把自己说的话当成新指令。戴耳机可以得到更自然的打断体验。
+外放音箱时建议加 `--no-barge-in`，播放结束后的 1.5 秒内会忽略麦克风输入，避免把自己说的话当成新指令。戴耳机可以得到更自然的打断体验。
 
 ## 配置
 
@@ -226,6 +228,7 @@ docs/                审计、架构、评估、决策、路线图、状态、�
 | 文档 | 内容 |
 | --- | --- |
 | [小白版说明](docs/GETTING_STARTED_CN.md) | 不写代码也能看懂的上手流程 |
+| [进入 Minecraft 全流程](docs/ENTER_MINECRAFT_CN.md) | 从开服务器到语音、动作、客户端 Mod 的完整步骤 |
 | [架构](docs/ARCHITECTURE.md) | 组件、数据流、时序、故障恢复 |
 | [仓库审计](docs/REPO_AUDIT.md) | 旧项目 MiddleAPI 与 Mod 的问题定位 |
 | [技术评估](docs/TECH_EVALUATION.md) | GPT-SoVITS、Genie、CosyVoice、IndexTTS 的对比证据 |

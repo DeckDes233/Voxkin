@@ -44,6 +44,9 @@ class StudioServer:
         app.router.add_get("/api/audio/devices", self.audio_devices)
         app.router.add_get("/api/services", self.services)
         app.router.add_post("/api/services/{name}/{action}", self.service_action)
+        app.router.add_get("/api/mic", self.mic_status)
+        app.router.add_post("/api/mic/start", self.mic_start)
+        app.router.add_post("/api/mic/stop", self.mic_stop)
         app.router.add_post("/api/config", self.update_config)
         app.router.add_post("/api/llm/test", self.llm_test)
         app.router.add_get("/ws", self.websocket)
@@ -65,6 +68,7 @@ class StudioServer:
         payload = self.runtime.status()
         payload["uptime_s"] = round(time.time() - self.started_at, 1)
         payload["config_path"] = str(self.config_path)
+        payload["mic"] = self.runtime.mic_status()
         return web.json_response(payload)
 
     async def say(self, request: web.Request) -> web.Response:
@@ -142,6 +146,15 @@ class StudioServer:
     async def logs(self, request: web.Request) -> web.Response:
         lines = int(request.query.get("lines", "200"))
         return web.json_response({"lines": tail_log(lines)})
+
+    async def mic_status(self, request: web.Request) -> web.Response:
+        return web.json_response(self.runtime.mic_status())
+
+    async def mic_start(self, request: web.Request) -> web.Response:
+        return web.json_response(await self.runtime.start_mic())
+
+    async def mic_stop(self, request: web.Request) -> web.Response:
+        return web.json_response(await self.runtime.stop_mic())
 
     async def services(self, request: web.Request) -> web.Response:
         return web.json_response(await self.runtime.services_status())

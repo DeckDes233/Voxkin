@@ -38,10 +38,10 @@ class VadSegmenter:
 
     def calibrate(self, noise_rms: float) -> None:
         """用启动时测到的环境噪声设置阈值。"""
-        floor = max(0.0005, noise_rms)
+        floor = min(0.02, max(0.0005, noise_rms))
         self.noise_floor = floor
-        self.min_rms = max(0.0015, floor * 1.5)
-        self.threshold_ratio = 2.0
+        self.min_rms = max(0.0015, floor * 1.2)
+        self.threshold_ratio = 1.6
 
     def _frame_rms(self, frame: np.ndarray) -> float:
         return float(np.sqrt(np.mean(np.square(frame, dtype=np.float64))))
