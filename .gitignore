@@ -7,6 +7,7 @@ logs/
 *.log
 config/local.yaml
 config/secrets.yaml
+config/voxkin.yaml
 .env
 data/
 studio_dist/
