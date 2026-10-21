@@ -54,19 +54,17 @@
 
 当前依赖全部宽松许可，两种协议都成立。
 
-推荐 MIT，理由：
+项目已选择 MIT，理由：
 
 1. 项目的价值在整合与体验，不在代码保护。
 2. MIT 与现有依赖、Fabric 生态、未来可能的商业合作都兼容。
 3. 如果以后需要强制衍生开源，可以在重要版本切换，但已发布的 MIT 版本无法收回。
 
-如果目标是「任何基于本项目的公开衍生都必须开源」，选 GPL-3.0；如果还要求网络服务也开源，选 AGPL-3.0。
+已完成：
 
-协议确定后需要做三件事：
-
-1. 在仓库根目录加入 `LICENSE` 全文。
-2. 在 `pyproject.toml`、`bridge/package.json`、`mod/src/main/resources/fabric.mod.json` 中写入协议标识。
-3. 在 README 顶部替换「协议待定」的说明。
+1. 根目录加入 `LICENSE` 全文。
+2. `pyproject.toml`、`bridge/package.json`、`mod/src/main/resources/fabric.mod.json` 写入 MIT 标识。
+3. README 顶部与许可证章节替换为 MIT 说明。
 
 ## 6. 第三方声明
 

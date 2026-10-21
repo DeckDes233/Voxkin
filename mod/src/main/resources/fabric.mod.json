@@ -5,11 +5,12 @@
   "name": "Voxkin Audio",
   "description": "接收沃心 Core 的 PCM 音频流并在 Minecraft 客户端播放。",
   "authors": ["DeckDes"],
-  "license": "TBD",
+  "license": "MIT",
   "environment": "client",
   "entrypoints": {
     "client": ["dev.voxkin.audio.VoxkinAudioClient"]
   },
+  "mixins": ["voxkin.mixins.json"],
   "depends": {
     "fabricloader": ">=0.16.0",
     "minecraft": "~1.21.1",
