@@ -55,6 +55,15 @@ class Harness:
             }
         }
 
+    def mic_status(self) -> dict[str, Any]:
+        return {
+            "state": "stopped",
+            "running": False,
+            "last_transcript": "",
+            "last_stt_ms": None,
+            "barge_in": False,
+        }
+
 
 async def wait_until(predicate, timeout: float = 3.0) -> bool:
     deadline = asyncio.get_running_loop().time() + timeout

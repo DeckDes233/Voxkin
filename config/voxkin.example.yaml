@@ -40,7 +40,9 @@ stt:
   to_simplified: true
   input_gain: 1.0
   local_files_only: false
-  playback_cooldown_s: 0.9
+  playback_cooldown_s: 1.5
+  input_device: ""
+  barge_in: false
 
 audio:
   output: "speaker"

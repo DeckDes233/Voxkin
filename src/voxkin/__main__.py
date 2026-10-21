@@ -130,7 +130,7 @@ async def run_mic(config, seconds: float, listen_only: bool, output: str | None,
     if output:
         config.audio.output = output
     if device:
-        config.audio.device = device
+        config.stt.input_device = device
     if gain is not None:
         config.stt.input_gain = gain
     runtime = await Runtime.create(config)
@@ -158,7 +158,7 @@ async def run_mic(config, seconds: float, listen_only: bool, output: str | None,
         pipeline=runtime.pipeline,
         stt=runtime.stt,
         vad=VadSegmenter.from_config(config.stt),
-        microphone=Microphone(sample_rate=config.stt.sample_rate, device=config.audio.device),
+        microphone=Microphone(sample_rate=config.stt.sample_rate, device=config.stt.input_device),
         emit=runtime.hub.publish,
         barge_in=barge_in,
         gain=config.stt.input_gain,

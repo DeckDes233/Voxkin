@@ -135,6 +135,22 @@ function handleEvent(payload) {
     case "action_finished":
       pushEvent("行动完成", payload.tool);
       break;
+    case "announce":
+      pushEvent("沃心", payload.text, "sentence");
+      break;
+    case "mic_transcript":
+      pushEvent("你说", `${payload.text}（${payload.stt_ms} ms）`, "sentence");
+      $("micLog").textContent += `\n你说：${payload.text}`;
+      break;
+    case "mic_reply": {
+      const spoken = payload.summary.meta.spoken;
+      $("micLog").textContent += `\n沃心：${spoken}`;
+      pushEvent("回复", `首次可听 ${payload.summary.first_audible_ms} ms`, "sentence");
+      break;
+    }
+    case "mic_error":
+      pushEvent("麦克风", payload.error, "error");
+      break;
     default:
       pushEvent(payload.type || "事件", JSON.stringify(payload));
   }
@@ -195,6 +211,21 @@ async function saveConfig() {
     ? `已保存 ${data.changed.length} 项，重启服务后生效`
     : "保存失败";
   loadStatus();
+}
+
+async function loadMic() {
+  const response = await fetch("/api/mic");
+  const data = await response.json();
+  const state = data.state === "running" || data.state === "ready" ? "正在聆听" : data.state;
+  $("micState").textContent = `${state}${data.last_stt_ms ? " · 上次识别 " + data.last_stt_ms + " ms" : ""}`;
+}
+
+async function micAction(action) {
+  const response = await fetch(`/api/mic/${action}`, { method: "POST" });
+  if (!response.ok) {
+    pushEvent("麦克风", `${action} 失败：HTTP ${response.status}`, "error");
+  }
+  loadMic();
 }
 
 async function loadServices() {
@@ -264,12 +295,16 @@ $("interruptBtn").addEventListener("click", interrupt);
 $("ttsBtn").addEventListener("click", synth);
 $("saveConfig").addEventListener("click", saveConfig);
 $("testLlm").addEventListener("click", testLlm);
+$("micStart").addEventListener("click", () => micAction("start"));
+$("micStop").addEventListener("click", () => micAction("stop"));
 
 connect();
 loadStatus();
 loadMetrics();
 loadLogs();
 loadServices();
+loadMic();
 setInterval(loadStatus, 3000);
 setInterval(loadServices, 4000);
+setInterval(loadMic, 2500);
 setInterval(loadLogs, 5000);
