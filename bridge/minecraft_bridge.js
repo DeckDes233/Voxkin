@@ -574,10 +574,17 @@ async function pickupItems(args) {
       entity.position.distanceTo(bot.entity.position) <= range
   );
   if (!item) throw new Error(`附近 ${range} 格内没有掉落物`);
+  const name = item.name || '';
+  const before = name ? countItem(name) : 0;
   await bot.pathfinder.goto(
     new goals.GoalNear(item.position.x, item.position.y, item.position.z, 1)
   );
-  return '走到了掉落物旁边';
+  await sleep(500);
+  if (name) {
+    const gained = countItem(name) - before;
+    if (gained > 0) return `捡起了 ${gained} 个 ${blockLabel(name)}`;
+  }
+  return '走到了掉落物旁边，但还没有捡起';
 }
 
 function countItem(name) {
