@@ -30,9 +30,10 @@ class Harness:
         self.metrics = MetricsStore()
         self.dispatcher = ActionDispatcher()
         self.tts = ToneTTS(delay_s=0.001)
+        self.llm = OpenAICompatLLM(config.llm)
         self.pipeline = ConversationPipeline(
             config=config,
-            llm=OpenAICompatLLM(config.llm),
+            llm=self.llm,
             tts=self.tts,
             sink=WavDirSink(tmp_path),
             metrics=self.metrics,
