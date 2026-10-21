@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Voxkin Studio</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>沃心 Voxkin Studio</h1>
+    <span class="sub" id="uptime">本地控制终端</span>
+  </div>
+  <div class="pills" id="pills"></div>
+</header>
+
+<main>
+  <section class="panel wide">
+    <h2>实时对话</h2>
+    <div class="row">
+      <input id="sayText" type="text" placeholder="输入一句话，触发完整的语音链路" autocomplete="off">
+      <button id="sayBtn" class="primary">发送</button>
+      <button id="interruptBtn">打断</button>
+    </div>
+    <div class="legend">事件流</div>
+    <div id="events" class="events"></div>
+  </section>
+
+  <section class="panel">
+    <h2>延迟分解</h2>
+    <table id="latencyTable">
+      <thead><tr><th>轮次</th><th>识别</th><th>首字</th><th>首句</th><th>首音频</th><th>首次可听</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="legend">汇总（毫秒）</div>
+    <pre id="aggregate" class="aggregate"></pre>
+  </section>
+
+  <section class="panel">
+    <h2>TTS 试听</h2>
+    <div class="row">
+      <input id="ttsText" type="text" value="你好，我是沃心，很高兴在方块世界里见到你。" autocomplete="off">
+      <button id="ttsBtn">合成播放</button>
+    </div>
+    <audio id="player" controls></audio>
+    <div class="legend" id="ttsTiming">尚未测试</div>
+  </section>
+
+  <section class="panel">
+    <h2>配置</h2>
+    <div class="form">
+      <label>LLM 地址 <input id="cfgBaseUrl" type="text"></label>
+      <label>模型名称 <input id="cfgModel" type="text"></label>
+      <label>角色名称 <input id="cfgCharacter" type="text"></label>
+      <label>参考音频 <input id="cfgReference" type="text"></label>
+      <label>输出方式
+        <select id="cfgOutput">
+          <option value="speaker">本机扬声器</option>
+          <option value="minecraft_file">Minecraft Mod 目录</option>
+          <option value="wav_dir">写入 WAV 文件</option>
+        </select>
+      </label>
+      <label>Mod 音频目录 <input id="cfgMinecraftDir" type="text"></label>
+    </div>
+    <div class="row">
+      <button id="saveConfig" class="primary">保存配置</button>
+      <span id="configNote" class="legend"></span>
+    </div>
+  </section>
+
+  <section class="panel wide">
+    <h2>运行日志</h2>
+    <pre id="logs" class="logs"></pre>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

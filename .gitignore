@@ -10,3 +10,5 @@ config/secrets.yaml
 .env
 data/
 studio_dist/
+models/
+src/*.egg-info/

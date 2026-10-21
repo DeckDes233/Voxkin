@@ -1,4 +1,4 @@
-llm:
+﻿llm:
   provider: openai_compat
   base_url: "https://api.deepseek.com/v1"
   model: "deepseek-chat"
@@ -9,14 +9,17 @@ llm:
   stream: true
 
 tts:
-  engine: "genie"
+  engine: "gpt_sovits"
   character: "Theresa"
-  model_dir: "models/Theresa"
+  base_url: "http://127.0.0.1:9880"
   reference_audio: "models/reference/xiaote.wav"
-  reference_text: ""
+  reference_text: "阿米娅看上去还是这么瘦弱，这个年纪的孩子，个子是不是应该更高一点才对？她到底有没有好好吃饭呢。"
+  text_lang: "zh"
+  prompt_lang: "zh"
   language: "zh"
   sample_rate: 32000
-  max_chars_per_request: 40
+  max_chars_per_request: 30
+  timeout_s: 120
 
 stt:
   engine: "faster_whisper"
