@@ -212,6 +212,119 @@ MINECRAFT_TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "eat",
+            "description": "吃背包里的食物。饥饿值已满时不会吃；不指定 item 时自动挑一种食物，不会主动吃金苹果。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item": {
+                        "type": "string",
+                        "description": "食物物品 ID，例如 bread、cooked_beef；省略时自动选择",
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "最多吃几个，默认 1",
+                        "minimum": 1,
+                        "maximum": 16,
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "observe",
+            "description": "用一句话报告自身状态和周围环境：坐标、朝向、维度、血量、饥饿、时间天气、手持、护甲、背包前 8 项、附近玩家与敌对生物。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "radius": {
+                        "type": "number",
+                        "description": "观察半径，默认 16 格",
+                        "minimum": 1,
+                        "maximum": 64,
+                    },
+                    "block": {
+                        "type": "string",
+                        "description": "可选，额外报告附近某一种方块，例如 iron_ore",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "locate_block",
+            "description": "按方块 ID 搜索附近方块，返回候选坐标、距离和垂直差，并指出最近的一个；找不到时明确说明。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "block": {
+                        "type": "string",
+                        "description": "方块 ID，例如 iron_ore、oak_log",
+                    },
+                    "radius": {
+                        "type": "number",
+                        "description": "搜索半径，默认 32 格",
+                        "minimum": 1,
+                        "maximum": 64,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最多返回几个候选，默认 5",
+                        "minimum": 1,
+                        "maximum": 16,
+                    },
+                },
+                "required": ["block"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "locate_entity",
+            "description": "搜索附近实体，返回名字、类型、距离和坐标；玩家使用真实用户名，找不到时明确说明。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "description": "可选，实体类型，例如 player、zombie、hostile",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "可选，实体或玩家名字",
+                    },
+                    "radius": {
+                        "type": "number",
+                        "description": "搜索半径，默认 32 格",
+                        "minimum": 1,
+                        "maximum": 64,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最多返回几个，默认 5",
+                        "minimum": 1,
+                        "maximum": 16,
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sleep",
+            "description": "走到 16 格内的床睡觉；下界、末地、白天（非雷暴）、附近有敌对生物或床被占用时会说明原因，不会假报天亮。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 TOOL_SYSTEM_HINT = (
@@ -221,6 +334,7 @@ TOOL_SYSTEM_HINT = (
     "问背包或有什么东西时调用 inventory；让你打怪、清怪时调用 attack_nearest。"
     "要挖单个方块用 break_block；要放置方块用 place_block；要走到某种方块用 goto_block；地上有掉落物用 pickup_items。"
     "要合成木板、木棍、工作台、工具时用 craft。"
+    "想知道周围情况用 observe；找方块用 locate_block；找玩家或生物用 locate_entity；饿了用 eat；晚上用 sleep 睡觉。"
     "玩家问你是谁、在哪、在做什么、为什么，先用一句话直接回答，不要调用工具。"
     "调用工具前先说一句要做什么，不要只调用工具不说话。"
     "回答保持一到两句话，不要提到接口、模型、语音合成或系统内部。"
