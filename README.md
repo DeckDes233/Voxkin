@@ -1,54 +1,130 @@
 # 沃心 Voxkin
 
-沃心是一个面向 Minecraft 的实时 AI 伙伴系统。它把「听见玩家 → 理解 → 用自然语音回答 → 在游戏里执行动作」拆成互不阻塞的通道：语音通道追求尽快出声，行动通道在后台执行并回报可验证的结果。
+<p align="center">
+  <b>会和你在 Minecraft 里一起生活、说话、干活的 AI 伙伴</b><br>
+  实时语音 · 自主行动 · 长期记忆 · 本地部署
+</p>
 
-当前仓库包含可运行的本地语音链路、Minecraft 桥接协议与客户端、统一控制终端 Voxkin Studio，以及从现有项目迁移所需的模型准备脚本和审计文档。
+<p align="center">
+  <a href="https://github.com/DeckDes233/Voxkin/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DeckDes233/Voxkin/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.10-3776ab">
+  <img alt="Minecraft" src="https://img.shields.io/badge/Minecraft-1.21.1-3c8527">
+  <img alt="Status" src="https://img.shields.io/badge/status-prototype-orange">
+</p>
 
-## 当前能力
+沃心是一个面向 Minecraft 的 AI 伙伴系统。它把「听见玩家 → 理解 → 用自然语音回答 → 在游戏里执行动作」拆成两条互不阻塞的通道：语音通道尽快出声，行动通道在后台执行并回报可验证的结果。
+
+当前版本在本机完成了完整闭环：玩家在游戏里说一句话，沃心在 1 到 4 秒内开始说话，同时决定并执行游戏动作，动作结果会在完成后播报。
+
+> 第一次接触这个项目，建议先读 [小白版说明](docs/GETTING_STARTED_CN.md)。<br>
+> English documentation: [README.en.md](README.en.md).
+
+---
+
+## 目录
+
+- [现在能做什么](#现在能做什么)
+- [它是怎么工作的](#它是怎么工作的)
+- [延迟实测](#延迟实测)
+- [快速开始](#快速开始)
+- [配置](#配置)
+- [项目结构](#项目结构)
+- [文档](#文档)
+- [许可证](#许可证)
+
+---
+
+## 现在能做什么
 
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
-| 流式 LLM → 分句 → 流式 TTS → 播放 | 可运行 | 在本机以 5 轮连续对话实测，首次可听延迟中位数 964 毫秒，复测 1173 毫秒（本地测试 LLM、真实 TTS 与扬声器） |
-| GPT-SoVITS v2Pro 音色复用 | 可运行 | 通过 `api_v2.py` 的 `streaming_mode`，直接使用现有 `xiaote` 权重与参考音频 |
-| 本地语音识别 | 可运行 | faster-whisper small / int8 / CPU，中文 9.88 秒音频约 2.58 秒 |
-| 端点检测与打断 | 可运行 | 能量 VAD、最短语音与静音阈值，检测到新语音即打断当前回复 |
-| Minecraft 桥接 | 可运行 | 已在本机 Paper 1.21.1 上完成「玩家聊天 → 语音回复 → 挖方块 → 回报结果」；首次可听 975–1494 毫秒，动作完成 6108 毫秒 |
-| Minecraft 音频投递 | 可运行（复用现有 Mod） | 把语音按句写成 WAV 分段到现有 Mod 监听的目录，按音频时长节流以保证顺序 |
-| Voxkin Studio | 可运行 | 状态、试听、实时事件、延迟分解、配置、日志，以及受管引擎的启动/停止/重启与健康检查 |
+| 实时语音对话 | 可用 | 麦克风 → 本地识别 → 流式模型 → 分句 → 流式语音 → 扬声器 |
+| 游戏内聊天 | 可用 | 玩家在 Minecraft 里说话，沃心用语音回应 |
+| 游戏动作 | 可用 | 挖方块、走到坐标、看向玩家、停止，动作结果经桥接确认后才算完成 |
+| 打断 | 可用 | 新语音到来时关闭旧语音请求并清空播放队列 |
+| 长期记忆 | 可用 | SQLite 保存原始对话，空闲时把旧对话压缩成摘要，按关键词检索后放入上下文 |
+| 统一控制台 | 可用 | 状态、试听、实时事件、延迟分解、配置、服务启停、日志 |
+| 客户端音频 Mod | 构建通过，未在真实客户端验证 | 通过 WebSocket 接收 PCM 并播放，暂未接入空间音源 |
+| 多引擎适配 | 可用 | 语音合成可换 GPT-SoVITS 或 Genie；模型接口兼容 OpenAI 格式 |
 
-## 环境要求
+![Voxkin Studio 控制台](docs/images/studio.png)
+
+## 它是怎么工作的
+
+```mermaid
+flowchart LR
+    P[玩家语音或游戏聊天] --> A[语音识别 / 桥接]
+    A --> B[沃心 Core]
+    B --> C[流式模型]
+    C --> D[增量分句]
+    D --> E[流式语音合成]
+    E --> F[扬声器 / 游戏内 Mod]
+    C --> G[工具调用]
+    G --> H[Minecraft 桥接]
+    H --> I[游戏内动作]
+    I --> J[结果校验]
+    J --> B
+    B --> K[记忆库]
+    K --> B
+```
+
+两条通道互不等待：语音在动作执行之前就开始了，动作完成后结果会补一句播报。
+
+```mermaid
+sequenceDiagram
+    participant P as 玩家
+    participant C as Core
+    participant L as 模型
+    participant T as 语音合成
+    participant B as 游戏桥接
+
+    P->>C: 帮我挖三块泥土
+    C->>L: 流式请求
+    L-->>C: 文本 + 工具调用
+    C->>T: 第一句
+    T-->>C: 音频分块
+    C->>P: 开始说话
+    C->>B: collect_blocks
+    B->>B: 寻路并挖掘
+    B-->>C: 挖到 3 个泥土
+    C->>T: 结果播报
+    T-->>P: 好了，挖到 3 个泥土
+```
+
+## 延迟实测
+
+测试机器：i9-14900HX、RTX 4060 Laptop 8GB、32GB 内存；语音合成使用 GPT-SoVITS v2Pro，识别使用 faster-whisper small。
+
+| 场景 | 首次可听（中位数） | 说明 |
+| --- | --- | --- |
+| 本地测试模型 + 真实语音 | 964 ms | 验证管线本身的开销 |
+| 真实模型 + 真实语音 | 3871 ms | 真实网络与模型首 token 占主要部分 |
+| 游戏内聊天到语音 | 975–1494 ms | 真实模型未参与该轮，用本地测试模型 |
+| 语音识别 | 9.88 秒音频 2.58 秒 | CPU、int8 |
+
+完整数据与复现命令见 [基准结果](docs/BENCHMARK_RESULTS.md)。
+
+## 快速开始
+
+### 1. 准备环境
 
 - Windows 10/11，Python 3.10
-- Node.js 20 以上（仅 Minecraft 桥接需要）
-- GPT-SoVITS v2Pro 运行包（`runtime/python.exe`、`GPT_SoVITS`、`api_v2.py`）
-- 音色权重：`GPT_weights/*.ckpt` 与 `SoVITS_weights/*.pth`
-- 可选：NVIDIA 显卡（本项目在 RTX 4060 Laptop 8GB 上以 `cuda`、`is_half: true` 运行）
+- Node.js 20 以上（Minecraft 桥接与客户端 Mod 构建）
+- JDK 21（只用于构建 Fabric Mod）
+- GPT-SoVITS v2Pro 运行包与一个训练好的音色
 
-## 安装
+### 2. 安装与配置
 
 ```powershell
+git clone https://github.com/DeckDes233/Voxkin.git
+cd Voxkin
 python -m venv .venv --system-site-packages
 .\.venv\Scripts\python.exe -m pip install -U pip
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-```
-
-`genie-tts`、`faster-whisper`、`sounddevice` 按需安装：`pip install -e ".[tts,stt,audio]"`。
-
-## 配置
-
-```powershell
 Copy-Item config\voxkin.example.yaml config\voxkin.yaml
 ```
 
-- `config/voxkin.example.yaml`：可提交的配置样例。
-- `config/voxkin.yaml`：本地实际配置，端口、模型路径等，不进入版本库。
-- `config/local.yaml`：不进入版本库的覆盖项，可写 API Key 与个人路径。
-
-API Key 只从环境变量 `DEEPSEEK_API_KEY` 或 `config/local.yaml` 读取，日志与状态接口不会返回明文。
-
-### 接入 OpenCode Go
-
-`config/local.yaml` 示例（密钥只写在这里，文件已被忽略）：
+把模型密钥写进 `config/local.yaml`：
 
 ```yaml
 llm:
@@ -59,60 +135,79 @@ llm:
     x-opencode-session: "voxkin-deepseek-chan-01"
 ```
 
-服务端要求 `x-opencode-session` 请求头，缺少时返回 `400 MissingSessionID`。模型列表可用 `GET https://opencode.ai/inference/go/v1/models` 查询。加载工具定义后，模型可以直接调用 `collect_blocks`、`goto`、`chat`、`stop`、`look_at_player`。
-
-## 启动
+### 3. 启动三个服务
 
 ```powershell
-# 1. GPT-SoVITS 语音服务（独立目录，示例路径）
-runtime\python.exe api_v2.py -a 127.0.0.1 -p 9880 -c GPT_SoVITS\configs\tts_infer.yaml
+# 语音合成
+<GPT-SoVITS 目录>\runtime\python.exe api_v2.py -a 127.0.0.1 -p 9880 -c GPT_SoVITS\configs\tts_infer.yaml
 
-# 2. Voxkin Studio 与控制服务
+# 控制台
 .\.venv\Scripts\python.exe -m voxkin serve
-# 打开 http://127.0.0.1:8765
 
-# 3. Minecraft 桥接（可选）
+# Minecraft 桥接
 cd bridge
 npm install
 $env:MC_HOST="127.0.0.1"; $env:MC_PORT="25565"; $env:MC_USERNAME="Voxkin"
 node minecraft_bridge.js
 ```
 
-## 常用命令
+打开 <http://127.0.0.1:8765> 就能看到控制台，在输入框里发一句话即可试听完整链路。
 
-```powershell
-python -m voxkin doctor                     # 环境、模型、音频设备检查
-python -m voxkin say "你好"                  # 一轮完整链路
-python -m voxkin tts "你好" --out work\a.wav # 只测 TTS
-python -m voxkin stt work\a16k.wav          # 只测识别
-python -m voxkin talk work\a.wav            # 文件模拟说话，跑完识别到播放
-python -m voxkin bench --turns 5            # 连续多轮延迟基准
-python -m voxkin mic --seconds 30           # 麦克风实时对话
+### 4. 在游戏里使用
+
+1. 启动 Minecraft 1.21.1 与 Fabric Loader。
+2. 把 `mod/build/libs/voxkin-audio-0.1.0.jar` 与 Fabric API 放进 `mods/`。
+3. 把 `config/voxkin.yaml` 的 `audio.output` 改成 `websocket`。
+4. 进入世界后，桥接机器人会加入服务器，玩家在聊天框里说话即可。
+
+客户端 Mod 当前的播放不经过游戏混音器，空间音源在后续版本接入。
+
+## 配置
+
+| 文件 | 用途 |
+| --- | --- |
+| `config/voxkin.example.yaml` | 可提交的默认配置 |
+| `config/voxkin.yaml` | 本地实际配置，不进入版本库 |
+| `config/local.yaml` | 密钥与个人路径覆盖，不进入版本库 |
+| `data/voxkin.db` | 对话与记忆数据库，不进入版本库 |
+
+常用开关：
+
+```yaml
+audio:
+  output: "speaker"        # speaker / minecraft_file / websocket / wav_dir
+
+memory:
+  enabled: true
+  summarize_threshold: 8   # 累计多少条消息后压缩一次
+  context_token_budget: 900
 ```
 
-## 目录
+## 项目结构
 
 ```
-src/voxkin/            核心包：配置、事件、管线、适配器、服务
-src/voxkin/studio/     Studio 前端资源
-tests/                 单元测试与 WebSocket 集成测试
-tools/dev_llm_server.py 本地 OpenAI 兼容流式服务，用于离线基准
-bridge/                Minecraft 桥接客户端（Node.js）
-docs/                  审计、架构、评估、决策、路线图、状态、基准
-scripts/               模型准备与环境脚本
+src/voxkin/          核心：配置、管线、模型与语音适配器、记忆、服务
+src/voxkin/studio/   控制台前端
+bridge/              Minecraft 桥接（mineflayer）
+mod/                 Fabric 客户端音频 Mod
+tests/               自动化测试
+tools/               本地测试模型
+docs/                审计、架构、评估、决策、路线图、状态、基准
 ```
 
 ## 文档
 
-- [仓库审计](docs/REPO_AUDIT.md)
-- [架构与数据流](docs/ARCHITECTURE.md)
-- [技术评估](docs/TECH_EVALUATION.md)
-- [决策记录](docs/DECISIONS.md)
-- [路线图](docs/ROADMAP.md)
-- [当前状态](docs/STATUS.md)
-- [基准结果](docs/BENCHMARK_RESULTS.md)
-- [MindCraft 源码审计](docs/research/MINDCRAFT_AUDIT.md)
+| 文档 | 内容 |
+| --- | --- |
+| [小白版说明](docs/GETTING_STARTED_CN.md) | 不写代码也能看懂的上手流程 |
+| [架构](docs/ARCHITECTURE.md) | 组件、数据流、时序、故障恢复 |
+| [仓库审计](docs/REPO_AUDIT.md) | 旧项目 MiddleAPI 与 Mod 的问题定位 |
+| [技术评估](docs/TECH_EVALUATION.md) | GPT-SoVITS、Genie、CosyVoice、IndexTTS 的对比证据 |
+| [决策记录](docs/DECISIONS.md) | 为什么这样拆分与选型 |
+| [路线图](docs/ROADMAP.md) | 后续优先级 |
+| [当前状态](docs/STATUS.md) | 已完成、已知问题、阻塞 |
+| [基准结果](docs/BENCHMARK_RESULTS.md) | 所有实测数据与复现方式 |
 
-## 许可证与边界
+## 许可证
 
-本仓库不包含模型权重、参考录音与第三方运行包。真实 DeepSeek 请求默认不开启，基准使用本地测试服务，详见 [基准结果](docs/BENCHMARK_RESULTS.md)。
+项目协议待定，正在 MIT 与 GPL-3.0 之间评估。依赖清单与兼容性分析见 [许可证分析](docs/LICENSE_ANALYSIS.md)。在协议确定前，请把本仓库视为保留所有权利。

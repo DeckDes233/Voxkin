@@ -16,6 +16,7 @@ graph TD
         SPLIT[SentenceSplitter<br/>可朗读文本]
         DISP[ActionDispatcher]
         SUP[ServiceSupervisor<br/>启停/健康检查]
+        MEM[MemoryStore<br/>SQLite 对话与摘要]
         HUB[EventHub]
         MET[MetricsStore]
     end
@@ -54,6 +55,8 @@ graph TD
     SUP -->|start/stop| TTS
     PIPE --> MET
     PIPE --> HUB
+    PIPE --> MEM
+    MEM --> PIPE
 
     PIPE --> SPK
     PIPE --> WAV
@@ -160,6 +163,8 @@ sequenceDiagram
 - `ServiceSupervisor`：`register(spec)`、`start(name)`、`stop(name)`、`restart(name)`、`health(name)`、`status()`。
 - 工具定义：`src/voxkin/agent/tools.py` 提供 `collect_blocks`、`goto`、`chat`、`stop`、`look_at_player`，随请求下发给模型；模型返回 `tool_calls` 时进入动作通道。
 - 语音播报：`ConversationPipeline.announce(text)` 把系统侧文本送入 TTS，用于动作开始确认与结果回报。
+- 记忆：`MemoryStore` 保存原始对话与压缩摘要，`ContextBuilder` 按关键词检索并按 token 预算组装上下文，`MemoryWriter` 在空闲时生成摘要。
+- 音频推送：`WebSocketAudioSink` 把 PCM 分块广播给 `/ws/audio`，客户端 Mod 按顺序播放，`flush` 消息用于打断。
 - 桥接消息：`hello`、`chat`、`state`（桥接 → Core）；`welcome`、`action`（Core → 桥接）；`action_result`（桥接 → Core）。
 
 ## 5. 并发模型
