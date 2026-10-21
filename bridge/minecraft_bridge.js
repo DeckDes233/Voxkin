@@ -265,7 +265,7 @@ async function runAction(message) {
   }, timeoutMs);
   try {
     if (
-      ['goto', 'come_to_player', 'collect_blocks', 'attack_nearest', 'stop', 'break_block', 'place_block', 'goto_block', 'pickup_items', 'craft', 'smelt', 'eat', 'sleep'].includes(
+      ['goto', 'come_to_player', 'collect_blocks', 'attack_nearest', 'attack_target', 'stop', 'break_block', 'place_block', 'goto_block', 'pickup_items', 'craft', 'smelt', 'eat', 'sleep'].includes(
         message.tool
       )
     ) {
@@ -318,6 +318,18 @@ async function runAction(message) {
         const range = Math.min(Math.max(Number(args.range) || 16, 3), 32);
         const target = findHostile(range);
         if (!target) throw new Error(`附近 ${range} 格内没有敌对生物`);
+        if (target.name === 'creeper') {
+          await retreatFrom(target);
+          detail = '苦力怕太近，先退到安全距离';
+          break;
+        }
+        detail = await attackEntity(target);
+        break;
+      }
+      case 'attack_target': {
+        const target = findAttackTarget(args);
+        if (!target) throw new Error('没有找到符合条件的实体');
+        if (target.type === 'player') throw new Error('不攻击玩家');
         if (target.name === 'creeper') {
           await retreatFrom(target);
           detail = '苦力怕太近，先退到安全距离';
@@ -1603,6 +1615,32 @@ function survivalTick() {
   if (bot.food <= 14 && Date.now() - lastEatAt > 10000) {
     eatIfPossible();
   }
+}
+
+function findAttackTarget(args) {
+  const range = Math.min(Math.max(Number(args.range) || 16, 3), 32);
+  if (args.id !== undefined) {
+    const entity = bot.entities[String(args.id)];
+    if (entity && entity.position) return entity;
+  }
+  const name = String(args.name || '').toLowerCase();
+  const type = String(args.type || '').toLowerCase();
+  return bot.nearestEntity((entity) => {
+    if (!entity.position || entity === bot.entity) return false;
+    if (entity.position.distanceTo(bot.entity.position) > range) return false;
+    if (name) {
+      const label = String(entity.name || entity.username || '').toLowerCase();
+      if (label !== name) return false;
+    }
+    if (type === 'hostile') {
+      return (entity.type === 'hostile' || entity.type === 'mob') && HOSTILE_MOBS.has(entity.name);
+    }
+    if (type === 'player') return entity.type === 'player';
+    if (type) {
+      return String(entity.type || '').toLowerCase() === type || String(entity.name || '').toLowerCase() === type;
+    }
+    return (entity.type === 'hostile' || entity.type === 'mob') && HOSTILE_MOBS.has(entity.name);
+  });
 }
 
 function resolvePlayer(name) {

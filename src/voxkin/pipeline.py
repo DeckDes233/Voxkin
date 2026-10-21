@@ -343,6 +343,7 @@ class ConversationPipeline:
             "craft": "好，我合成。",
             "smelt": "好，我去熔炼。",
             "attack_nearest": "好，我打它。",
+            "attack_target": "好，我打它。",
             "inventory": "好，我看看背包。",
             "observe": "好，我看看四周。",
             "eat": "好，我吃点东西。",
