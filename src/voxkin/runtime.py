@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from voxkin.agent.actions import ActionDispatcher
 from voxkin.audio.sinks import AudioSink, build_sink
 from voxkin.config import VoxkinConfig
 from voxkin.events import EventHub, MetricsStore
@@ -51,6 +52,7 @@ class Runtime:
     vad: VadSegmenter
     metrics: MetricsStore
     hub: EventHub
+    dispatcher: ActionDispatcher
     pipeline: ConversationPipeline
 
     @classmethod
@@ -85,6 +87,12 @@ class Runtime:
             metrics=metrics,
             emit=hub.publish,
         )
+        dispatcher = ActionDispatcher()
+
+        async def handle_action(call: dict[str, Any], turn) -> str:
+            return await dispatcher.dispatch(call["name"], call.get("arguments") or {})
+
+        pipeline.set_action_handler(handle_action)
         runtime = cls(
             config=config,
             llm=llm,
@@ -94,6 +102,7 @@ class Runtime:
             vad=VadSegmenter.from_config(config.stt),
             metrics=metrics,
             hub=hub,
+            dispatcher=dispatcher,
             pipeline=pipeline,
         )
         return runtime
@@ -109,6 +118,11 @@ class Runtime:
             "audio": self.sink.describe(),
             "metrics": self.metrics.aggregate(),
             "speaking": self.pipeline.is_speaking,
+            "bridge": {
+                "connected": self.dispatcher.connected,
+                "name": self.dispatcher.bridge_name,
+                "pending_actions": self.dispatcher.pending_count,
+            },
             "persona": self.config.persona.name,
             "project_root": str(Path.cwd()),
         }

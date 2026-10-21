@@ -12,3 +12,5 @@ data/
 studio_dist/
 models/
 src/*.egg-info/
+bridge/node_modules/
+bridge/package-lock.json

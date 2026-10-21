@@ -1,0 +1,136 @@
+import asyncio
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+
+from dev_llm_server import build_app as build_llm_app
+
+from support import ToneTTS
+from voxkin.agent.actions import ActionDispatcher
+from voxkin.audio.sinks import WavDirSink
+from voxkin.config import VoxkinConfig
+from voxkin.events import EventHub, MetricsStore
+from voxkin.llm.openai_compat import OpenAICompatLLM
+from voxkin.pipeline import ConversationPipeline
+from voxkin.server import StudioServer
+
+
+class Harness:
+    """把真实管线接到 Studio 服务上，用于验证 WebSocket 协议；TTS 使用确定音源。"""
+
+    def __init__(self, config: VoxkinConfig, tmp_path: Path) -> None:
+        self.config = config
+        self.hub = EventHub()
+        self.metrics = MetricsStore()
+        self.dispatcher = ActionDispatcher()
+        self.tts = ToneTTS(delay_s=0.001)
+        self.pipeline = ConversationPipeline(
+            config=config,
+            llm=OpenAICompatLLM(config.llm),
+            tts=self.tts,
+            sink=WavDirSink(tmp_path),
+            metrics=self.metrics,
+            emit=self.hub.publish,
+        )
+
+        async def handle_action(call: dict, turn) -> str:
+            return await self.dispatcher.dispatch(call["name"], call.get("arguments") or {})
+
+        self.pipeline.set_action_handler(handle_action)
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "bridge": {
+                "connected": self.dispatcher.connected,
+                "name": self.dispatcher.bridge_name,
+                "pending_actions": self.dispatcher.pending_count,
+            }
+        }
+
+
+@pytest.fixture
+async def stack(tmp_path):
+    llm_app = build_llm_app(delay_ms=2)
+    llm_runner = web.AppRunner(llm_app)
+    await llm_runner.setup()
+    llm_site = web.TCPSite(llm_runner, "127.0.0.1", 0)
+    await llm_site.start()
+    llm_port = llm_site._server.sockets[0].getsockname()[1]
+
+    config = VoxkinConfig()
+    config.llm.api_key = "test-key"
+    config.llm.base_url = f"http://127.0.0.1:{llm_port}/v1"
+    harness = Harness(config, tmp_path)
+    await harness.pipeline.start()
+
+    studio = StudioServer(harness, config_path=tmp_path / "voxkin.yaml")
+    server = TestServer(studio.build())
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        yield harness, client
+    finally:
+        await client.close()
+        await harness.pipeline.close()
+        await llm_runner.cleanup()
+
+
+async def test_bridge_websocket_dispatch(stack):
+    harness, client = stack
+    ws = await client.ws_connect("/ws/bridge?name=test")
+    welcome = await ws.receive_json()
+    assert welcome["type"] == "welcome"
+
+    task = asyncio.create_task(harness.dispatcher.dispatch("collect_blocks", {"block": "oak_log"}))
+    message = await ws.receive_json()
+    assert message["type"] == "action"
+    assert message["tool"] == "collect_blocks"
+    await ws.send_json(
+        {
+            "type": "action_result",
+            "action_id": message["action_id"],
+            "ok": True,
+            "detail": "collected 3 oak_log",
+        }
+    )
+    assert await task == "collected 3 oak_log"
+
+    status = await client.get("/api/status")
+    payload = await status.json()
+    assert payload["bridge"]["connected"] is True
+    await ws.close()
+
+
+async def test_bridge_chat_triggers_turn(stack):
+    harness, client = stack
+    ws = await client.ws_connect("/ws/bridge?name=test")
+    await ws.receive_json()
+    queue = harness.hub.subscribe()
+    await ws.send_json({"type": "chat", "text": "你好", "player": "Steve"})
+    finished = None
+    for _ in range(60):
+        event = await asyncio.wait_for(queue.get(), timeout=5)
+        if event.get("type") == "turn_finished":
+            finished = event
+            break
+    harness.hub.unsubscribe(queue)
+    await ws.close()
+    assert finished is not None
+    assert finished["summary"]["first_audible_ms"] is not None
+
+
+async def test_second_bridge_is_rejected(stack):
+    harness, client = stack
+    first = await client.ws_connect("/ws/bridge?name=first")
+    await first.receive_json()
+    second = await client.ws_connect("/ws/bridge?name=second")
+    error = await second.receive_json()
+    assert error["type"] == "error"
+    await first.close()
+    await second.close()

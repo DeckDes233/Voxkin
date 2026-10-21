@@ -12,6 +12,8 @@ from aiohttp import WSMsgType, web
 
 from voxkin.audio.capture import Microphone
 from voxkin.audio.wav import arrays_to_wav_bytes
+from voxkin.agent.actions import ActionError
+from voxkin.bridge.protocol import ActionResult, parse_chat
 from voxkin.config import load_config, save_config
 from voxkin.logging_setup import tail_log
 from voxkin.runtime import Runtime
@@ -40,6 +42,7 @@ class StudioServer:
         app.router.add_get("/api/audio/devices", self.audio_devices)
         app.router.add_post("/api/config", self.update_config)
         app.router.add_get("/ws", self.websocket)
+        app.router.add_get("/ws/bridge", self.bridge_socket)
         return app
 
     async def index(self, request: web.Request) -> web.StreamResponse:
@@ -155,6 +158,45 @@ class StudioServer:
         current.validate()
         save_config(current, self.config_path)
         return web.json_response({"saved": True, "changed": changed, "restart_required": changed})
+
+    async def bridge_socket(self, request: web.Request) -> web.StreamResponse:
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+        name = request.query.get("name", "mineflayer")
+
+        async def send(payload: dict[str, Any]) -> None:
+            if ws.closed:
+                raise ConnectionError("Minecraft 桥接连接已关闭")
+            await ws.send_str(json.dumps(payload, ensure_ascii=False))
+
+        try:
+            self.runtime.dispatcher.attach(send, name)
+        except ActionError as error:
+            await ws.send_str(json.dumps({"type": "error", "error": str(error)}, ensure_ascii=False))
+            await ws.close()
+            return ws
+        await send({"type": "welcome", "name": name, "protocol": 1})
+        try:
+            async for message in ws:
+                if message.type != WSMsgType.TEXT:
+                    continue
+                data = json.loads(message.data)
+                kind = data.get("type")
+                if kind == "chat":
+                    chat = parse_chat(data)
+                    asyncio.create_task(self.runtime.pipeline.respond(chat["text"]))
+                elif kind == "action_result":
+                    self.runtime.dispatcher.resolve(ActionResult.from_message(data))
+                elif kind == "hello":
+                    self.runtime.dispatcher.bridge_name = str(data.get("bridge", name))
+                    await send({"type": "welcome", "name": self.runtime.dispatcher.bridge_name})
+                elif kind == "state":
+                    await self.runtime.hub.publish(
+                        {"type": "bridge_state", "data": data.get("data", {})}
+                    )
+        finally:
+            self.runtime.dispatcher.detach(send)
+        return ws
 
     async def websocket(self, request: web.Request) -> web.StreamResponse:
         ws = web.WebSocketResponse(heartbeat=30)

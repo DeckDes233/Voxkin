@@ -1,0 +1,19 @@
+{
+  "name": "voxkin-minecraft-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "沃心 Minecraft 桥接：把游戏内聊天转发给 Voxkin Core，并在游戏里执行动作",
+  "main": "minecraft_bridge.js",
+  "scripts": {
+    "start": "node minecraft_bridge.js"
+  },
+  "dependencies": {
+    "mineflayer": "^4.24.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

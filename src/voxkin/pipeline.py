@@ -13,7 +13,7 @@ from voxkin.text import SentenceSplitter
 from voxkin.tts.base import TTSAdapter
 
 EventEmitter = Callable[[dict[str, Any]], Awaitable[None]]
-ActionHandler = Callable[[dict[str, Any], TurnTimeline], Awaitable[None]]
+ActionHandler = Callable[[dict[str, Any], TurnTimeline], Awaitable[str]]
 
 
 class ConversationPipeline:
@@ -36,6 +36,7 @@ class ConversationPipeline:
         self._generation = 0
         self._active_turn: TurnTimeline | None = None
         self._active_tasks: list[asyncio.Task] = []
+        self._background_tasks: set[asyncio.Task] = set()
         self._sentence_queue: asyncio.Queue[str | None] | None = None
         self._action_handler: ActionHandler | None = None
         self._started = False
@@ -146,10 +147,11 @@ class ConversationPipeline:
                 elif delta.kind == "tool_call" and delta.tool_call:
                     tool_calls += 1
                     action_task = asyncio.create_task(
-                        self._run_action(delta.tool_call, turn, generation),
+                        self._run_action(delta.tool_call, turn),
                         name=f"action-{turn.request_id}",
                     )
-                    self._active_tasks.append(action_task)
+                    self._background_tasks.add(action_task)
+                    action_task.add_done_callback(self._background_tasks.discard)
             for sentence in splitter.flush():
                 await self._enqueue_sentence(turn, sentence, queue)
             await queue.put(None)
@@ -233,9 +235,7 @@ class ConversationPipeline:
                     turn.mark("t5_first_audio")
                 await self.sink.play(turn.request_id, pcm)
 
-    async def _run_action(
-        self, call: dict[str, Any], turn: TurnTimeline, generation: int
-    ) -> None:
+    async def _run_action(self, call: dict[str, Any], turn: TurnTimeline) -> None:
         turn.mark("t7_action_start")
         await self._broadcast(
             {
@@ -245,19 +245,42 @@ class ConversationPipeline:
                 "arguments": call.get("arguments"),
             }
         )
-        if self._action_handler is not None:
-            await self._action_handler(call, turn)
-        if generation == self._generation:
-            turn.mark("t8_action_done")
+        if self._action_handler is None:
             await self._broadcast(
                 {
-                    "type": "action_finished",
+                    "type": "action_skipped",
                     "request_id": turn.request_id,
                     "tool": call.get("name"),
+                    "reason": "没有配置动作执行器",
                 }
             )
+            return
+        try:
+            detail = await self._action_handler(call, turn)
+        except Exception as error:
+            turn.meta.setdefault("action_errors", []).append(str(error))
+            await self._broadcast(
+                {
+                    "type": "action_failed",
+                    "request_id": turn.request_id,
+                    "tool": call.get("name"),
+                    "error": str(error),
+                }
+            )
+            return
+        turn.mark("t8_action_done")
+        await self._broadcast(
+            {
+                "type": "action_finished",
+                "request_id": turn.request_id,
+                "tool": call.get("name"),
+                "detail": detail,
+            }
+        )
 
     async def close(self) -> None:
+        for task in list(self._background_tasks):
+            task.cancel()
         try:
             await self.interrupt("shutdown")
         finally:
