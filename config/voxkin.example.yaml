@@ -37,6 +37,7 @@ stt:
   vad_min_silence_ms: 640
   sample_rate: 16000
   max_utterance_s: 20
+  to_simplified: true
 
 audio:
   output: "speaker"

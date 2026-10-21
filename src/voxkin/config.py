@@ -67,6 +67,7 @@ class STTConfig:
     vad_min_silence_ms: int = 640
     sample_rate: int = 16000
     max_utterance_s: float = 20.0
+    to_simplified: bool = True
 
 
 @dataclass
