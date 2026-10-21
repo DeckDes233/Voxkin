@@ -15,3 +15,7 @@ models/
 src/*.egg-info/
 bridge/node_modules/
 bridge/package-lock.json
+mod/.gradle/
+mod/build/
+mod/run/
+mod/.idea/

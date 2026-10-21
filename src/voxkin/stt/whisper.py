@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from voxkin.config import STTConfig
+from voxkin.stt.normalize import to_simplified
 
 
 class STTError(RuntimeError):
@@ -64,6 +65,8 @@ class WhisperSTT:
             condition_on_previous_text=False,
         )
         text = "".join(segment.text for segment in segments).strip()
+        if self.config.to_simplified and self.config.language.lower().startswith("zh"):
+            text = to_simplified(text)
         self.last_inference_seconds = round(time.perf_counter() - started, 3)
         return text
 

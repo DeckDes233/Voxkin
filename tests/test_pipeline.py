@@ -113,3 +113,31 @@ async def test_history_keeps_user_and_assistant(llm_port, tmp_path):
     roles = [item["role"] for item in pipeline.history]
     assert roles.count("user") == 1
     assert roles.count("assistant") == 1
+
+
+async def test_pipeline_persists_turns_to_memory(llm_port, tmp_path):
+    from voxkin.memory import MemoryStore
+
+    config = make_config(llm_port)
+    config.memory.db_path = str(tmp_path / "memory.db")
+    config.memory.summarize_threshold = 99
+    store = MemoryStore(config.memory)
+    store.initialize()
+    pipeline = ConversationPipeline(
+        config,
+        OpenAICompatLLM(config.llm),
+        ToneTTS(delay_s=0.001),
+        WavDirSink(tmp_path),
+        MetricsStore(),
+        memory=store,
+    )
+    await pipeline.start()
+    try:
+        await pipeline.respond("记住我喜欢在夜晚挖矿。")
+    finally:
+        await pipeline.close()
+    assert store.counts()["turns"] == 2
+    turns = store.recent_turns()
+    assert turns[0]["role"] == "user"
+    assert turns[1]["role"] == "assistant"
+    store.close()

@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -225,6 +226,30 @@ async def test_action_failure_is_spoken(stack):
     assert failed is not None
     assert summary["meta"].get("action_errors")
     assert any("没做成" in text for text in harness.tts.texts)
+
+
+async def test_audio_websocket_streams_pcm(stack):
+    harness, client = stack
+    from voxkin.audio.websocket import WebSocketAudioSink
+
+    sink = WebSocketAudioSink()
+    harness.pipeline.sink = sink
+    ws = await client.ws_connect("/ws/audio")
+    welcome = await ws.receive_json()
+    assert welcome["sample_rate"] == 32000
+
+    pcm = np.full(320, 500, dtype=np.int16)
+    task = asyncio.create_task(sink.play("turn-1", pcm))
+    header = await ws.receive_json()
+    assert header["type"] == "pcm"
+    assert header["bytes"] == 640
+    data = await ws.receive_bytes()
+    assert len(data) == 640
+    await task
+
+    await sink.flush()
+    assert (await ws.receive_json())["type"] == "flush"
+    await ws.close()
 
 
 async def test_second_bridge_is_rejected(stack):

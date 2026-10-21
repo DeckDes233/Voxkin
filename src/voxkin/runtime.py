@@ -10,6 +10,7 @@ from voxkin.config import VoxkinConfig
 from voxkin.events import EventHub, MetricsStore
 from voxkin.llm.base import LLMAdapter, LLMDelta, LLMError
 from voxkin.llm.openai_compat import OpenAICompatLLM
+from voxkin.memory import MemoryStore, MemoryWriter
 from voxkin.pipeline import ConversationPipeline
 from voxkin.services import ServiceSpec, ServiceSupervisor
 from voxkin.stt.vad import VadSegmenter
@@ -56,6 +57,7 @@ class Runtime:
     dispatcher: ActionDispatcher
     pipeline: ConversationPipeline
     supervisor: ServiceSupervisor
+    memory: MemoryStore | None = None
 
     @classmethod
     async def create(cls, config: VoxkinConfig) -> "Runtime":
@@ -74,6 +76,8 @@ class Runtime:
             )
         elif config.audio.output == "wav_dir":
             sink = build_sink("wav_dir", directory=config.audio.wav_dir)
+        elif config.audio.output == "websocket":
+            sink = build_sink("websocket", sample_rate=32000)
         else:
             sink = build_sink(
                 "speaker",
@@ -81,6 +85,14 @@ class Runtime:
                 device=config.audio.device,
                 volume=config.audio.volume,
             )
+        dispatcher = ActionDispatcher()
+        store: MemoryStore | None = None
+        writer: MemoryWriter | None = None
+        if config.memory.enabled:
+            store = MemoryStore(config.memory)
+            store.initialize()
+            if isinstance(llm, OpenAICompatLLM):
+                writer = MemoryWriter(store, llm, config.memory)
         pipeline = ConversationPipeline(
             config=config,
             llm=llm,
@@ -88,8 +100,9 @@ class Runtime:
             sink=sink,
             metrics=metrics,
             emit=hub.publish,
+            memory=store,
+            memory_writer=writer,
         )
-        dispatcher = ActionDispatcher()
 
         async def handle_action(call: dict[str, Any], turn) -> str:
             return await dispatcher.dispatch(call["name"], call.get("arguments") or {})
@@ -117,6 +130,7 @@ class Runtime:
             dispatcher=dispatcher,
             pipeline=pipeline,
             supervisor=supervisor,
+            memory=store,
         )
         return runtime
 
@@ -139,6 +153,7 @@ class Runtime:
                 "name": self.dispatcher.bridge_name,
                 "pending_actions": self.dispatcher.pending_count,
             },
+            "memory": self.memory.counts() if self.memory is not None else {"enabled": False},
             "persona": self.config.persona.name,
             "project_root": str(Path.cwd()),
         }
@@ -148,3 +163,5 @@ class Runtime:
             await self.pipeline.close()
         finally:
             await self.supervisor.close()
+            if self.memory is not None:
+                self.memory.close()

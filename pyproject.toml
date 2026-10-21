@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=1.26",
     "PyYAML>=6.0",
     "soundfile>=0.12",
+    "opencc-python-reimplemented>=0.1.7",
 ]
 
 [project.optional-dependencies]

@@ -11,6 +11,7 @@ from voxkin.audio.sinks import AudioSink
 from voxkin.config import VoxkinConfig
 from voxkin.events import MetricsStore, TurnTimeline
 from voxkin.llm.base import LLMAdapter, LLMDelta
+from voxkin.memory import ContextBuilder, MemoryStore, MemoryWriter
 from voxkin.text import SentenceSplitter
 from voxkin.tts.base import TTSAdapter
 
@@ -27,6 +28,8 @@ class ConversationPipeline:
         sink: AudioSink,
         metrics: MetricsStore,
         emit: EventEmitter | None = None,
+        memory: MemoryStore | None = None,
+        memory_writer: MemoryWriter | None = None,
     ) -> None:
         self.config = config
         self.llm = llm
@@ -34,7 +37,20 @@ class ConversationPipeline:
         self.sink = sink
         self.metrics = metrics
         self.emit = emit
-        self.history: deque[dict[str, str]] = deque(maxlen=config.persona.max_history_turns * 2)
+        self.memory = memory
+        self.memory_writer = memory_writer
+        system_parts = []
+        if config.persona.system_prompt:
+            system_parts.append(config.persona.system_prompt)
+        if config.llm.enable_tools:
+            system_parts.append(TOOL_SYSTEM_HINT)
+        self._system_prompt = "\n".join(system_parts)
+        self._context_builder = (
+            ContextBuilder(memory, config.memory, self._system_prompt) if memory is not None else None
+        )
+        self._local_history: deque[dict[str, str]] = deque(
+            maxlen=config.persona.max_history_turns * 2
+        )
         self._generation = 0
         self._active_turn: TurnTimeline | None = None
         self._active_tasks: list[asyncio.Task] = []
@@ -44,6 +60,7 @@ class ConversationPipeline:
         self._accept_audio = False
         self._action_handler: ActionHandler | None = None
         self._started = False
+        self._summarize_task: asyncio.Task | None = None
         self.sink.set_playback_start_callback(self._on_playback_start)
         self._spoken_texts: dict[str, list[str]] = {}
 
@@ -72,17 +89,20 @@ class ConversationPipeline:
         turn.mark("t6_playback_start", stamp)
 
     def _build_messages(self, user_text: str) -> list[dict[str, str]]:
+        if self._context_builder is not None:
+            return self._context_builder.build(user_text)
         messages: list[dict[str, str]] = []
-        system_parts = []
-        if self.config.persona.system_prompt:
-            system_parts.append(self.config.persona.system_prompt)
-        if self.config.llm.enable_tools:
-            system_parts.append(TOOL_SYSTEM_HINT)
-        if system_parts:
-            messages.append({"role": "system", "content": "\n".join(system_parts)})
-        messages.extend(self.history)
+        if self._system_prompt:
+            messages.append({"role": "system", "content": self._system_prompt})
+        messages.extend(self._local_history)
         messages.append({"role": "user", "content": user_text})
         return messages
+
+    @property
+    def history(self) -> list[dict[str, Any]]:
+        if self.memory is not None:
+            return self.memory.recent_turns(limit=self.config.memory.recent_turns)
+        return list(self._local_history)
 
     def _tool_schemas(self) -> list[dict[str, Any]] | None:
         return MINECRAFT_TOOLS if self.config.llm.enable_tools else None
@@ -116,6 +136,8 @@ class ConversationPipeline:
     async def respond(self, user_text: str, request_id: str | None = None) -> dict[str, Any]:
         if not self._started:
             await self.start()
+        if self._summarize_task is not None and not self._summarize_task.done():
+            self._summarize_task.cancel()
         if self._active_turn is not None:
             await self.interrupt("superseded")
         self._generation += 1
@@ -209,13 +231,29 @@ class ConversationPipeline:
             )
         turn.meta["tokens"] = len(collected)
         turn.meta["tool_calls"] = tool_calls
-        self.history.append({"role": "user", "content": user_text})
-        if collected:
-            self.history.append({"role": "assistant", "content": "".join(collected)})
+        if self.memory is not None:
+            self.memory.add_turn(turn.request_id, "user", user_text)
+            if collected:
+                self.memory.add_turn(turn.request_id, "assistant", "".join(collected))
+            if self.memory_writer is not None:
+                self._summarize_task = asyncio.create_task(
+                    self._delayed_summarize(), name=f"memory-{turn.request_id}"
+                )
+                self._background_tasks.add(self._summarize_task)
+                self._summarize_task.add_done_callback(self._background_tasks.discard)
+        else:
+            self._local_history.append({"role": "user", "content": user_text})
+            if collected:
+                self._local_history.append({"role": "assistant", "content": "".join(collected)})
         self.metrics.add(turn)
         summary = turn.summary()
         await self._broadcast({"type": "turn_finished", "summary": summary})
         return summary
+
+    async def _delayed_summarize(self) -> None:
+        await asyncio.sleep(self.config.memory.summarize_delay_s)
+        if self.memory_writer is not None:
+            await self.memory_writer.maybe_summarize()
 
     async def announce(self, text: str) -> None:
         """把一句系统侧的话送进语音通道，不经过 LLM。"""
