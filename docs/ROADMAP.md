@@ -2,6 +2,14 @@
 
 按优先级排列。P0 是让系统在真实游戏中可用的必要条件，P1 是体验与可维护性，P2 是长期目标。
 
+## 最终里程碑
+
+> 最后的milestone是沃心独立通关一次mc，全流程，我只负责旁观。
+
+定义、边界与验收条件见 [最终里程碑](MILESTONE.md)。阶段计划见 [独立通关路线图](plans/INDEPENDENT_RUN_ROADMAP.md)，架构见 [自治架构](plans/AUTONOMOUS_RUN_ARCHITECTURE.md)，评测见 [评测体系](plans/EVALUATION.md)。
+
+当前所有 P0/P1/P2 都是这个里程碑的子任务；与通关无关的优化排在其后。
+
 ## P0
 
 | 任务 | 依赖 | 验收条件 |
