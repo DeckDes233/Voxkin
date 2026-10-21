@@ -164,6 +164,8 @@ async def test_action_runs_while_speech_completes(stack):
     assert finished is not None
     assert finished["tool"] == "collect_blocks"
     assert finished["detail"] == "collected 3 oak_log"
+    record = harness.metrics.recent(1)[0]
+    assert record["action_done_ms"] is not None
 
 
 async def test_llm_test_endpoint(stack):

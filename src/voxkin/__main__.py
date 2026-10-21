@@ -38,6 +38,10 @@ def build_parser() -> argparse.ArgumentParser:
     mic = sub.add_parser("mic", help="麦克风实时对话")
     mic.add_argument("--seconds", type=float, default=30.0)
 
+    talk = sub.add_parser("talk", help="用 WAV 文件模拟一次说话，跑完识别到播放的完整链路")
+    talk.add_argument("file", type=Path)
+    talk.add_argument("--realtime", action="store_true", help="按 32ms 一块实时投递音频")
+
     bench = sub.add_parser("bench", help="连续多轮延迟基准")
     bench.add_argument("--turns", type=int, default=5)
     bench.add_argument("--text", default="你好，今天我们一起去做点什么？")
@@ -135,6 +139,45 @@ async def run_mic(config, seconds: float) -> None:
         await runtime.close()
 
 
+async def run_talk(config, path: Path, realtime: bool) -> None:
+    import soundfile as sf
+    from scipy.signal import resample_poly
+
+    from voxkin.runtime import Runtime
+
+    audio, rate = sf.read(str(path), dtype="float32")
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    if rate != config.stt.sample_rate:
+        audio = resample_poly(audio, config.stt.sample_rate, rate).astype("float32")
+    runtime = await Runtime.create(config)
+    await runtime.start()
+    try:
+        await asyncio.to_thread(runtime.stt.load)
+        vad = VadSegmenter.from_config(config.stt)
+        block = 512
+        utterances = []
+        for start in range(0, audio.size, block):
+            utterances.extend(vad.feed(audio[start : start + block]))
+            if realtime:
+                await asyncio.sleep(block / config.stt.sample_rate)
+        utterances.extend(vad.flush())
+        if not utterances:
+            raise SystemExit("没有检测到语音片段")
+        for utterance in utterances:
+            speech_end = time.perf_counter()
+            text = await asyncio.to_thread(runtime.stt.transcribe, utterance)
+            stt_ms = round((time.perf_counter() - speech_end) * 1000, 1)
+            if not text:
+                continue
+            summary = await runtime.pipeline.respond(text)
+            summary["stt_ms"] = stt_ms
+            summary["recognized"] = text
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+    finally:
+        await runtime.close()
+
+
 async def run_bench(config, turns: int, text: str, out: Path | None) -> None:
     from voxkin.events import percentile
     from voxkin.runtime import Runtime
@@ -201,6 +244,8 @@ def main(argv: list[str] | None = None) -> int:
         run_stt(config, args.file)
     elif args.command == "mic":
         asyncio.run(run_mic(config, args.seconds))
+    elif args.command == "talk":
+        asyncio.run(run_talk(config, args.file, args.realtime))
     elif args.command == "bench":
         asyncio.run(run_bench(config, args.turns, args.text, args.json))
     elif args.command == "doctor":

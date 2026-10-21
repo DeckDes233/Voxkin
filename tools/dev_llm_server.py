@@ -48,9 +48,11 @@ async def completions(request: web.Request) -> web.StreamResponse:
     delay = request.app["delay_ms"] / 1000.0
     text = request.app["reply"]
     messages = body.get("messages") or []
-    wants_action = bool(messages) and "ACTION" in str(messages[-1].get("content", ""))
+    last_user = str(messages[-1].get("content", "")) if messages else ""
+    wants_action = "ACTION" in last_user
+    dig_block = "dirt" if "泥土" in last_user else "oak_log"
     if wants_action:
-        text = "我先去砍点木头。"
+        text = "我先去挖一点。"
     chunk_size = 2
     for index in range(0, len(text), chunk_size):
         payload = {
@@ -73,7 +75,7 @@ async def completions(request: web.Request) -> web.StreamResponse:
                                 "type": "function",
                                 "function": {
                                     "name": "collect_blocks",
-                                    "arguments": json.dumps({"block": "oak_log", "count": 3}),
+                                    "arguments": json.dumps({"block": dig_block, "count": 3}),
                                 },
                             }
                         ]

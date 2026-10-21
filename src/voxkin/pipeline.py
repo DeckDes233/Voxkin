@@ -259,6 +259,7 @@ class ConversationPipeline:
             detail = await self._action_handler(call, turn)
         except Exception as error:
             turn.meta.setdefault("action_errors", []).append(str(error))
+            self.metrics.update(turn)
             await self._broadcast(
                 {
                     "type": "action_failed",
@@ -269,6 +270,7 @@ class ConversationPipeline:
             )
             return
         turn.mark("t8_action_done")
+        self.metrics.update(turn)
         await self._broadcast(
             {
                 "type": "action_finished",

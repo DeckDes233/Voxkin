@@ -90,6 +90,17 @@ class MetricsStore:
             if len(self._turns) > self._capacity:
                 self._turns = self._turns[-self._capacity :]
 
+    def update(self, timeline: TurnTimeline) -> None:
+        record = timeline.summary()
+        with self._lock:
+            for index, existing in enumerate(self._turns):
+                if existing.get("request_id") == record["request_id"]:
+                    self._turns[index] = record
+                    return
+            self._turns.append(record)
+            if len(self._turns) > self._capacity:
+                self._turns = self._turns[-self._capacity :]
+
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
             return list(reversed(self._turns[-limit:]))

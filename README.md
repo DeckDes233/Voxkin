@@ -12,7 +12,7 @@
 | GPT-SoVITS v2Pro 音色复用 | 可运行 | 通过 `api_v2.py` 的 `streaming_mode`，直接使用现有 `xiaote` 权重与参考音频 |
 | 本地语音识别 | 可运行 | faster-whisper small / int8 / CPU，中文 9.88 秒音频约 2.58 秒 |
 | 端点检测与打断 | 可运行 | 能量 VAD、最短语音与静音阈值，检测到新语音即打断当前回复 |
-| Minecraft 桥接 | 协议与客户端已完成，未连真实服务器验证 | WebSocket 协议已通过真实 WebSocket 集成测试；`bridge/minecraft_bridge.js` 需要 Minecraft 服务端才能端到端验证 |
+| Minecraft 桥接 | 可运行 | 已在本机 Paper 1.21.1 上完成「玩家聊天 → 语音回复 → 挖方块 → 回报结果」；首次可听 975–1494 毫秒，动作完成 6108 毫秒 |
 | Minecraft 音频投递 | 可运行（复用现有 Mod） | 把语音按句写成 WAV 分段到现有 Mod 监听的目录，按音频时长节流以保证顺序 |
 | Voxkin Studio | 可运行 | 状态、试听、实时事件、延迟分解、配置、日志，以及受管引擎的启动/停止/重启与健康检查 |
 
@@ -70,6 +70,7 @@ python -m voxkin doctor                     # 环境、模型、音频设备检�
 python -m voxkin say "你好"                  # 一轮完整链路
 python -m voxkin tts "你好" --out work\a.wav # 只测 TTS
 python -m voxkin stt work\a16k.wav          # 只测识别
+python -m voxkin talk work\a.wav            # 文件模拟说话，跑完识别到播放
 python -m voxkin bench --turns 5            # 连续多轮延迟基准
 python -m voxkin mic --seconds 30           # 麦克风实时对话
 ```
