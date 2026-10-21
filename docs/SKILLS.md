@@ -44,8 +44,8 @@
 | 15 | eat_food | partial | 反射 `bridge:715-726`，触发 `892-895,919-921` | 无工具；`consume` 失败只写日志，无 food 增量校验 | 5 |
 | 16 | craft_item | existing | `tools.py:192-214`；`bridge:502-533` | 材料不足也先放工作台（`510-517`），只取 `recipes[0]`（`522`） | 8 |
 | 17 | place_block | existing | `tools.py:137-153`；`bridge:401-433` | 只收绝对坐标，目标非空即失败（`406`），无放置后校验 | — |
-| 18 | attack_target | missing | 内部 `bridge:603-659` | 需要实体句柄，无 `case`，不可编排 | 6 |
-| 19 | attack_nearest | partial | `tools.py:97-114`；`bridge:223-240` | 只 `lookAt`+`attack` 不接近；苦力怕后撤在 `670-673` 未复用 | 6 |
+| 18 | attack_target | partial | `tools.py` attack_target；`bridge` 的 `attack_target` | 已支持 id/名字/类型，拒绝玩家；未实机验证 | 6 |
+| 19 | attack_nearest | partial | `tools.py` attack_nearest；`bridge` 复用 `attackEntity` | 已接近、射箭、苦力怕后撤；未实机验证 | 6 |
 | 20 | assess_threat | missing | 内部 `bridge:896-918` | 只用于自动开战，无威胁摘要 | 2 |
 
 ### 1.2 P1 / P2
@@ -111,8 +111,8 @@
 
 | skill_id | 参数 | 前置 | 后置 | 失败原因与恢复 | 超时 / 取消 | 测试方法 | 状态证据 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| attack_target | entity_id | 目标可见且存活 | 目标死亡或脱离 | 无 `case`；内部 `attackEntity` 有接近、弓、低血退出（`603-659`），不可寻址 | 20 次×600ms；有中断检查（`609`） | fake 实体生命期，断言只打指定 id | missing |
-| attack_nearest | range 3-32 | 范围内有 hostile（`46-52`） | 目标消失 | 不接近，远目标空挥 24 次（`230-235`）；苦力怕不后撤；无弓、盾、低血逻辑 | 24×600ms≈14.4s；无中断检查 | 16 格放僵尸，断言接近后击杀；未验证 | partial |
+| attack_target | id / name / type / range | 目标可见且存活 | 目标死亡或脱离 | 按 id、名字或类型解析；玩家拒绝；苦力怕后撤；接近与远程共用 `attackEntity` | 20 次×600ms；有中断检查 | fake 实体生命期，断言只打指定目标 | partial |
+| attack_nearest | range 3-32 | 范围内有 hostile | 目标消失 | 复用 `attackEntity`：接近、远程、苦力怕后撤；未实机验证 | 20 次×600ms；有中断检查 | 16 格放僵尸，断言接近后击杀；未验证 | partial |
 | assess_threat | range | 已进世界 | 威胁清单与建议 | 无 | 建议 1s | 同 observe_environment 夹具 | missing |
 
 ## 3. 意图路由审计
@@ -160,10 +160,10 @@
 | --- | --- | --- |
 | 真实 Minecraft 端到端 | 本次未运行；`node --check` 通过 | 审计命令 |
 | bridge 逻辑测试 | 无 JS 单测；`test_bridge` 只验 WebSocket 帧与派发 | `tests/test_bridge.py:104-127` |
-| 测试数量 | 文档已统一为 136；本次实跑 136 | `docs/STATUS.md:27`；`docs/MILESTONE.md:46`；`docs/plans/EVALUATION.md:17` |
+| 测试数量 | 文档已统一为 138；本次实跑 138 | `docs/STATUS.md:27`；`docs/MILESTONE.md:46`；`docs/plans/EVALUATION.md:17` |
 | 路线图交付物 | `scripts/run_stage.py`、`bridge/skills/manifest.js` 不存在 | `docs/plans/INDEPENDENT_RUN_ROADMAP.md:102-107` |
 | 独立模式接线 | `VOXKIN_INDEPENDENT` 只在 bridge 读取，Python 侧零引用 | `bridge:90,1209-1211` |
-| 动作数量 | 文档写 20 个，新增 5 个技能与 smelt 后 `case` 为 20 个 | `bridge:189-380` |
+| 动作数量 | 文档写 21 个，新增 5 个技能、smelt 与 attack_target 后 `case` 为 21 个 | `bridge:189-420` |
 | 并发改动 | `observe`、`eat`、`locate_block`、`locate_entity`、`sleep` 已在 `e1ee85e` 提交；本表状态仍按 `b602e1d` 基线，这 5 项未逐行重评 | `git show e1ee85e --stat` |
 | 行号基线 | 本表按 `b602e1d`，工作树行号已偏移；核对用 `git show b602e1d:bridge/minecraft_bridge.js` | 同上 |
 
