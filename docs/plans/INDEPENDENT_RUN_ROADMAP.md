@@ -94,7 +94,7 @@ checkpoint 在每次阶段切换和每 10 分钟写入（TaskStore + `runs/<run_
 | M0 | 4 | 背包到阶段的只读判定报告 | `agent/progress.py`、`tests/test_progress.py` | 输出阶段与缺料清单 |
 | M0 | 5 | 30 分钟纯观测基线 | `runs/`、`docs/plans/EVALUATION.md` | 完整率 ≥99%，无人工输入 |
 | M1 | 1 | TaskRunner 循环与 step 终态 | `agent/runner.py`（新） | 单测覆盖 done/failed/retry/cancelled |
-| M1 | 2 | Verifier：背包、坐标、维度、方块四类规则 | `progress.py`、`runner.py` | 每步可机器判定 |
+| M1 | 2 | Verifier：背包、坐标、维度、方块四类规则（S2 按食物与床、S4 按钻石镐判定） | `progress.py`、`runner.py` | 每步可机器判定 |
 | M1 | 3 | TaskStore 扩展 checkpoint、resume、事件查询 | `agent/tasks.py` | 重启后可续跑 |
 | M1 | 4 | 死亡重生、卡住检测、bridge 重连 | `runner.py`、`minecraft_bridge.js` | `/kill` 后 5 分钟恢复 |
 | M1 | 5 | 独立模式：关闭向玩家要坐标与自动跟随 | `minecraft_bridge.js`、`runner.py` | 无玩家在线时不发求助 |

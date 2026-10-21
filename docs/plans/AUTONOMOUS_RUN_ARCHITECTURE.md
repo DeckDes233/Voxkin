@@ -6,70 +6,60 @@
 
 | 项 | 选择 | 依据 |
 | --- | --- | --- |
-| 任务模型 | HTN + 方法白名单；LLM 只做方法选择、参数绑定与失败重规划 | 通关顺序固定且分层，完成条件可机器判定（`src/voxkin/agent/progress.py:15-65`、`:82-83`） |
+| 任务模型 | HTN + 方法白名单，LLM 只做方法选择、参数绑定与失败重规划 | 通关顺序固定且分层，完成条件可机器判定（`src/voxkin/agent/progress.py:15-65`、`:82-83`） |
 | 决策分层 | bridge 反射 100ms、TaskRunner 调度 1s、Planner 规划 30–120s | 真实 LLM 首 token p50 2594.7ms（`docs/BENCHMARK_RESULTS.md:86`） |
-| 执行主体 | Core 的 TaskRunner；bridge 只执行一个 skill 并回报结构化证据 | 桥接动作串行且无取消（`bridge/minecraft_bridge.js:154-165`、`src/voxkin/agent/actions.py:71-88`） |
-| 首个纵向切片 | 空背包 → 木镐 → 石镐 → 熔炉 → 铁镐（S0–S3），零干预 | 现有动作只覆盖采集、移动与放置（`src/voxkin/agent/tools.py:5-192`） |
+| 执行主体 | Core 的 TaskRunner；bridge 只执行一个 skill 并回报结构化证据 | 桥接动作串行，长任务没有 step 级取消（`bridge/minecraft_bridge.js:154-165`、`src/voxkin/agent/actions.py:71-88`） |
+| 首个切片 | 空背包 → 木镐 → 石镐 → 熔炉 → 铁镐（S0–S3），零干预 | 现有动作只覆盖采集、移动与放置（`src/voxkin/agent/tools.py:5-192`） |
 
 ## 1. 现状与差距
 
-| 能力 | 现状 | 证据 | 对通关的影响 |
+| 能力 | 现状 | 证据 | 影响 |
 | --- | --- | --- | --- |
-| 阶段表 | S0–S6；`is_complete` 只比对背包；无运行路径导入 | `progress.py:15-65`、`:82-83`；`tests/test_progress.py:3` | 无前置条件、调度与恢复；S5、S6 过粗 |
+| 阶段表 | S0–S6；`is_complete` 只比对背包；无运行路径导入 | `progress.py:15-65`、`:82-83`；`tests/test_progress.py:3` | 无前置条件、调度与恢复 |
 | 动作集 | 12 个：采集、移动、放置、背包、攻击、拾取 | `src/voxkin/agent/tools.py:5-192`、`bridge/minecraft_bridge.js:188-266` | 无 craft、smelt、chest、sleep、portal、bow |
-| 动作队列 | 单队列串行；attack_nearest、stop 插队并打断当前动作 | `bridge/minecraft_bridge.js:66`、`:70`、`:144-165` | 无 step 级进度、超时未分级、长任务独占 |
-| 动作超时 | 统一 120s | `src/voxkin/agent/actions.py:20` | 探索、下界类动作必然超时 |
-| 状态帧 | 5s 一帧：位置、朝向、维度、时间、天气、血量、饥饿、玩家 | `bridge/minecraft_bridge.js:1027`、`:1106-1124` | 缺背包、耐久、脚下方块、死亡坐标、传送事件 |
-| 死亡 | `death` 事件停跟随与闲逛；重生由 mineflayer 默认完成 | `bridge/minecraft_bridge.js:1071-1077`、`bridge/node_modules/mineflayer/lib/loader.js:75` | 不回收掉落物、不恢复任务 |
-| 反射 | 受击反击、低血后撤、进食、苦力怕避让 | `bridge/minecraft_bridge.js:616-659`、`:661-693` | 与任务无仲裁协议，抢占后不通知 Core |
-| 记忆 | 只有对话记忆 | `src/voxkin/memory.py:66-97` | 无地点、箱子、探索覆盖、路线 |
-| 播报 | `announce` 可直接进 TTS | `src/voxkin/pipeline.py:273-284` | 任务播报需节流 |
+| 动作队列 | 单队列串行；attack_nearest、stop 插队并打断当前动作；统一 120s 超时 | `bridge/minecraft_bridge.js:66`、`:70`、`:144-165`；`src/voxkin/agent/actions.py:20` | 无 step 级取消与进度；探索类超时 |
+| 状态帧 | 5s 一帧：位置、朝向、维度、时间、天气、血量、饥饿、玩家 | `bridge/minecraft_bridge.js:1027`、`:1106-1124` | 缺背包、耐久、脚下方块、死亡坐标 |
+| 死亡 | `death` 事件停跟随与闲逛；重生由 mineflayer 默认完成 | `bridge/minecraft_bridge.js:1071-1077`、`node_modules/mineflayer/lib/loader.js:75` | 不回收掉落物、不恢复任务 |
+| 反射 | 受击反击、低血后撤、进食、苦力怕避让 | `bridge/minecraft_bridge.js:616-659`、`:661-693` | 与任务无仲裁协议 |
+| 记忆 | 只有对话记忆；播报走 `announce` | `src/voxkin/memory.py:66-97`、`src/voxkin/pipeline.py:273-284` | 无地点、箱子、探索覆盖 |
 
 ## 2. 总体架构
 
 | 组件 | 职责 | 不负责 |
 | --- | --- | --- |
 | Core | 进程、配置、事件总线、语音回合 | 单步动作细节 |
-| TaskRunner | 任务队列、抢占仲裁、检查点、恢复、阶段推进 | 生成计划内容 |
+| TaskRunner | 队列、抢占仲裁、检查点、恢复、阶段推进 | 生成计划内容 |
 | Planner | 方法选择、参数绑定、失败重规划 | 逐 tick 控制 |
-| Executor | 把 Step 变成 skill 调用，收集执行前后证据 | 判定成功与否 |
+| Executor | 把 Step 变成 skill 调用，收集前后证据 | 判定成功与否 |
 | Verifier | 规则判定、证据落库、失败分类 | 调用模型 |
-| Skill Layer | 可取消、可重跑的游戏操作单元 | 跨步骤编排 |
-| Bridge | mineflayer 连接、本地反射、状态与事件上报 | 任务级决策 |
+| Skill Layer + Bridge | 可取消的游戏操作单元；mineflayer 连接、本地反射、状态上报 | 任务级决策 |
 | Memory | 对话记忆、世界记忆、任务存储 | 参与实时控制 |
 
 ```mermaid
 graph TD
-  subgraph Game[游戏侧 Node]
+  subgraph Game[游戏侧]
     MC[Paper 1.21.1] --- BR[Bridge mineflayer]
     BR --> BF[反射 FSM]
     BR --> SK[Skill Layer]
   end
   subgraph Core[Voxkin Core]
-    PIPE[ConversationPipeline] --- RUN[TaskRunner]
-    RUN --> PLAN[Planner] --> GATE[LLM 调度门]
-    PIPE --- GATE
-    RUN --> EXE[Executor] --> DISP[ActionDispatcher]
-    EXE --> VER[Verifier]
-    VER --> WM[(WorldMemory)]
-    VER --> TS[(TaskStore)]
-    RUN --> WM
-    RUN --> TS
-    RUN --> PIPE
-    WM --> PLAN
-    TS --> PLAN
-    MEM[(对话记忆)] --- PIPE
+  PIPE[ConversationPipeline] --- RUN[TaskRunner]
+  RUN --> PLAN[Planner] --> GATE[LLM 调度门] --- PIPE
+  RUN --> EXE[Executor] --> DISP[ActionDispatcher]
+  EXE --> VER[Verifier] --> WM[(WorldMemory)]
+  VER --> TS[(TaskStore)]
+  RUN --> WM
+  RUN --> TS
+  RUN --> PIPE
   end
   BR -- state/reflex/death --> DISP
   SK -- action_result/progress --> DISP
   DISP --> RUN
-  EXE -- skill --> DISP
   PIPE -- 玩家指令 --> RUN
 ```
 
-- 数据流：`observe` 拉取背包、方块、实体、区块 → Executor 调 skill → bridge 回报结果与进度 → Executor 再 observe → Verifier 判定 → TaskRunner 写检查点并推进阶段。
-- 单一运行步：同一时刻只有一个 running step；skill 是最小原子单位，可取消、可重跑。
-- 证据只认结构化 `observe` 与事件；`detail` 是中文可朗读文本（`bridge/minecraft_bridge.js:278-289`），不参与判定；语音通道不等待任务。
+- 数据流：`observe` 拉取背包、方块、实体、区块 → Executor 调 skill → bridge 回报结果与进度 → 再 observe → Verifier 判定 → TaskRunner 写检查点并推进阶段；同一时刻只有一个 running step，语音通道不等待任务。
+- 证据只认结构化 `observe` 与事件，`detail` 是中文可朗读文本（`bridge/minecraft_bridge.js:278-289`），不参与判定。
 
 ## 3. 任务模型
 
@@ -80,48 +70,29 @@ graph TD
 | HTN | 方法分层，前置与效果显式 | 任务网络可序列化 | 重选方法即可 | 采用 |
 | 状态机 | 转移清晰 | 状态少易存 | 组合爆炸 | 只用于 bridge 反射（`bridge/minecraft_bridge.js:616-693`） |
 
-- 选 HTN：S0–S6 已是分层目标（`progress.py:15-65`），每个目标有可判定的完成条件（`progress.py:82-83`），可一一映射为方法。
-- 前置与效果交给 Verifier 逐条检查，满足「每步可机器检查」（`docs/PROGRESSION_AGENT.md:92`）；失败只重选未完成子任务，已完成部分保留。
-- LLM 输出被方法白名单约束，`docs/PROGRESSION_AGENT.md:17-19` 的规划/执行/验证分工保持不变。
+- 选 HTN：S0–S6 是分层目标（`progress.py:15-65`），完成条件可判定（`progress.py:82-83`），能一一映射为方法；前置与效果交给 Verifier 检查，满足「每步可机器检查」（`docs/PROGRESSION_AGENT.md:92`）。
+- LLM 输出被方法白名单约束，失败只重选未完成子任务，`docs/PROGRESSION_AGENT.md:17-19` 的规划/执行/验证分工保持不变。
 
 | 结构 | 字段 |
 | --- | --- |
 | Task | `id`、`parent`、`method`、`goal(Predicate)`、`status`（pending/ready/running/done/failed/blocked）、`priority`、`attempts/max`、`deadline`、`checkpoint` |
 | Step | `id`、`task_id`、`ordinal`、`skill`、`args`、`pre[]`、`post[]`、`verify`、`timeout_s`、`retry`、`on_failure`、`idem_key`、`restartable` |
 | Predicate / Effect | `kind`（item/block/dim/pos/time/vitals/flag/entity）、`args`、`negate`；Effect 另含 `expected` |
-| Retry | `max`、`backoff_s[]`、`mutators[]`（半径×2、换目标点、换工具）、`classes`（transient/permanent/unsafe） |
-| Replan | `scope`（step/task/stage）、`budget`、`context_delta`、`trigger` |
+| Retry / Replan | Retry：`max`、`backoff_s[]`、`mutators[]`（半径×2、换目标点、换工具）、`classes`（transient/permanent/unsafe）；Replan：`scope`（step/task/stage）、`budget`、`context_delta`、`trigger` |
 
 ## 4. 三个模型的契约
 
-### 4.1 Planner
-
-- 触发：阶段入口、replan、阶段失败恢复；禁止按步调用；≤1 次/2min、≤3 次/阶段、≤60 次/小时。
-- 输入 JSON：
-
+**Planner**：阶段入口、replan、阶段失败恢复时调用；≤1 次/2min、≤3 次/阶段、≤60 次/小时。输入：
 ```json
-{"stage":"S3","goal":"iron_pickaxe>=1","inventory":{"raw_iron":5,"coal":3},
- "state":{"pos":[12,64,-3],"dim":"overworld","health":18,"food":17,"time":6000},
- "world":{"base":[10,64,0],"known":[{"kind":"furnace","pos":[11,64,1]}],"danger":[]},
- "skills":["craft","smelt","collect_blocks","goto"],
- "recent":[{"step":"smelt iron_ingot","ok":false,"reason":"no fuel"}],"budget":{"max_steps":5}}
+{"stage":"S3","goal":"iron_pickaxe>=1","inventory":{"raw_iron":5,"coal":3},"state":{"pos":[12,64,-3],"dim":"overworld","health":18,"food":17,"time":6000},"world":{"base":[10,64,0],"known":[{"kind":"furnace","pos":[11,64,1]}]},"skills":["craft","smelt","collect_blocks","goto"],"recent":[{"step":"smelt iron_ingot","ok":false,"reason":"no fuel"}],"budget":{"max_steps":5}}
 ```
-
-- 输出 JSON：
-
+**Planner 输出**：
 ```json
-{"stage":"S3","reason":"缺燃料","steps":[{"skill":"collect_blocks","args":{"block":"coal_ore","count":8},
- "pre":[{"kind":"item","args":{"id":"wooden_pickaxe","n":1}}],"post":[{"kind":"item","args":{"id":"coal","n":8}}],
- "verify":"inv_delta","timeout_s":90,"on_failure":"replan"}],"fallbacks":["用木板烧铁"]}
+{"stage":"S3","reason":"缺燃料","steps":[{"skill":"collect_blocks","args":{"block":"coal_ore","count":8},"pre":[{"kind":"item","args":{"id":"wooden_pickaxe","n":1}}],"post":[{"kind":"item","args":{"id":"coal","n":8}}],"verify":"inv_delta","timeout_s":90,"on_failure":"replan"}],"fallbacks":["用木板烧铁"]}
 ```
+- 校验与预算：JSON schema；`skill` 在 manifest；`post` 非空且规则已知；步数 ≤5；阶段不回退，非法时带错误重问 1 次，再失败用方法库默认展开；上下文 system ≤200 token、输入 ≤900、输出 ≤500，不注入完整对话历史（`docs/PROGRESSION_AGENT.md:93`）。
 
-- 校验：JSON schema；`skill` 在 manifest；`post` 非空且规则已知；args 合法；步数 ≤5；物品 id 来自 minecraft-data；阶段不回退。非法时带错误重问 1 次，再失败用方法库默认展开。
-- 上下文预算：system ≤200 token、输入 ≤900、输出 ≤500；不注入完整对话历史（`docs/PROGRESSION_AGENT.md:93`）。
-
-### 4.2 Executor
-
-- 默认 scripted：方法库给出 skill 与 args，Executor 只做前置检查、派发、等结果；LLM 模式仅在 skill 返回 `needs_decision` 时启用（≤1 次 LLM、≤4 次工具调用、≤30s）。
-
+**Executor**：默认 scripted，方法库给出 skill 与 args；LLM 模式仅在 skill 返回 `needs_decision` 时启用（≤1 次 LLM、≤4 次工具调用、≤30s）。
 ```text
 step = queue.next_ready()
 if not verifier.pre_ok(step): return replan(step)
@@ -134,7 +105,7 @@ for attempt in 1..step.retry.max:
 return replan(step)
 ```
 
-### 4.3 Verifier
+**Verifier**：
 
 | rule | 判定 | 证据来源 |
 | --- | --- | --- |
@@ -142,17 +113,16 @@ return replan(step)
 | `block_placed` / `block_gone` | 坐标方块等于目标 / 为空气 | `observe.blocks` |
 | `dimension` / `position` | 维度等于目标 / 与目标距离 ≤ r | `state` |
 | `entity_count` | 目标实体消失或击杀数达标 | 事件 + `observe.entities` |
-| `container` | 槽位含指定物品 | `observe.container` |
-| `flag` / `survived` | 世界记忆标记 / 步骤期间无死亡无掉落 | WorldMemory、事件流 |
+| `container` / `flag` | 槽位含指定物品 / 世界记忆标记成立 | `observe.container`、WorldMemory |
+| `survived` | 步骤期间无死亡、无关键掉落 | 事件流 |
 
 ```json
-{"step_id":"s-S3-2","ts":1729500000.0,"rule":"inv_delta","subject":"iron_ingot",
- "before":0,"after":3,"source":"observe","ok":true,"attempt":1}
+{"step_id":"s-S3-2","ts":1729500000.0,"rule":"inv_delta","subject":"iron_ingot","before":0,"after":3,"source":"observe","ok":true,"attempt":1}
 ```
 
-- 失败关闭：缺证据视为未通过；`detail` 文本不参与；每次尝试都留证（`docs/PROGRESSION_AGENT.md:56-58`）。
+失败关闭：缺证据视为未通过，`detail` 文本不参与，每次尝试都留证（`docs/PROGRESSION_AGENT.md:56-58`）。
 
-### 4.4 预算
+**预算**：
 
 | 项 | 值 | 理由 |
 | --- | --- | --- |
@@ -160,41 +130,31 @@ return replan(step)
 | Executor LLM | ≤1/step、≤40/小时 | 全程数百步 |
 | 上下文 | Planner ≤1200 token、Executor ≤900 | 现有对话预算 900（`src/voxkin/config.py:111`） |
 | 工具调用 | ≤4/step、并发 1 | 桥接串行（`bridge/minecraft_bridge.js:154-165`） |
-| 重试 | step 2（transient 3）、task 3、replan 3/阶段 | 防无限重试 |
-| 运行 | 12h 软上限 | 到点进安全态并报告 |
+| 重试与运行 | step 2（transient 3）、task 3、replan 3/阶段；12h 软上限 | 防无限重试，到点进安全态并报告 |
 
 ## 5. 世界记忆
 
-地点类型：`base`、`bed`、`table`、`furnace`、`chest`、`portal`、`stronghold`、`village`、`spawner`、`waypoint`、`water`、`lava`、`death_spot`。
-
+地点类型：`base`、`bed`、`table`、`furnace`、`chest`、`portal`、`stronghold`、`village`、`spawner`、`waypoint`、`water`、`lava`、`death_spot`。存 `data/voxkin.db`，与对话记忆共用 WAL（`src/voxkin/memory.py:69-70`）：
 ```sql
--- data/voxkin.db，与对话记忆共用 WAL（src/voxkin/memory.py:69-70）
-CREATE TABLE places(id INTEGER PRIMARY KEY, run_id TEXT, kind TEXT, name TEXT, dim TEXT,
-  x REAL, y REAL, z REAL, payload TEXT, confidence REAL, first_seen REAL, last_seen REAL, visits INTEGER, status TEXT);
+CREATE TABLE places(id INTEGER PRIMARY KEY, run_id TEXT, kind TEXT, name TEXT, dim TEXT, x REAL, y REAL, z REAL, payload TEXT, confidence REAL, first_seen REAL, last_seen REAL, visits INTEGER, status TEXT);
 CREATE UNIQUE INDEX ux_places ON places(run_id, dim, round(x), round(y), round(z), kind);
-CREATE TABLE containers(id INTEGER PRIMARY KEY, place_id INTEGER, dim TEXT, x REAL, y REAL, z REAL, slots TEXT, updated_at REAL);
-CREATE TABLE routes(id INTEGER PRIMARY KEY, run_id TEXT, src INTEGER, dst INTEGER, dim TEXT,
-  waypoints TEXT, distance REAL, status TEXT, updated_at REAL);
-CREATE TABLE cells(id INTEGER PRIMARY KEY, run_id TEXT, dim TEXT, cx INTEGER, cz INTEGER,
-  status TEXT, scanned_at REAL, note TEXT);
+CREATE TABLE containers(id INTEGER PRIMARY KEY, place_id INTEGER, slots TEXT, updated_at REAL);
+CREATE TABLE cells(id INTEGER PRIMARY KEY, run_id TEXT, dim TEXT, cx INTEGER, cz INTEGER, status TEXT, scanned_at REAL, note TEXT);
 CREATE UNIQUE INDEX ux_cells ON cells(run_id, dim, cx, cz);
-CREATE TABLE dangers(id INTEGER PRIMARY KEY, run_id TEXT, kind TEXT, dim TEXT, x REAL, y REAL,
-  z REAL, radius REAL, severity INTEGER, created_at REAL, expires_at REAL);
+CREATE TABLE routes(id INTEGER PRIMARY KEY, run_id TEXT, src INTEGER, dst INTEGER, dim TEXT, waypoints TEXT, distance REAL, status TEXT);
+CREATE TABLE dangers(id INTEGER PRIMARY KEY, run_id TEXT, kind TEXT, dim TEXT, x REAL, y REAL, z REAL, radius REAL, severity INTEGER, expires_at REAL);
 ```
 
-避免重复探索：
-
-- 查询优先：任何「找 X」先查 `places`/`containers`，半径内命中就复用，未命中才 `findBlocks`。
+- 查询优先：任何「找 X」先查 `places`/`containers`，半径内命中就复用，未命中才 `findBlocks`；bridge 只上报事实，Verifier 与 TaskRunner 写库。
 - 覆盖栅格：主世界每 64×64 格一个 cell，扫描后写 `status=scanned`；下一探索点按「邻接未扫描 cell 数 / 距离」打分。
-- 负结果：搜索失败写 `cells.note`，60min 内不重复搜索同一 cell；要塞用射线三角定位，不做网格遍历。
-- 路线与配对：成功路径写 `routes`，连续 2 次失败标 `degraded`；`portal` 记录对端 place，坐标按 ×8 换算存 `payload`。
-- 死亡点：`death_spot` 记录坐标、维度、时间与背包摘要，回收决策据此做；写入权在 Verifier 与 TaskRunner，Planner 只读摘要。
+- 负结果与路线：搜索失败写 `cells.note`，60min 内不重复搜索；成功路径写 `routes`，连续 2 次失败标 `degraded`。
+- 传送门与死亡点：`portal` 记录对端 place，坐标按 ×8 换算存 `payload`；`death_spot` 记坐标、维度、时间与背包摘要，回收决策据此做；Planner 只读摘要。
 
 ## 6. 恢复机制
 
 | 故障 | 检测信号 | 阈值 | 恢复动作 | 升级 |
 | --- | --- | --- | --- | --- |
-| 死亡 | `death` 事件（`bridge/minecraft_bridge.js:1071-1077`）；health=0 | 即时 | mineflayer 默认重生（`loader.js:75`）；写 death_spot；重生后重新 observe | 同点 10min 内 3 次死亡 → 划危险区、换路线、报告 |
+| 死亡 | `death` 事件（`bridge/minecraft_bridge.js:1071-1077`）；health=0；y<−60 | 即时 | mineflayer 默认重生（`loader.js:75`）；写 death_spot；重生后重新 observe | 同点 10min 内 3 次死亡 → 划危险区、换路线、报告 |
 | 卡住 | 位移 <0.3 格且 skill 运行中；pathfinder 无路径 | 3s | 跳 → 侧移 → 重算（canDig=false）→ 扩 searchRadius → 允许挖 → 换目标（`docs/research/PLAYER_LIKENESS.md:171`） | 同一目标 3 次 → 放弃并写 cell 阻塞 |
 | 岩浆/火 | `inLava` 或脚下 lava/fire；血量连续下降 | 100ms 反射 | jump + 向最近固体移动；有水桶先放水；寻路已避开 lava（`bridge/minecraft_bridge.js:1000-1017`） | 4s 未脱困 → 撤离并报告 |
 | 饥饿 | `state.food`（`bridge/minecraft_bridge.js:1114`） | 1s | ≤14 进食（`:690-692`）；≤6 停战；无食物 → 觅食任务插队 | food=0 且 5min 无食物 → 暂停危险任务并报告 |
@@ -204,7 +164,6 @@ CREATE TABLE dangers(id INTEGER PRIMARY KEY, run_id TEXT, kind TEXT, dim TEXT, x
 | 区块未加载 | `blockAt` 返回 null；observe 空缺；travelTo 已等区块（`bridge/minecraft_bridge.js:293-295`） | 5s | 等待 5s → 前进 8 格 → 重试 observe；未知方块不挖 | 同坐标 3 次 → 换入口或路线 |
 | 背包满 | `used_slots ≥ 36` 或 `emptySlotCount=0` | 1s | 存入已知 chest；无 chest 按白名单丢弃（泥土、沙砾、超额圆石）；关键物品禁丢 | 腾不出 3 格 → 回基地并报告 |
 | 工具损坏 | `held.remaining < 10%` 或物品消失 | 事件 + 1s | 换同级备用 → 升下一档 → 触发做工具任务 | 无材料无备用 → 回基地取并报告 |
-| 坠落虚空 | y < −60；末地 y < 0 | 即时 | 按死亡分支处理；末地先搭平台再移动 | 并入死亡升级 |
 
 ## 7. 长任务执行
 
@@ -216,35 +175,31 @@ CREATE TABLE dangers(id INTEGER PRIMARY KEY, run_id TEXT, kind TEXT, dim TEXT, x
 | 3 | TaskRunner | 挖矿、合成、探索 | 正常执行 |
 | 4 | 闲逛 | 空闲 | 仅无任务时（`bridge/minecraft_bridge.js:815-824`） |
 
-- 仲裁点唯一：所有抢占先写 run_state（running/paused/preempted/blocked），再决定是否发 cancel。
+- 仲裁点唯一：抢占先写 run_state（running/paused/preempted/blocked），再决定是否发 cancel。
 - 语音打断不取消动作：`pipeline.interrupt` 只取消 `_active_tasks`（`src/voxkin/pipeline.py:136-139`），动作在 `_background_tasks`（`:201-206`）；玩家说停必须显式派发 stop。
-- 暂停不打断 skill，等其返回或 cancel 生效（≤2s）；恢复先 observe，再重验最后 5 个 done step。
-- 检查点：`{run_id, stage, task_id, step_ordinal, attempt, inventory_digest, last_evidence_id}`，每个 verified step 后写；running 状态重启后按 unknown 处理。
-- 幂等：`idem_key` 唯一索引；执行前 `post_ok` 则跳过；点门、交易、投眼、睡觉等 consumable 步骤必须先 verify。
+- 暂停不打断 skill，等其返回或 cancel 生效（≤2s）；恢复先 observe 再重验最后 5 个 done step；检查点写 `{run_id, stage, task_id, step_ordinal, attempt, inventory_digest, last_evidence_id}`，`idem_key` 唯一索引，执行前 `post_ok` 则跳过，点门、交易、投眼、睡觉等 consumable 步骤必须先 verify。
 
 | 现有机制 | 位置 | 冲突 | 配合方式 |
 | --- | --- | --- | --- |
-| 单队列串行 | `bridge/minecraft_bridge.js:154-165` | 长 skill 独占 | skill 硬上限 110s，超时 bridge 自停 |
+| 单队列串行 + 120s 超时 | `bridge/minecraft_bridge.js:154-165`；`src/voxkin/agent/actions.py:20` | 长 skill 独占，探索类必超时 | skill 硬上限 110s；per-tool timeout + 分段进度 |
 | 优先动作插入 | `bridge/minecraft_bridge.js:70`、`:144-152` | 只覆盖 attack_nearest、stop | 扩为 cancel、stop、observe 三类 |
-| 只有全局 interrupted 标志 | `bridge/minecraft_bridge.js:133-142` | 子循环轮询；无逐 skill token | 每个 skill 子循环检查 cancel token |
-| Core 120s 超时 | `src/voxkin/agent/actions.py:20` | 探索类必超时 | per-tool timeout + 分段进度 |
+| 无取消令牌 | `bridge/minecraft_bridge.js:133-142` | 靠 interrupted 轮询 | 每个 skill 子循环检查 cancel token |
 | 无进度事件 | `bridge/minecraft_bridge.js:278-289` | 无法检查点 | 新增 skill_progress（phase、pct、at） |
 
 ## 8. 终局流程
 
 | # | 步骤 | 前置条件 | 所需技能 | 失败回退 | 完成判定 |
 | --- | --- | --- | --- | --- | --- |
-| 1 | 下界门 | 10 obsidian、flint_and_steel、diamond_pickaxe | craft、place_block、use_on_block | 无黑曜石 → 岩浆浇铸；无打火石 → 铁+燧石 | 门激活 + 维度切换 |
-| 2 | 进入下界 | 门、食物 ≥8、铁装 | goto、portal_enter | 门被毁 → 重建 | dimension=the_nether |
-| 3 | 找下界要塞 | 下界石砖方块 | explore、scan、break_block | 30min 未找到 → 回主世界换方向 | places 记录 fortress |
-| 4 | 烈焰棒 ≥7 | 石剑以上、可选抗火 | attack_nearest(blaze)、pickup | 低血 → 撤退重进；刷怪笼旁建掩体 | 背包 blaze_rod ≥7（`progress.py:56`） |
-| 5 | 末影珍珠 ≥16 | 铁剑、夜晚或诡异森林 | attack_nearest(enderman)、pickup | 不足 → 猪灵以物易物或延长猎杀 | 背包 ender_pearl ≥16 |
-| 6 | 合成末影之眼 | 烈焰粉 + 珍珠 | craft | 粉不足 → 补烈焰棒 | eye_of_ender ≥12 |
-| 7 | 定位要塞 | 12 眼、两点以上三角测量 | throw_eye、goto、dig_down | 眼碎 → 补眼；无信号 → 换点重测 | 找到 end_portal_frame |
-| 8 | 激活末地门 | 12 眼、frame 有空位 | place_block、use_on | 眼不足 → 回第 6 步 | flag:end_portal_lit |
-| 9 | 末地平台 | 落点 (100,49,0) | place_block、goto、bridge | 无方块 → 拆平台边缘 | 抵达主岛 |
-| 10 | 摧毁水晶 | 弓 + 箭，或方块 + 剑 | shoot、build、attack | 无弓 → 攀柱近战 | 10 个 crystal 消失 |
-| 11 | 击败末影龙 | 铁装、剑、食物、水桶 | attack_entity、retreat、place_block | 低血 → 掩体回血；龙息 → 离开 | 龙死亡 + 出口传送门出现 |
+| 1 | 下界门并进入 | 10 obsidian、flint_and_steel、diamond_pickaxe、食物 ≥8 | craft、place_block、use_on_block、goto、portal_enter | 无黑曜石 → 岩浆浇铸；无打火石 → 铁+燧石；门被毁 → 重建 | 门激活且 dimension=the_nether |
+| 2 | 找下界要塞 | 下界石砖方块 | explore、scan、break_block | 30min 未找到 → 回主世界换方向 | places 记录 fortress |
+| 3 | 烈焰棒 ≥7 | 石剑以上、可选抗火 | attack_nearest(blaze)、pickup | 低血 → 撤退重进；刷怪笼旁建掩体 | 背包 blaze_rod ≥7（`progress.py:56`） |
+| 4 | 末影珍珠 ≥16 | 铁剑、夜晚或诡异森林 | attack_nearest(enderman)、pickup | 不足 → 猪灵以物易物或延长猎杀 | 背包 ender_pearl ≥16 |
+| 5 | 合成末影之眼 | 烈焰粉 + 珍珠 | craft | 粉不足 → 补烈焰棒 | eye_of_ender ≥12 |
+| 6 | 定位要塞 | 12 眼、两点以上三角测量 | throw_eye、goto、dig_down | 眼碎 → 补眼；无信号 → 换点重测 | 找到 end_portal_frame |
+| 7 | 激活末地门 | 12 眼、frame 有空位 | place_block、use_on | 眼不足 → 回第 5 步 | flag:end_portal_lit |
+| 8 | 末地平台 | 落点 (100,49,0) | place_block、goto、bridge | 无方块 → 拆平台边缘 | 抵达主岛 |
+| 9 | 摧毁水晶 | 弓 + 箭，或方块 + 剑 | shoot、build、attack | 无弓 → 攀柱近战 | 10 个 crystal 消失 |
+| 10 | 击败末影龙 | 铁装、剑、食物、水桶 | attack_entity、retreat、place_block | 低血 → 掩体回血；龙息 → 离开 | 龙死亡 + 出口传送门出现 |
 
 ## 9. 安全边界
 
@@ -265,16 +220,12 @@ CREATE TABLE dangers(id INTEGER PRIMARY KEY, run_id TEXT, kind TEXT, dim TEXT, x
 | --- | --- | --- | --- |
 | `src/voxkin/agent/tasks.py`、`methods.py` | 新增 | Task/Step/Predicate/Retry 数据类；S0–S6 方法库与默认展开 | `progress.py:15-65` |
 | `src/voxkin/agent/runner.py` | 新增 | 队列、仲裁、检查点、恢复 | `actions.py`、`pipeline.py` |
-| `src/voxkin/agent/planner.py` | 新增 | 提示、JSON schema、校验、降级 | `llm/base.py` |
-| `src/voxkin/agent/verifier.py` | 新增 | 规则表、证据格式 | `events.py` |
+| `src/voxkin/agent/planner.py`、`verifier.py` | 新增 | 提示、JSON schema、校验、降级；规则表、证据格式 | `llm/base.py`、`events.py` |
 | `src/voxkin/agent/world_memory.py`、`task_store.py` | 新增 | places/containers/cells/routes/dangers；tasks/steps/evidence/checkpoints | `memory.py:66-97` |
 | `src/voxkin/agent/progress.py` | 修改 | 增加前置条件；拆分 S5/S6 子阶段 | 现有 STAGES |
-| `src/voxkin/agent/tools.py` | 修改 | 新工具 schema（craft、smelt、sleep、chest、portal、bow、observe、cancel） | 现有 12 个 |
-| `src/voxkin/agent/actions.py` | 修改 | cancel、observe、per-tool timeout、进度订阅 | `dispatch` |
-| `src/voxkin/server.py` | 修改 | `/api/run/*`，bridge 新消息类型 | 现有 WebSocket |
-| `src/voxkin/runtime.py` | 修改 | 组装 TaskRunner 与两个 store | `create()` |
-| `src/voxkin/pipeline.py` | 修改 | 玩家指令 → runner.preempt；播报节流 | `announce` |
-| `src/voxkin/config.py`、`llm/openai_compat.py` | 修改 | AutonomyConfig；单次调用覆盖 temperature/max_tokens | 现有 dataclass、`stream_chat` |
+| `src/voxkin/agent/tools.py`、`actions.py` | 修改 | 新工具 schema（craft、smelt、sleep、chest、portal、bow、observe、cancel）；cancel、observe、per-tool timeout | 现有 12 个工具、`dispatch` |
+| `src/voxkin/server.py`、`runtime.py` | 修改 | `/api/run/*`、bridge 新消息类型；组装 TaskRunner 与两个 store | 现有 WebSocket、`create()` |
+| `src/voxkin/pipeline.py`、`config.py`、`llm/openai_compat.py` | 修改 | 玩家指令 → runner.preempt；AutonomyConfig；单次调用覆盖 temperature/max_tokens | `announce`、dataclass、`stream_chat` |
 | `bridge/minecraft_bridge.js` | 修改 | 分发到 skills、取消令牌、状态扩展 | 现有 switch |
 | `bridge/skills/*.js`、`manifest.json` | 新增 | craft/smelt/chest/sleep/portal/combat/observe/build/shoot；技能清单与版本 | mineflayer 内置 API |
 
