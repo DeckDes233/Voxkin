@@ -44,6 +44,7 @@ class StudioServer:
         app.router.add_get("/api/services", self.services)
         app.router.add_post("/api/services/{name}/{action}", self.service_action)
         app.router.add_post("/api/config", self.update_config)
+        app.router.add_post("/api/llm/test", self.llm_test)
         app.router.add_get("/ws", self.websocket)
         app.router.add_get("/ws/bridge", self.bridge_socket)
         return app
@@ -162,6 +163,19 @@ class StudioServer:
     async def audio_devices(self, request: web.Request) -> web.Response:
         devices = await asyncio.to_thread(Microphone.list_devices)
         return web.json_response({"input": devices})
+
+    async def llm_test(self, request: web.Request) -> web.Response:
+        from voxkin.llm.base import LLMError
+        from voxkin.llm.openai_compat import OpenAICompatLLM, TimedLLMProbe
+
+        if not isinstance(self.runtime.llm, OpenAICompatLLM):
+            raise web.HTTPConflict(text="当前没有配置可用的 LLM 凭据")
+        probe = TimedLLMProbe(self.runtime.llm)
+        try:
+            result = await probe.run([{"role": "user", "content": "用一句话打个招呼"}])
+        except LLMError as error:
+            raise web.HTTPBadGateway(text=str(error))
+        return web.json_response(result)
 
     async def update_config(self, request: web.Request) -> web.Response:
         body = await request.json()

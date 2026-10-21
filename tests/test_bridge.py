@@ -165,6 +165,16 @@ async def test_action_runs_while_speech_completes(stack):
     assert finished["detail"] == "collected 3 oak_log"
 
 
+async def test_llm_test_endpoint(stack):
+    harness, client = stack
+    response = await client.post("/api/llm/test")
+    assert response.status == 200
+    data = await response.json()
+    assert data["ttft_ms"] is not None
+    assert data["total_ms"] >= data["ttft_ms"]
+    assert data["text"]
+
+
 async def test_second_bridge_is_rejected(stack):
     harness, client = stack
     first = await client.ws_connect("/ws/bridge?name=first")

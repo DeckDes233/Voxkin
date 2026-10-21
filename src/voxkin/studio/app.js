@@ -239,6 +239,17 @@ async function serviceAction(name, action) {
   loadServices();
 }
 
+async function testLlm() {
+  $("llmNote").textContent = "请求中…";
+  const response = await fetch("/api/llm/test", { method: "POST" });
+  if (!response.ok) {
+    $("llmNote").textContent = `测试失败：HTTP ${response.status} ${await response.text()}`;
+    return;
+  }
+  const data = await response.json();
+  $("llmNote").textContent = `首 token ${data.ttft_ms} ms · 总耗时 ${data.total_ms} ms · 回复：${data.text.slice(0, 60)}`;
+}
+
 async function loadLogs() {
   const response = await fetch("/api/logs?lines=60");
   const data = await response.json();
@@ -252,6 +263,7 @@ $("sayText").addEventListener("keydown", (event) => {
 $("interruptBtn").addEventListener("click", interrupt);
 $("ttsBtn").addEventListener("click", synth);
 $("saveConfig").addEventListener("click", saveConfig);
+$("testLlm").addEventListener("click", testLlm);
 
 connect();
 loadStatus();
