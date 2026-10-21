@@ -54,10 +54,10 @@
 
 | 优先级 | skill_id | 状态 | 现有实现 | 缺口 |
 | --- | --- | --- | --- | --- |
-| P1 | pickup_items | partial | `tools.py:174-191`；`bridge:445-457` | 只走近，不拾取、不回报数量 |
-| P1 | smelt_item | missing | 无 | 熔炉交互、燃料核算 |
-| P1 | sleep | missing | 无 | 床检测、夜晚判定、起床确认 |
-| P1 | equip_armor | partial | `bridge:1253-1260` | 每 15s 自动穿，无显式技能与槽位选择 |
+| P1 | pickup_items | partial | `tools.py` pickup_items；`bridge` 拾取后校验背包 | 仍依赖实体名称与拾取时序 |
+| P1 | smelt_item | partial | `bridge` 的 `smelt` | 未实机验证熔炉窗口、燃料与产物时序 |
+| P1 | sleep | partial | `bridge` 的 `sleep` | 未实机验证床的交互距离与多人服务器行为 |
+| P1 | equip_armor | partial | `bridge` 每 15s 自动穿甲 | 无显式技能与槽位选择 |
 | P1 | scan_surroundings | missing | 无 | 周边方块/生物摘要 |
 | P1 | use_block | missing | 无 | 门、按钮、拉杆、工作台右键 |
 | P1 | store_item / take_item | missing | 无 | 箱子窗口与槽位遍历 |
@@ -160,10 +160,10 @@
 | --- | --- | --- |
 | 真实 Minecraft 端到端 | 本次未运行；`node --check` 通过 | 审计命令 |
 | bridge 逻辑测试 | 无 JS 单测；`test_bridge` 只验 WebSocket 帧与派发 | `tests/test_bridge.py:104-127` |
-| 测试数量 | 文档已统一为 134；本次实跑 134 | `docs/STATUS.md:27`；`docs/MILESTONE.md:46`；`docs/plans/EVALUATION.md:17` |
+| 测试数量 | 文档已统一为 136；本次实跑 136 | `docs/STATUS.md:27`；`docs/MILESTONE.md:46`；`docs/plans/EVALUATION.md:17` |
 | 路线图交付物 | `scripts/run_stage.py`、`bridge/skills/manifest.js` 不存在 | `docs/plans/INDEPENDENT_RUN_ROADMAP.md:102-107` |
 | 独立模式接线 | `VOXKIN_INDEPENDENT` 只在 bridge 读取，Python 侧零引用 | `bridge:90,1209-1211` |
-| 动作数量 | 文档写 19 个，新增 5 个技能后 `case` 为 19 个 | `bridge:189-380` |
+| 动作数量 | 文档写 20 个，新增 5 个技能与 smelt 后 `case` 为 20 个 | `bridge:189-380` |
 | 并发改动 | `observe`、`eat`、`locate_block`、`locate_entity`、`sleep` 已在 `e1ee85e` 提交；本表状态仍按 `b602e1d` 基线，这 5 项未逐行重评 | `git show e1ee85e --stat` |
 | 行号基线 | 本表按 `b602e1d`，工作树行号已偏移；核对用 `git show b602e1d:bridge/minecraft_bridge.js` | 同上 |
 
