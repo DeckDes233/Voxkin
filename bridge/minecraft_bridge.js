@@ -215,6 +215,12 @@ function interruptCurrent(reason) {
 }
 
 function enqueueAction(message) {
+  if (message.tool === 'stop') {
+    const dropped = actionQueue.splice(0, actionQueue.length);
+    for (const item of dropped) {
+      reply(item, false, '被停止指令取消');
+    }
+  }
   if (PRIORITY_ACTIONS.has(message.tool)) {
     interruptCurrent(message.tool);
     actionQueue.unshift(message);
@@ -247,6 +253,16 @@ async function runAction(message) {
   interrupted = false;
   actionBusy = true;
   lastActivity = Date.now();
+  const timeoutMs = Math.min(Math.max(Number(message.timeout_s) || 120, 5), 300) * 1000;
+  const deadline = setTimeout(() => {
+    log('动作超时', message.tool, `${Math.round(timeoutMs / 1000)}s`);
+    interrupted = true;
+    if (bot) {
+      bot.pathfinder.stop();
+      bot.stopDigging();
+      bot.clearControlStates();
+    }
+  }, timeoutMs);
   try {
     if (
       ['goto', 'come_to_player', 'collect_blocks', 'attack_nearest', 'stop', 'break_block', 'place_block', 'goto_block', 'pickup_items', 'craft', 'eat', 'sleep'].includes(
@@ -302,18 +318,12 @@ async function runAction(message) {
         const range = Math.min(Math.max(Number(args.range) || 16, 3), 32);
         const target = findHostile(range);
         if (!target) throw new Error(`附近 ${range} 格内没有敌对生物`);
-        await equipWeapon();
-        const name = blockLabel(target.name);
-        let hits = 0;
-        for (let index = 0; index < 24 && target.isValid; index += 1) {
-          await bot.lookAt(target.position.offset(0, target.height * 0.8, 0), true);
-          bot.attack(target);
-          hits += 1;
-          await sleep(600);
+        if (target.name === 'creeper') {
+          await retreatFrom(target);
+          detail = '苦力怕太近，先退到安全距离';
+          break;
         }
-        detail = target.isValid
-          ? `攻击了 ${name} ${hits} 次，它还在`
-          : `击败了 ${name}，${hits} 次攻击`;
+        detail = await attackEntity(target);
         break;
       }
       case 'goto':
@@ -360,6 +370,7 @@ async function runAction(message) {
   } catch (error) {
     reply(message, false, error.message);
   } finally {
+    clearTimeout(deadline);
     actionBusy = false;
     currentTool = '';
     interrupted = false;
@@ -429,13 +440,37 @@ async function goTo(x, y, z) {
   return `已到达 (${x}, ${y}, ${z}) 附近，距离 ${result.distance.toFixed(1)} 格`;
 }
 
+async function collectDrops(range = 6) {
+  for (let index = 0; index < 8; index += 1) {
+    const item = bot.nearestEntity(
+      (entity) =>
+        entity.type === 'item' &&
+        entity.position.distanceTo(bot.entity.position) <= range
+    );
+    if (!item) break;
+    try {
+      await bot.pathfinder.goto(
+        new goals.GoalNear(item.position.x, item.position.y, item.position.z, 1)
+      );
+    } catch {
+      break;
+    }
+    await sleep(200);
+  }
+}
+
 async function collectBlocks(blockName, count) {
   const blockIds = bot.registry.blocksByName[blockName];
   if (!blockIds) throw new Error(`未知方块 ${blockName}`);
+  const owned = countItem(blockName);
+  const need = Math.max(0, count - owned);
+  if (need === 0) {
+    return `背包里已经有 ${owned} 个 ${blockLabel(blockName)}，不需要再挖`;
+  }
   const positions = bot.findBlocks({
     matching: blockIds.id,
     maxDistance: 32,
-    count: Math.max(count, 1),
+    count: need,
   });
   if (positions.length === 0) throw new Error(`附近 32 格内没有 ${blockLabel(blockName)}`);
   let collected = 0;
@@ -449,10 +484,12 @@ async function collectBlocks(blockName, count) {
       await bot.dig(block);
       collected += 1;
     }
-    if (collected >= count) break;
+    if (collected >= need) break;
   }
-  if (collected === 0) throw new Error(`没有成功挖到 ${blockLabel(blockName)}`);
-  return `挖到 ${collected} 个 ${blockLabel(blockName)}`;
+  await collectDrops(6);
+  const gained = countItem(blockName) - owned;
+  if (gained <= 0) throw new Error(`没有捡到 ${blockLabel(blockName)}`);
+  return `获得 ${gained} 个 ${blockLabel(blockName)}，背包共 ${countItem(blockName)} 个`;
 }
 
 async function equipToolFor(block) {
