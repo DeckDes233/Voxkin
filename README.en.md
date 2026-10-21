@@ -80,6 +80,8 @@ Full numbers and reproduction steps: [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_
 
 ## Quick start
 
+![Voxkin Studio](docs/images/studio.png)
+
 Requirements: Windows 10/11, Python 3.10, Node.js 20+, JDK 21 for the mod build, a GPT-SoVITS v2Pro runtime and a trained voice.
 
 ```powershell

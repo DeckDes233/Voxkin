@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "voxkin-audio",
+  "version": "${version}",
+  "name": "Voxkin Audio",
+  "description": "接收沃心 Core 的 PCM 音频流并在 Minecraft 客户端播放。",
+  "authors": ["DeckDes"],
+  "license": "TBD",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["dev.voxkin.audio.VoxkinAudioClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}

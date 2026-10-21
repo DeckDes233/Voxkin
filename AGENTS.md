@@ -12,12 +12,15 @@
 | `src/voxkin/pipeline.py` | 对话回合、TTS 队列、打断、动作派发 |
 | `src/voxkin/llm/` | OpenAI 兼容流式客户端 |
 | `src/voxkin/tts/` | TTS 适配器：`gpt_sovits`（HTTP 流式）、`genie`（进程内 ONNX） |
-| `src/voxkin/audio/` | 麦克风采集、音频输出（扬声器 / WAV / Minecraft 文件） |
+| `src/voxkin/audio/` | 麦克风采集、音频输出（扬声器 / WAV / Minecraft 文件 / WebSocket） |
 | `src/voxkin/stt/` | faster-whisper 识别与能量端点检测 |
 | `src/voxkin/agent/actions.py` | 动作派发：转发给桥接并等待可验证结果 |
 | `src/voxkin/bridge/protocol.py` | 桥接消息结构 |
 | `src/voxkin/server.py` | Studio HTTP/WebSocket 服务与桥接入口 |
 | `src/voxkin/services.py` | 外部引擎进程的启停、重启与健康检查 |
+| `src/voxkin/memory.py` | SQLite 对话存储、摘要压缩、检索与上下文预算 |
+| `src/voxkin/audio/websocket.py` | 向客户端 Mod 广播 PCM 分块 |
+| `mod/` | Fabric 1.21.1 客户端音频 Mod（Java 21 与 Gradle 8.12） |
 | `bridge/minecraft_bridge.js` | mineflayer 客户端，执行动作并回报结果 |
 | `tools/dev_llm_server.py` | 本地测试 LLM，不访问外网 |
 | `docs/` | 事实来源：审计、架构、评估、决策、路线图、状态、基准 |
@@ -38,12 +41,15 @@
 - 本地测试 LLM：`.\.venv\Scripts\python.exe tools\dev_llm_server.py --port 8799`
 - 测试：`.\.venv\Scripts\python.exe -m pytest tests -q`
 - 基准：`.\.venv\Scripts\python.exe -m voxkin bench --turns 5 --json work\bench.json`
+- 客户端 Mod：`cd mod; $env:JAVA_HOME="<JDK 21>"; gradle build`（Gradle 8.12，需要代理访问 Fabric 与 Mojang 仓库）
 
 Windows 下 pip 需要绕过系统代理：设置 `NO_PROXY=*`。
 
 ## Git 规则
 
-- 只做本地提交，不执行 `git push`。
+- 可以推送到 `https://github.com/DeckDes233/Voxkin`：`main` 存放已验证版本，`develop` 存放开发中版本。
+- 不强制推送，不改写已有提交历史，不删除远端分支。
+- 推送前确认 `git grep` 找不到密钥，`config/local.yaml` 与 `work/` 未被跟踪。
 - 每个提交只包含一个目的；提交前检查 `git diff --check`、`git status --short` 与文件清单。
 - 不提交 `work/`、`models/`、`config/local.yaml`、日志、模型权重、参考录音与密钥。
 - 不使用 `git reset --hard`、`git clean -fd`，不改写历史。

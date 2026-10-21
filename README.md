@@ -156,9 +156,17 @@ node minecraft_bridge.js
 ### 4. 在游戏里使用
 
 1. 启动 Minecraft 1.21.1 与 Fabric Loader。
-2. 把 `mod/build/libs/voxkin-audio-0.1.0.jar` 与 Fabric API 放进 `mods/`。
-3. 把 `config/voxkin.yaml` 的 `audio.output` 改成 `websocket`。
-4. 进入世界后，桥接机器人会加入服务器，玩家在聊天框里说话即可。
+2. 编译客户端 Mod：
+
+   ```powershell
+   cd mod
+   $env:JAVA_HOME="<JDK 21 路径>"
+   gradle build
+   ```
+
+3. 把 `mod/build/libs/voxkin-audio-0.1.0.jar` 与 Fabric API 放进 `mods/`。
+4. 把 `config/voxkin.yaml` 的 `audio.output` 改成 `websocket`。
+5. 进入世界后，桥接机器人会加入服务器，玩家在聊天框里说话即可。
 
 客户端 Mod 当前的播放不经过游戏混音器，空间音源在后续版本接入。
 
