@@ -189,6 +189,29 @@ MINECRAFT_TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "craft",
+            "description": "用背包里的材料合成物品；需要工作台时会自动放置并回收。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item": {
+                        "type": "string",
+                        "description": "物品 ID，例如 oak_planks、stick、wooden_pickaxe",
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "合成数量，默认 1",
+                        "minimum": 1,
+                        "maximum": 64,
+                    },
+                },
+                "required": ["item"],
+            },
+        },
+    },
 ]
 
 TOOL_SYSTEM_HINT = (
@@ -197,6 +220,7 @@ TOOL_SYSTEM_HINT = (
     "玩家说跟我来、跟上、别掉队时调用 follow_player；说过来、来我这、到我这里时调用 come_to_player；"
     "问背包或有什么东西时调用 inventory；让你打怪、清怪时调用 attack_nearest。"
     "要挖单个方块用 break_block；要放置方块用 place_block；要走到某种方块用 goto_block；地上有掉落物用 pickup_items。"
+    "要合成木板、木棍、工作台、工具时用 craft。"
     "玩家问你是谁、在哪、在做什么、为什么，先用一句话直接回答，不要调用工具。"
     "调用工具前先说一句要做什么，不要只调用工具不说话。"
     "回答保持一到两句话，不要提到接口、模型、语音合成或系统内部。"
