@@ -10,6 +10,7 @@
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10-3776ab">
   <img alt="Minecraft" src="https://img.shields.io/badge/Minecraft-1.21.1-3c8527">
   <img alt="Status" src="https://img.shields.io/badge/status-prototype-orange">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 Voxkin is an AI companion for Minecraft. It splits "hear the player → understand → answer with natural speech → act in the world" into two channels that never block each other: the voice channel starts speaking as early as possible, while the action channel runs in the background and reports verified results.
@@ -122,8 +123,24 @@ node minecraft_bridge.js
 
 Open <http://127.0.0.1:8765>, type a sentence, and the full chain runs.
 
-## Configuration
+### 5. Talk through the microphone
 
+```powershell
+.\.venv\Scripts\python.exe -m voxkin mic
+```
+
+Speak naturally; press `Ctrl+C` to stop. Useful flags:
+
+| Flag | Purpose |
+| --- | --- |
+| `--listen-only` | Transcribe only, no LLM or TTS |
+| `--gain 4` | Boost a quiet microphone |
+| `--no-barge-in` | Disable interruption on open speakers to avoid hearing itself |
+| `--output speaker` | Override the audio output for this run |
+
+With open speakers, add `--no-barge-in`: microphone input is ignored for 0.9 seconds after playback ends, preventing the bot from answering its own voice. Headphones give the most natural interruption behaviour.
+
+## Configuration
 | File | Purpose |
 | --- | --- |
 | `config/voxkin.example.yaml` | Committed defaults |
@@ -156,4 +173,4 @@ docs/                Audit, architecture, evaluation, decisions, roadmap, status
 
 ## License
 
-The project license is not decided yet; MIT and GPL-3.0 are under evaluation. Dependencies are listed in [docs/LICENSE_ANALYSIS.md](docs/LICENSE_ANALYSIS.md). Until a license is chosen, treat the repository as all rights reserved.
+MIT. See [LICENSE](LICENSE) and [docs/LICENSE_ANALYSIS.md](docs/LICENSE_ANALYSIS.md).

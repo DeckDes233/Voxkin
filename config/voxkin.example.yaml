@@ -4,7 +4,7 @@ llm:
   model: "deepseek-chat"
   api_key_env: "DEEPSEEK_API_KEY"
   temperature: 0.7
-  max_tokens: 512
+  max_tokens: 800
   timeout_s: 60
   stream: true
 
@@ -38,6 +38,9 @@ stt:
   sample_rate: 16000
   max_utterance_s: 20
   to_simplified: true
+  input_gain: 1.0
+  local_files_only: false
+  playback_cooldown_s: 0.9
 
 audio:
   output: "speaker"

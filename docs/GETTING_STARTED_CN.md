@@ -103,7 +103,28 @@ cd D:\Voxkin
 
 ![控制台](images/studio.png)
 
-## 四、让它在游戏里出现
+## 四、直接用麦克风说话
+
+不想进游戏也能测试。新开一个 PowerShell 窗口：
+
+```powershell
+cd D:\Voxkin
+.\.venv\Scripts\python.exe -m voxkin mic
+```
+
+看到「麦克风已就绪」，直接对着麦克风说话，停顿一下，沃心就会回答。
+
+如果它听不到你：
+
+```powershell
+.\.venv\Scripts\python.exe -m voxkin mic --listen-only
+```
+
+这个模式只显示识别结果，不回答。先确认屏幕上出现了你说的话，再换回正常模式。
+
+声音偏小可以加 `--gain 4`；用外放音箱时加 `--no-barge-in`，否则它可能把自己的声音当成你说的话。戴耳机体验最好。
+
+## 五、让它在游戏里出现
 
 ### 第 1 步：准备一个 Minecraft 服务器
 
@@ -133,7 +154,7 @@ node minecraft_bridge.js
 
 现在你在游戏聊天框里说话，角色会用语音回答。
 
-## 五、常见问题
+## 六、常见问题
 
 **没有声音**
 
@@ -155,7 +176,7 @@ node minecraft_bridge.js
 
 把 `config\voxkin.yaml` 里的 `server.port` 改成 8766，然后重新启动 Core，浏览器也跟着换端口。
 
-## 六、几个名词的大白话解释
+## 七、几个名词的大白话解释
 
 | 名词 | 大白话 |
 | --- | --- |
@@ -166,7 +187,7 @@ node minecraft_bridge.js
 | 桥接 | 在游戏里替角色走路和挖方块的程序 |
 | WebSocket | 两个程序之间一直开着的对话通道 |
 
-## 七、安全提醒
+## 八、安全提醒
 
 - 密钥只放在 `config\local.yaml`，不要提交到 GitHub。
 - 不要把 8765、9880 这些端口开到公网。

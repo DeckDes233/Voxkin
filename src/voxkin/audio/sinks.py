@@ -34,6 +34,9 @@ class AudioSink(ABC):
         if self._on_playback_start is not None:
             self._on_playback_start(turn_id, time.perf_counter())
 
+    def is_playing(self) -> bool:
+        return False
+
     @abstractmethod
     async def start(self) -> None: ...
 
@@ -62,9 +65,15 @@ class SpeakerSink(AudioSink):
         self._thread: threading.Thread | None = None
         self._started_turns: set[str] = set()
         self._error: BaseException | None = None
+        self._pending = 0
+        self._pending_lock = threading.Lock()
 
     def describe(self) -> dict:
         return {"output": "speaker", "sample_rate": self.sample_rate, "device": self.device or "default"}
+
+    def is_playing(self) -> bool:
+        with self._pending_lock:
+            return self._pending > 0
 
     async def start(self) -> None:
         import sounddevice as sd
@@ -98,12 +107,18 @@ class SpeakerSink(AudioSink):
                     self._notify_playback_start(turn_id)
                 if self.volume != 1.0:
                     pcm = (pcm.astype(np.float32) * self.volume).clip(-32768, 32767).astype(np.int16)
-                stream.write(pcm)
+                try:
+                    stream.write(pcm)
+                finally:
+                    with self._pending_lock:
+                        self._pending = max(0, self._pending - 1)
         finally:
             stream.stop()
             stream.close()
 
     async def play(self, turn_id: str, pcm: np.ndarray) -> None:
+        with self._pending_lock:
+            self._pending += 1
         self._queue.put((turn_id, resample_pcm(pcm, 32000, self.sample_rate)))
 
     async def flush(self) -> None:
@@ -112,6 +127,8 @@ class SpeakerSink(AudioSink):
                 self._queue.get_nowait()
             except queue.Empty:
                 break
+        with self._pending_lock:
+            self._pending = 0
 
     async def close(self) -> None:
         self._queue.put(None)

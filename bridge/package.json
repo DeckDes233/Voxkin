@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "license": "MIT",
   "description": "沃心 Minecraft 桥接：把游戏内聊天转发给 Voxkin Core，并在游戏里执行动作",
   "main": "minecraft_bridge.js",
   "scripts": {

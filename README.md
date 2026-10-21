@@ -10,6 +10,7 @@
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10-3776ab">
   <img alt="Minecraft" src="https://img.shields.io/badge/Minecraft-1.21.1-3c8527">
   <img alt="Status" src="https://img.shields.io/badge/status-prototype-orange">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 沃心是一个面向 Minecraft 的 AI 伙伴系统。它把「听见玩家 → 理解 → 用自然语音回答 → 在游戏里执行动作」拆成两条互不阻塞的通道：语音通道尽快出声，行动通道在后台执行并回报可验证的结果。
@@ -44,7 +45,7 @@
 | 打断 | 可用 | 新语音到来时关闭旧语音请求并清空播放队列 |
 | 长期记忆 | 可用 | SQLite 保存原始对话，空闲时把旧对话压缩成摘要，按关键词检索后放入上下文 |
 | 统一控制台 | 可用 | 状态、试听、实时事件、延迟分解、配置、服务启停、日志 |
-| 客户端音频 Mod | 构建通过，未在真实客户端验证 | 通过 WebSocket 接收 PCM 并播放，暂未接入空间音源 |
+| 客户端音频 Mod | 构建通过，接入 Minecraft 流式声源 | 通过 WebSocket 接收 PCM，绑定机器人实体位置；未在真实客户端验证 |
 | 多引擎适配 | 可用 | 语音合成可换 GPT-SoVITS 或 Genie；模型接口兼容 OpenAI 格式 |
 
 ![Voxkin Studio 控制台](docs/images/studio.png)
@@ -170,6 +171,23 @@ node minecraft_bridge.js
 
 客户端 Mod 当前的播放不经过游戏混音器，空间音源在后续版本接入。
 
+### 5. 用麦克风对话
+
+```powershell
+.\.venv\Scripts\python.exe -m voxkin mic
+```
+
+直接用说话和沃心交流，按 `Ctrl+C` 退出。常用参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--listen-only` | 只识别，不调用模型与语音，用来检查麦克风 |
+| `--gain 4` | 麦克风声音偏小时放大输入 |
+| `--no-barge-in` | 外放音箱时关闭打断，避免听到自己的声音 |
+| `--output speaker` | 临时覆盖音频输出方式 |
+
+外放音箱时建议加 `--no-barge-in`，播放结束后的 0.9 秒内会忽略麦克风输入，避免把自己说的话当成新指令。戴耳机可以得到更自然的打断体验。
+
 ## 配置
 
 | 文件 | 用途 |
@@ -218,4 +236,4 @@ docs/                审计、架构、评估、决策、路线图、状态、�
 
 ## 许可证
 
-项目协议待定，正在 MIT 与 GPL-3.0 之间评估。依赖清单与兼容性分析见 [许可证分析](docs/LICENSE_ANALYSIS.md)。在协议确定前，请把本仓库视为保留所有权利。
+本项目使用 MIT 许可证，全文见 [LICENSE](LICENSE)。依赖与分发边界见 [许可证分析](docs/LICENSE_ANALYSIS.md)。

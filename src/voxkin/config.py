@@ -68,6 +68,9 @@ class STTConfig:
     sample_rate: int = 16000
     max_utterance_s: float = 20.0
     to_simplified: bool = True
+    input_gain: float = 1.0
+    local_files_only: bool = False
+    playback_cooldown_s: float = 0.9
 
 
 @dataclass

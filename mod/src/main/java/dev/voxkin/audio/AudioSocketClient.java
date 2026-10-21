@@ -11,7 +11,6 @@ import java.util.concurrent.CountDownLatch;
 
 public final class AudioSocketClient {
     private final URI uri;
-    private final PcmPlayer player = new PcmPlayer();
     private final HttpClient http = HttpClient.newHttpClient();
     private final StringBuilder textBuffer = new StringBuilder();
     private volatile boolean running = true;
@@ -51,7 +50,7 @@ public final class AudioSocketClient {
                 if (current != null) {
                     current.abort();
                 }
-                player.flush();
+                AudioRuntime.requestFlush();
             }
             if (!running) {
                 break;
@@ -63,7 +62,7 @@ public final class AudioSocketClient {
                 break;
             }
         }
-        player.close();
+        AudioRuntime.shutdown();
     }
 
     public void stop() {
@@ -72,7 +71,7 @@ public final class AudioSocketClient {
         if (current != null) {
             current.abort();
         }
-        player.close();
+        AudioRuntime.shutdown();
     }
 
     private void handleText(String text) {
@@ -87,7 +86,7 @@ public final class AudioSocketClient {
         switch (type) {
             case "welcome" -> System.out.println("[voxkin-audio] 采样率 " + payload.get("sample_rate").getAsInt());
             case "pcm" -> pendingBytes = payload.get("bytes").getAsInt();
-            case "flush" -> player.flush();
+            case "flush" -> AudioRuntime.requestFlush();
             case "pong" -> {
             }
             default -> {
@@ -124,7 +123,7 @@ public final class AudioSocketClient {
             byte[] chunk = new byte[data.remaining()];
             data.get(chunk);
             if (pendingBytes > 0) {
-                player.enqueue(chunk);
+                AudioRuntime.enqueue(chunk);
                 pendingBytes = Math.max(0, pendingBytes - chunk.length);
             }
             webSocket.request(1);

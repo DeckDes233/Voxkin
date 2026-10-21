@@ -36,7 +36,13 @@ def build_parser() -> argparse.ArgumentParser:
     stt.add_argument("file", type=Path)
 
     mic = sub.add_parser("mic", help="麦克风实时对话")
-    mic.add_argument("--seconds", type=float, default=30.0)
+    mic.add_argument("--seconds", type=float, default=0.0, help="0 表示一直运行到 Ctrl+C")
+    mic.add_argument("--listen-only", action="store_true", help="只做识别，不调用模型与语音")
+    mic.add_argument("--output", choices=["speaker", "websocket", "wav_dir", "minecraft_file"], default=None)
+    mic.add_argument("--device", default=None, help="麦克风设备名的一部分")
+    mic.add_argument("--no-barge-in", dest="barge_in", action="store_false")
+    mic.add_argument("--gain", type=float, default=None, help="麦克风输入增益，安静环境可调到 3-4")
+    mic.set_defaults(barge_in=True)
 
     talk = sub.add_parser("talk", help="用 WAV 文件模拟一次说话，跑完识别到播放的完整链路")
     talk.add_argument("file", type=Path)
@@ -118,24 +124,62 @@ def run_stt(config, path: Path) -> None:
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-async def run_mic(config, seconds: float) -> None:
+async def run_mic(config, seconds: float, listen_only: bool, output: str | None, device: str | None, barge_in: bool, gain: float | None = None) -> None:
     from voxkin.runtime import Runtime
 
+    if output:
+        config.audio.output = output
+    if device:
+        config.audio.device = device
+    if gain is not None:
+        config.stt.input_gain = gain
     runtime = await Runtime.create(config)
     await runtime.start()
+
+    async def on_status(kind: str, payload: dict) -> None:
+        if kind == "ready":
+            mode = "只听不答" if listen_only else "对话"
+            print(f"麦克风已就绪（{mode}，Ctrl+C 退出）", flush=True)
+        elif kind == "speech_start":
+            print("… 检测到说话", flush=True)
+        elif kind == "barge_in":
+            print("打断上一段回复", flush=True)
+        elif kind == "transcript":
+            print(f"你说：{payload['text']}（识别 {payload['stt_ms']} ms）", flush=True)
+        elif kind == "reply":
+            summary = payload["summary"]
+            spoken = summary["meta"].get("spoken", "")
+            print(
+                f"沃心：{spoken}  首次可听 {summary.get('first_audible_ms')} ms",
+                flush=True,
+            )
+
     loop = VoiceLoop(
         pipeline=runtime.pipeline,
         stt=runtime.stt,
         vad=VadSegmenter.from_config(config.stt),
         microphone=Microphone(sample_rate=config.stt.sample_rate, device=config.audio.device),
         emit=runtime.hub.publish,
+        barge_in=barge_in,
+        gain=config.stt.input_gain,
+        playback_cooldown_s=config.stt.playback_cooldown_s,
+        on_status=on_status,
     )
-    task = asyncio.create_task(loop.run())
+    task = asyncio.create_task(loop.run(listen_only=listen_only))
     try:
-        await asyncio.sleep(seconds)
+        if seconds <= 0:
+            await task
+        else:
+            await asyncio.sleep(seconds)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\n停止麦克风", flush=True)
     finally:
         loop.stop()
         task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
         await runtime.close()
 
 
@@ -243,7 +287,17 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "stt":
         run_stt(config, args.file)
     elif args.command == "mic":
-        asyncio.run(run_mic(config, args.seconds))
+        asyncio.run(
+            run_mic(
+                config,
+                args.seconds,
+                args.listen_only,
+                args.output,
+                args.device,
+                args.barge_in,
+                args.gain,
+            )
+        )
     elif args.command == "talk":
         asyncio.run(run_talk(config, args.file, args.realtime))
     elif args.command == "bench":

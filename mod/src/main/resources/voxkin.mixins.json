@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "dev.voxkin.audio.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "SoundManagerAccessor",
+    "SoundSystemAccessor"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

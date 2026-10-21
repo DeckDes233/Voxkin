@@ -37,18 +37,6 @@ MINECRAFT_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "chat",
-            "description": "在游戏聊天栏发送一条消息。",
-            "parameters": {
-                "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "stop",
             "description": "停止当前移动与操作。",
             "parameters": {"type": "object", "properties": {}},
@@ -70,6 +58,7 @@ MINECRAFT_TOOLS: list[dict[str, Any]] = [
 
 TOOL_SYSTEM_HINT = (
     "你在 Minecraft 世界里行动，可以使用工具改变游戏状态。"
-    "玩家要求做事时调用合适的工具；描述动作使用「我去」这样的进行时，"
-    "不要声称已经完成，完成情况由系统回报。"
+    "回答玩家时直接用语音，不要调用工具来说话；只有确实要移动、挖掘或停止时才调用工具。"
+    "回答保持一到两句话，不要提到接口、模型、语音合成或系统内部。"
+    "描述动作使用「我去」这样的进行时，不要声称已经完成，完成情况由系统回报。"
 )
