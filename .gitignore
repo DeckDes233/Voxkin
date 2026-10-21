@@ -19,3 +19,5 @@ mod/.gradle/
 mod/build/
 mod/run/
 mod/.idea/
+runs/*
+!runs/README.md
