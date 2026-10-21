@@ -13,7 +13,9 @@ class LLMDelta:
 
 class LLMAdapter(Protocol):
     async def stream_chat(
-        self, messages: Sequence[dict[str, str]]
+        self,
+        messages: Sequence[dict[str, str]],
+        tools: Sequence[dict[str, Any]] | None = None,
     ) -> AsyncIterator[LLMDelta]: ...
 
     async def close(self) -> None: ...

@@ -14,6 +14,24 @@ const config = {
   ws: process.env.VOXKIN_WS || 'ws://127.0.0.1:8765/ws/bridge',
 };
 
+const BLOCK_NAMES = {
+  dirt: '泥土',
+  grass_block: '草方块',
+  stone: '石头',
+  cobblestone: '圆石',
+  oak_log: '橡木',
+  birch_log: '白桦木',
+  sand: '沙子',
+  gravel: '沙砾',
+  coal_ore: '煤矿',
+  iron_ore: '铁矿',
+  wheat: '小麦',
+};
+
+function blockLabel(name) {
+  return BLOCK_NAMES[name] || name;
+}
+
 let socket = null;
 let bot = null;
 let reconnectTimer = null;
@@ -138,7 +156,7 @@ async function collectBlocks(blockName, count) {
     maxDistance: 32,
     count: Math.max(count, 1),
   });
-  if (positions.length === 0) throw new Error(`附近 32 格内没有 ${blockName}`);
+  if (positions.length === 0) throw new Error(`附近 32 格内没有 ${blockLabel(blockName)}`);
   let collected = 0;
   for (const position of positions) {
     const block = bot.blockAt(position);
@@ -150,8 +168,8 @@ async function collectBlocks(blockName, count) {
     }
     if (collected >= count) break;
   }
-  if (collected === 0) throw new Error(`没有成功挖到 ${blockName}`);
-  return `挖到 ${collected} 个 ${blockName}`;
+  if (collected === 0) throw new Error(`没有成功挖到 ${blockLabel(blockName)}`);
+  return `挖到 ${collected} 个 ${blockLabel(blockName)}`;
 }
 
 function createBot() {

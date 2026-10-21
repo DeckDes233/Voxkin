@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections import deque
 from typing import Any, Awaitable, Callable
 
+from voxkin.agent.tools import MINECRAFT_TOOLS, TOOL_SYSTEM_HINT
 from voxkin.audio.sinks import AudioSink
 from voxkin.config import VoxkinConfig
 from voxkin.events import MetricsStore, TurnTimeline
@@ -38,6 +40,8 @@ class ConversationPipeline:
         self._active_tasks: list[asyncio.Task] = []
         self._background_tasks: set[asyncio.Task] = set()
         self._sentence_queue: asyncio.Queue[str | None] | None = None
+        self._tts_active = False
+        self._accept_audio = False
         self._action_handler: ActionHandler | None = None
         self._started = False
         self.sink.set_playback_start_callback(self._on_playback_start)
@@ -69,11 +73,19 @@ class ConversationPipeline:
 
     def _build_messages(self, user_text: str) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
+        system_parts = []
         if self.config.persona.system_prompt:
-            messages.append({"role": "system", "content": self.config.persona.system_prompt})
+            system_parts.append(self.config.persona.system_prompt)
+        if self.config.llm.enable_tools:
+            system_parts.append(TOOL_SYSTEM_HINT)
+        if system_parts:
+            messages.append({"role": "system", "content": "\n".join(system_parts)})
         messages.extend(self.history)
         messages.append({"role": "user", "content": user_text})
         return messages
+
+    def _tool_schemas(self) -> list[dict[str, Any]] | None:
+        return MINECRAFT_TOOLS if self.config.llm.enable_tools else None
 
     async def interrupt(self, reason: str = "user_interrupt") -> None:
         self._generation += 1
@@ -85,6 +97,7 @@ class ConversationPipeline:
             )
         self._active_turn = None
         self._sentence_queue = None
+        self._accept_audio = False
         for task in self._active_tasks:
             task.cancel()
         tasks = list(self._active_tasks)
@@ -116,6 +129,8 @@ class ConversationPipeline:
         self._spoken_texts[turn.request_id] = []
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._sentence_queue = queue
+        self._tts_active = True
+        self._accept_audio = True
         tts_task = asyncio.create_task(
             self._tts_worker(turn, queue, generation), name=f"tts-{turn.request_id}"
         )
@@ -126,7 +141,7 @@ class ConversationPipeline:
         splitter = SentenceSplitter(max_chars=self.config.tts.max_chars_per_request)
         collected: list[str] = []
         tool_calls = 0
-        stream = self.llm.stream_chat(self._build_messages(user_text))
+        stream = self.llm.stream_chat(self._build_messages(user_text), tools=self._tool_schemas())
         try:
             async for delta in stream:
                 if generation != self._generation:
@@ -154,6 +169,7 @@ class ConversationPipeline:
                     action_task.add_done_callback(self._background_tasks.discard)
             for sentence in splitter.flush():
                 await self._enqueue_sentence(turn, sentence, queue)
+            self._accept_audio = False
             await queue.put(None)
             if generation == self._generation:
                 try:
@@ -179,6 +195,7 @@ class ConversationPipeline:
         finally:
             if generation == self._generation:
                 self._active_turn = None
+                self._accept_audio = False
             await stream.aclose()
         turn.meta["spoken"] = "".join(self._spoken_texts.get(turn.request_id, []))
         if generation != self._generation:
@@ -200,6 +217,19 @@ class ConversationPipeline:
         await self._broadcast({"type": "turn_finished", "summary": summary})
         return summary
 
+    async def announce(self, text: str) -> None:
+        """把一句系统侧的话送进语音通道，不经过 LLM。"""
+        cleaned = text.strip()
+        if not cleaned:
+            return
+        await self._broadcast({"type": "announce", "text": cleaned})
+        if self._accept_audio and self._sentence_queue is not None:
+            await self._sentence_queue.put(cleaned)
+            return
+        token = f"announce-{uuid.uuid4().hex[:8]}"
+        async for pcm in self.tts.synthesize(cleaned):
+            await self.sink.play(token, pcm)
+
     async def _enqueue_sentence(
         self, turn: TurnTimeline, sentence: str, queue: asyncio.Queue[str | None]
     ) -> None:
@@ -220,23 +250,28 @@ class ConversationPipeline:
     async def _tts_worker(
         self, turn: TurnTimeline, queue: asyncio.Queue[str | None], generation: int
     ) -> None:
-        while True:
-            sentence = await queue.get()
-            if sentence is None:
-                break
-            if generation != self._generation:
-                break
-            if not turn.has("t4_tts_first_text"):
-                turn.mark("t4_tts_first_text")
-            async for pcm in self.tts.synthesize(sentence):
+        try:
+            while True:
+                sentence = await queue.get()
+                if sentence is None:
+                    break
                 if generation != self._generation:
-                    return
-                if not turn.has("t5_first_audio"):
-                    turn.mark("t5_first_audio")
-                await self.sink.play(turn.request_id, pcm)
+                    break
+                if not turn.has("t4_tts_first_text"):
+                    turn.mark("t4_tts_first_text")
+                async for pcm in self.tts.synthesize(sentence):
+                    if generation != self._generation:
+                        return
+                    if not turn.has("t5_first_audio"):
+                        turn.mark("t5_first_audio")
+                    await self.sink.play(turn.request_id, pcm)
+        finally:
+            self._tts_active = False
 
     async def _run_action(self, call: dict[str, Any], turn: TurnTimeline) -> None:
         turn.mark("t7_action_start")
+        if not turn.has("t5_first_audio"):
+            await self.announce("好的，我这就去。")
         await self._broadcast(
             {
                 "type": "action_started",
@@ -268,9 +303,11 @@ class ConversationPipeline:
                     "error": str(error),
                 }
             )
+            await self.announce("这次没做成，我换个地方看看。")
             return
         turn.mark("t8_action_done")
         self.metrics.update(turn)
+        await self.announce(f"好了，{detail}。")
         await self._broadcast(
             {
                 "type": "action_finished",

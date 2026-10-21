@@ -55,6 +55,15 @@ class Harness:
         }
 
 
+async def wait_until(predicate, timeout: float = 3.0) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.02)
+    return predicate()
+
+
 @pytest.fixture
 async def stack(tmp_path):
     llm_app = build_llm_app(delay_ms=2)
@@ -154,6 +163,7 @@ async def test_action_runs_while_speech_completes(stack):
             if event.get("type") == "action_finished":
                 finished = event
                 break
+        await wait_until(lambda: any("好了" in text for text in harness.tts.texts))
     finally:
         harness.hub.unsubscribe(events)
         responder.cancel()
@@ -166,6 +176,7 @@ async def test_action_runs_while_speech_completes(stack):
     assert finished["detail"] == "collected 3 oak_log"
     record = harness.metrics.recent(1)[0]
     assert record["action_done_ms"] is not None
+    assert any("好了" in text for text in harness.tts.texts)
 
 
 async def test_llm_test_endpoint(stack):
@@ -176,6 +187,44 @@ async def test_llm_test_endpoint(stack):
     assert data["ttft_ms"] is not None
     assert data["total_ms"] >= data["ttft_ms"]
     assert data["text"]
+
+
+async def test_action_failure_is_spoken(stack):
+    harness, client = stack
+    ws = await client.ws_connect("/ws/bridge?name=test")
+    await ws.receive_json()
+
+    async def fail_actions() -> None:
+        while True:
+            message = await ws.receive_json()
+            if message.get("type") == "action":
+                await ws.send_json(
+                    {
+                        "type": "action_result",
+                        "action_id": message["action_id"],
+                        "ok": False,
+                        "detail": "附近没有可挖的方块",
+                    }
+                )
+
+    responder = asyncio.create_task(fail_actions())
+    events = harness.hub.subscribe()
+    try:
+        summary = await harness.pipeline.respond("ACTION 去砍三块木头")
+        failed = None
+        for _ in range(40):
+            event = await asyncio.wait_for(events.get(), timeout=2)
+            if event.get("type") == "action_failed":
+                failed = event
+                break
+        await wait_until(lambda: any("没做成" in text for text in harness.tts.texts))
+    finally:
+        harness.hub.unsubscribe(events)
+        responder.cancel()
+        await ws.close()
+    assert failed is not None
+    assert summary["meta"].get("action_errors")
+    assert any("没做成" in text for text in harness.tts.texts)
 
 
 async def test_second_bridge_is_rejected(stack):

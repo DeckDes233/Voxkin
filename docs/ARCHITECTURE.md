@@ -158,6 +158,8 @@ sequenceDiagram
 - `AudioSink`：`start()`、`play(turn_id, pcm)`、`flush()`、`close()`、`describe()`。
 - `ActionDispatcher`：`attach(sender)`、`dispatch(tool, arguments)`、`resolve(ActionResult)`。
 - `ServiceSupervisor`：`register(spec)`、`start(name)`、`stop(name)`、`restart(name)`、`health(name)`、`status()`。
+- 工具定义：`src/voxkin/agent/tools.py` 提供 `collect_blocks`、`goto`、`chat`、`stop`、`look_at_player`，随请求下发给模型；模型返回 `tool_calls` 时进入动作通道。
+- 语音播报：`ConversationPipeline.announce(text)` 把系统侧文本送入 TTS，用于动作开始确认与结果回报。
 - 桥接消息：`hello`、`chat`、`state`（桥接 → Core）；`welcome`、`action`（Core → 桥接）；`action_result`（桥接 → Core）。
 
 ## 5. 并发模型

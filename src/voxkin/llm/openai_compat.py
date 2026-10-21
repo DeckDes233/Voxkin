@@ -26,7 +26,9 @@ class OpenAICompatLLM:
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=self.config.timeout_s)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            self._session = aiohttp.ClientSession(
+                timeout=timeout, connector=aiohttp.TCPConnector(force_close=True)
+            )
         return self._session
 
     def describe(self) -> dict[str, Any]:
@@ -42,7 +44,11 @@ class OpenAICompatLLM:
         if self._session is not None and not self._session.closed:
             await self._session.close()
 
-    async def stream_chat(self, messages: Sequence[dict[str, str]]) -> AsyncIterator[LLMDelta]:
+    async def stream_chat(
+        self,
+        messages: Sequence[dict[str, str]],
+        tools: Sequence[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[LLMDelta]:
         payload = {
             "model": self.config.model,
             "messages": list(messages),
@@ -50,11 +56,15 @@ class OpenAICompatLLM:
             "max_tokens": self.config.max_tokens,
             "stream": self.config.stream,
         }
+        if tools:
+            payload["tools"] = list(tools)
+            payload["tool_choice"] = "auto"
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
+        headers.update(self.config.headers)
         session = self._get_session()
         async with session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:

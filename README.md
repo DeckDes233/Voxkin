@@ -46,6 +46,21 @@ Copy-Item config\voxkin.example.yaml config\voxkin.yaml
 
 API Key 只从环境变量 `DEEPSEEK_API_KEY` 或 `config/local.yaml` 读取，日志与状态接口不会返回明文。
 
+### 接入 OpenCode Go
+
+`config/local.yaml` 示例（密钥只写在这里，文件已被忽略）：
+
+```yaml
+llm:
+  base_url: "https://opencode.ai/inference/go/openai/v1"
+  model: "deepseek-v4.1-flash"
+  api_key: "oc_sk_..."
+  headers:
+    x-opencode-session: "voxkin-deepseek-chan-01"
+```
+
+服务端要求 `x-opencode-session` 请求头，缺少时返回 `400 MissingSessionID`。模型列表可用 `GET https://opencode.ai/inference/go/v1/models` 查询。加载工具定义后，模型可以直接调用 `collect_blocks`、`goto`、`chat`、`stop`、`look_at_player`。
+
 ## 启动
 
 ```powershell

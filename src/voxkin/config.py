@@ -24,6 +24,8 @@ class LLMConfig:
     max_tokens: int = 512
     timeout_s: float = 60.0
     stream: bool = True
+    headers: dict[str, str] = field(default_factory=dict)
+    enable_tools: bool = True
 
     def resolve_api_key(self) -> str:
         if self.api_key:
@@ -159,7 +161,7 @@ def save_config(config: VoxkinConfig, path: Path | str | None = None) -> Path:
     target = Path(path) if path else DEFAULT_CONFIG_PATH
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "llm": {k: v for k, v in config.llm.__dict__.items() if k != "api_key"},
+        "llm": {k: v for k, v in config.llm.__dict__.items() if k not in {"api_key", "headers"}},
         "tts": config.tts.__dict__,
         "stt": config.stt.__dict__,
         "audio": config.audio.__dict__,

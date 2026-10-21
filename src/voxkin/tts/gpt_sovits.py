@@ -68,7 +68,9 @@ class GPTSoVITSClient:
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=self.config.timeout_s)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            self._session = aiohttp.ClientSession(
+                timeout=timeout, connector=aiohttp.TCPConnector(force_close=True)
+            )
         return self._session
 
     async def initialize(self) -> None:
