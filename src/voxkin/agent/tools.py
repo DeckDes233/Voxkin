@@ -115,6 +115,36 @@ MINECRAFT_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "attack_target",
+            "description": "攻击指定名字或类型的实体；默认只打敌对生物，玩家不会被攻击。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "实体名字，例如 zombie、husk",
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": "hostile、player 或具体实体类型",
+                    },
+                    "id": {
+                        "type": "integer",
+                        "description": "实体 ID，可选，来自 locate_entity",
+                    },
+                    "range": {
+                        "type": "number",
+                        "description": "搜索范围，默认 16 格",
+                        "minimum": 3,
+                        "maximum": 32,
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "break_block",
             "description": "挖掉一个方块。给方块名会自动找最近的，给坐标则挖指定位置。",
             "parameters": {
@@ -354,7 +384,7 @@ TOOL_SYSTEM_HINT = (
     "你在 Minecraft 世界里行动，可以使用工具改变游戏状态。"
     "回答玩家时直接用语音，不要调用工具来说话；只有确实要移动、挖掘或停止时才调用工具。"
     "玩家说跟我来、跟上、别掉队时调用 follow_player；说过来、来我这、到我这里时调用 come_to_player；"
-    "问背包或有什么东西时调用 inventory；让你打怪、清怪时调用 attack_nearest。"
+    "问背包或有什么东西时调用 inventory；让你打怪、清怪时调用 attack_nearest；指定打某一只用 attack_target。"
     "要挖单个方块用 break_block；要放置方块用 place_block；要走到某种方块用 goto_block；地上有掉落物用 pickup_items。"
     "要合成木板、木棍、工作台、工具时用 craft。"
     "要把粗铁、粗金或生食熔炼时用 smelt。"

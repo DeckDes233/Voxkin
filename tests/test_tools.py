@@ -8,7 +8,7 @@ from voxkin.pipeline import ConversationPipeline
 
 BRIDGE_SOURCE = Path(__file__).resolve().parents[1] / "bridge" / "minecraft_bridge.js"
 
-NEW_TOOLS = ("eat", "observe", "locate_block", "locate_entity", "sleep", "smelt")
+NEW_TOOLS = ("eat", "observe", "locate_block", "locate_entity", "sleep", "smelt", "attack_target")
 
 EXISTING_TOOLS = {
     "collect_blocks": ({"block", "count"}, {"block", "count"}),
