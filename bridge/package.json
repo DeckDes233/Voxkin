@@ -11,7 +11,9 @@
   },
   "dependencies": {
     "mineflayer": "^4.24.0",
+    "mineflayer-armor-manager": "^2.0.1",
     "mineflayer-pathfinder": "^2.4.5",
+    "mineflayer-tool": "^1.2.0",
     "ws": "^8.18.0"
   },
   "engines": {
