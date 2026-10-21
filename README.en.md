@@ -44,7 +44,7 @@ The current build closes the loop locally: a player says one sentence in game, V
 | Interruption | Working | New speech closes the old TTS request and clears the playback queue |
 | Long-term memory | Working | SQLite stores turns, idle-time summaries, keyword retrieval into context |
 | Control console | Working | Status, TTS preview, live events, latency breakdown, config, service control, logs |
-| Client audio mod | Builds, not verified in a live client | Receives PCM over WebSocket; spatial audio not wired yet |
+| Client audio mod | Builds, not verified in a live client | Receives PCM over WebSocket and plays it through a Minecraft streaming source positioned at the bot |
 | Engine adapters | Working | GPT-SoVITS or Genie for TTS; any OpenAI-compatible endpoint for the LLM |
 
 ## How it works
@@ -123,6 +123,17 @@ node minecraft_bridge.js
 
 Open <http://127.0.0.1:8765>, type a sentence, and the full chain runs.
 
+### 4. Enter Minecraft
+
+The full walkthrough (dedicated server, bridge, microphone, client mod, YSM) is currently Chinese-only: [docs/ENTER_MINECRAFT_CN.md](docs/ENTER_MINECRAFT_CN.md). The short version:
+
+1. Run a Paper 1.21.1 server with `online-mode=false` and `spawn-protection=0`; a LAN world rejects the offline bot.
+2. Start Studio and the bridge, then confirm the console shows the bridge connected and the bot `Voxkin` in the world.
+3. Join the server and talk to Voxkin in chat. It answers with voice and performs actions such as digging, walking, or turning.
+4. For positional audio, build the client mod (`cd mod; gradle build` with JDK 21), install the jar plus Fabric API, set `audio.output: websocket`, and add `-Dvoxkin.audio.url=ws://127.0.0.1:8765/ws/audio -Dvoxkin.audio.bot=Voxkin` to the client JVM arguments.
+
+The mod plays through Minecraft's streaming sound source at the bot entity, with distance attenuation; the spatial effect has not been verified in a live client yet.
+
 ### 5. Talk through the microphone
 
 ```powershell
@@ -138,7 +149,7 @@ Speak naturally; press `Ctrl+C` to stop. Useful flags:
 | `--no-barge-in` | Disable interruption on open speakers to avoid hearing itself |
 | `--output speaker` | Override the audio output for this run |
 
-With open speakers, add `--no-barge-in`: microphone input is ignored for 0.9 seconds after playback ends, preventing the bot from answering its own voice. Headphones give the most natural interruption behaviour.
+With open speakers, add `--no-barge-in`: microphone input is ignored for 1.5 seconds after playback ends, preventing the bot from answering its own voice. Headphones give the most natural interruption behaviour.
 
 ## Configuration
 | File | Purpose |
@@ -162,6 +173,8 @@ docs/                Audit, architecture, evaluation, decisions, roadmap, status
 
 ## Documentation
 
+- [Getting started (Chinese)](docs/GETTING_STARTED_CN.md)
+- [Enter Minecraft (Chinese)](docs/ENTER_MINECRAFT_CN.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Repository audit](docs/REPO_AUDIT.md)
 - [Technology evaluation](docs/TECH_EVALUATION.md)
