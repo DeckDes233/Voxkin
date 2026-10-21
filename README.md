@@ -36,8 +36,12 @@ python -m venv .venv --system-site-packages
 
 ## 配置
 
+```powershell
+Copy-Item config\voxkin.example.yaml config\voxkin.yaml
+```
+
 - `config/voxkin.example.yaml`：可提交的配置样例。
-- `config/voxkin.yaml`：本地实际配置，端口、模型路径等。
+- `config/voxkin.yaml`：本地实际配置，端口、模型路径等，不进入版本库。
 - `config/local.yaml`：不进入版本库的覆盖项，可写 API Key 与个人路径。
 
 API Key 只从环境变量 `DEEPSEEK_API_KEY` 或 `config/local.yaml` 读取，日志与状态接口不会返回明文。
