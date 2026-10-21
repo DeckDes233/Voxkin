@@ -483,13 +483,87 @@ async function retreatFrom(target) {
   }
 }
 
+function findRangedWeapon() {
+  const items = bot.inventory.items();
+  const bow = items.find((item) => item.name === 'bow' || item.name === 'crossbow');
+  const arrows = items.find((item) => item.name === 'arrow');
+  if (!bow || !arrows) return null;
+  return { bow, arrows };
+}
+
+function aimPoint(target) {
+  const base = target.position.offset(0, target.height * 0.5, 0);
+  const velocity = target.velocity || { x: 0, y: 0, z: 0 };
+  const distance = bot.entity.position.distanceTo(base);
+  const flight = distance / 30;
+  return base.offset(
+    (velocity.x || 0) * flight,
+    (velocity.y || 0) * flight,
+    (velocity.z || 0) * flight
+  );
+}
+
+async function shootAt(target) {
+  const ranged = findRangedWeapon();
+  if (!ranged) return false;
+  try {
+    await bot.equip(ranged.bow, 'hand');
+    await bot.lookAt(aimPoint(target), true);
+    await bot.activateItem();
+    await sleep(ranged.bow.name === 'crossbow' ? 1250 : 900);
+    await bot.deactivateItem();
+    return true;
+  } catch (error) {
+    log('射击失败', error.message);
+    return false;
+  }
+}
+
 async function attackEntity(target) {
   await equipWeapon();
   const name = blockLabel(target.name);
   let hits = 0;
+  let meleeReady = true;
   for (let index = 0; index < 20 && target.isValid !== false && bot.health > 4; index += 1) {
     if (interrupted) throw new Error('被新的指令打断');
-    if (target.position && bot.entity.position.distanceTo(target.position) > 3) {
+    const distance = target.position
+      ? bot.entity.position.distanceTo(target.position)
+      : 0;
+    const flying =
+      target.name === 'phantom' ||
+      (target.position && target.position.y - bot.entity.position.y > 2.5);
+    if (flying) {
+      await bot.lookAt(target.position.offset(0, target.height * 0.7, 0), true);
+      if (findRangedWeapon() && distance > 3.5) {
+        if (await shootAt(target)) {
+          hits += 1;
+          meleeReady = false;
+          await sleep(700);
+          continue;
+        }
+      }
+      if (distance <= 3.5) {
+        if (!meleeReady) {
+          await equipWeapon();
+          meleeReady = true;
+        }
+        bot.attack(target);
+        hits += 1;
+      }
+      await sleep(500);
+      continue;
+    }
+    if (findRangedWeapon() && distance > 6 && await shootAt(target)) {
+      hits += 1;
+      meleeReady = false;
+      await sleep(700);
+      continue;
+    }
+    if (!meleeReady) {
+      await equipWeapon();
+      meleeReady = true;
+    }
+    if (distance > 3) {
       await approach(target);
     }
     await bot.lookAt(target.position.offset(0, target.height * 0.8, 0), true);
@@ -579,6 +653,7 @@ function isNearDanger(position) {
   const dangers = new Set([
     'cactus',
     'lava',
+    'water',
     'fire',
     'magma_block',
     'sweet_berry_bush',
@@ -610,6 +685,78 @@ async function escapeEnvironment() {
   } finally {
     escapeBusy = false;
     lastActivity = Date.now();
+  }
+}
+
+function blockIsWater(block) {
+  return Boolean(block && block.name && block.name.includes('water'));
+}
+
+function findShore(radius = 12) {
+  const base = bot.entity.position;
+  for (let distance = 3; distance <= radius; distance += 2) {
+    for (let step = 0; step < 8; step += 1) {
+      const angle = (Math.PI * 2 * step) / 8;
+      const x = Math.floor(base.x + Math.cos(angle) * distance);
+      const z = Math.floor(base.z + Math.sin(angle) * distance);
+      for (let dy = -1; dy <= 2; dy += 1) {
+        const ground = bot.blockAt(vec(x, Math.floor(base.y) + dy, z));
+        if (!ground || ground.boundingBox !== 'block') continue;
+        if (blockIsWater(ground) || /lava/.test(ground.name)) continue;
+        const above = bot.blockAt(ground.position.offset(0, 1, 0));
+        const above2 = bot.blockAt(ground.position.offset(0, 2, 0));
+        if (above?.boundingBox === 'empty' && above2?.boundingBox === 'empty') {
+          return { position: ground.position.offset(0, 1, 0), angle };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+let waterEscapeBusy = false;
+let lastDrownLogAt = 0;
+
+async function swimToShore(reason) {
+  if (waterEscapeBusy) return;
+  waterEscapeBusy = true;
+  const oxygen = bot.oxygenLevel ?? 20;
+  if (Date.now() - lastDrownLogAt > 5000) {
+    lastDrownLogAt = Date.now();
+    log('水里氧气不足，游向岸边', `oxygen=${oxygen} ${reason}`);
+  }
+  try {
+    const shore = findShore(12);
+    if (shore) {
+      const base = bot.entity.position;
+      const dx = shore.position.x - base.x;
+      const dz = shore.position.z - base.z;
+      await bot.look(Math.atan2(-dx, dz), 0, true);
+    }
+    bot.setControlState('jump', true);
+    bot.setControlState('forward', true);
+    await sleep(1800);
+  } catch (error) {
+    log('游向岸边失败', error.message);
+  } finally {
+    bot.setControlState('forward', false);
+    waterEscapeBusy = false;
+  }
+}
+
+function waterTick() {
+  if (!bot || !bot.entity) return;
+  const feet = bot.blockAt(bot.entity.position);
+  const head = bot.blockAt(bot.entity.position.offset(0, 1, 0));
+  const inWater = blockIsWater(feet) || blockIsWater(head);
+  if (!inWater) {
+    if (bot.getControlState('jump')) bot.setControlState('jump', false);
+    return;
+  }
+  bot.setControlState('jump', true);
+  const oxygen = bot.oxygenLevel ?? 20;
+  if (oxygen <= 8) {
+    swimToShore(`oxygen=${oxygen}`);
   }
 }
 
@@ -997,6 +1144,8 @@ function createBot() {
     movements.allowSprinting = true;
     movements.canOpenDoors = true;
     movements.maxDropDown = 4;
+    movements.liquidCost = 12;
+    movements.infiniteLiquidDropdownDistance = false;
     const avoidBlocks = [
       'cactus',
       'magma_block',
@@ -1128,6 +1277,7 @@ connectCore();
 createBot();
 setInterval(idleTick, 1000);
 setInterval(survivalTick, 1000);
+setInterval(waterTick, 500);
 
 process.on('SIGINT', () => {
   log('收到退出信号');
