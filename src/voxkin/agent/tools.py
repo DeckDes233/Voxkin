@@ -325,6 +325,29 @@ MINECRAFT_TOOLS: list[dict[str, Any]] = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "smelt",
+            "description": "把矿石或生食放进熔炉熔炼；附近没有熔炉时会尝试放置背包里的熔炉，结束后回收。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item": {
+                        "type": "string",
+                        "description": "原料 ID，例如 raw_iron、raw_gold、beef",
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "熔炼数量，默认 1",
+                        "minimum": 1,
+                        "maximum": 64,
+                    },
+                },
+                "required": ["item"],
+            },
+        },
+    },
 ]
 
 TOOL_SYSTEM_HINT = (
@@ -334,6 +357,7 @@ TOOL_SYSTEM_HINT = (
     "问背包或有什么东西时调用 inventory；让你打怪、清怪时调用 attack_nearest。"
     "要挖单个方块用 break_block；要放置方块用 place_block；要走到某种方块用 goto_block；地上有掉落物用 pickup_items。"
     "要合成木板、木棍、工作台、工具时用 craft。"
+    "要把粗铁、粗金或生食熔炼时用 smelt。"
     "想知道周围情况用 observe；找方块用 locate_block；找玩家或生物用 locate_entity；饿了用 eat；晚上用 sleep 睡觉。"
     "玩家问你是谁、在哪、在做什么、为什么，先用一句话直接回答，不要调用工具。"
     "调用工具前先说一句要做什么，不要只调用工具不说话。"

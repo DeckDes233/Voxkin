@@ -265,7 +265,7 @@ async function runAction(message) {
   }, timeoutMs);
   try {
     if (
-      ['goto', 'come_to_player', 'collect_blocks', 'attack_nearest', 'stop', 'break_block', 'place_block', 'goto_block', 'pickup_items', 'craft', 'eat', 'sleep'].includes(
+      ['goto', 'come_to_player', 'collect_blocks', 'attack_nearest', 'stop', 'break_block', 'place_block', 'goto_block', 'pickup_items', 'craft', 'smelt', 'eat', 'sleep'].includes(
         message.tool
       )
     ) {
@@ -352,6 +352,9 @@ async function runAction(message) {
         break;
       case 'craft':
         detail = await craftItem(args);
+        break;
+      case 'smelt':
+        detail = await smeltItem(args);
         break;
       case 'look_at_player': {
         const player = bot.players[args.player];
@@ -600,7 +603,7 @@ function nearbyBlock(name, range) {
   return bot.findBlock({ matching: block.id, maxDistance: range });
 }
 
-async function placeCraftingTable() {
+async function placeInventoryBlock(name, label) {
   const base = bot.entity.position;
   const offsets = [
     [1, 0],
@@ -622,12 +625,16 @@ async function placeCraftingTable() {
       const above2 = bot.blockAt(ground.position.offset(0, 2, 0));
       if (above?.boundingBox === 'empty' && above2?.boundingBox === 'empty') {
         const target = above.position;
-        await placeBlock({ block: 'crafting_table', x: target.x, y: target.y, z: target.z });
+        await placeBlock({ block: name, x: target.x, y: target.y, z: target.z });
         return bot.blockAt(target);
       }
     }
   }
-  throw new Error('附近没有地方放工作台');
+  throw new Error(`附近没有地方放${label}`);
+}
+
+async function placeCraftingTable() {
+  return placeInventoryBlock('crafting_table', '工作台');
 }
 
 async function craftItem(args) {
@@ -661,6 +668,87 @@ async function craftItem(args) {
     }
   }
   return `合成 ${after - before} 个 ${blockLabel(name)}`;
+}
+
+const SMELT_OUTPUTS = {
+  raw_iron: 'iron_ingot',
+  raw_gold: 'gold_ingot',
+  raw_copper: 'copper_ingot',
+  sand: 'glass',
+  cobblestone: 'stone',
+  clay_ball: 'brick',
+  porkchop: 'cooked_porkchop',
+  beef: 'steak',
+  chicken: 'cooked_chicken',
+  mutton: 'cooked_mutton',
+  cod: 'cooked_cod',
+  salmon: 'cooked_salmon',
+  potato: 'baked_potato',
+};
+
+function findFuelItem() {
+  for (const name of ['coal', 'charcoal', 'oak_planks', 'birch_planks', 'stick']) {
+    const item = bot.inventory.items().find((entry) => entry.name === name);
+    if (item) return item;
+  }
+  return null;
+}
+
+async function smeltItem(args) {
+  const name = String(args.item || '');
+  const count = Math.max(1, Math.min(Number(args.count) || 1, 64));
+  const item = bot.registry.itemsByName[name];
+  if (!item) throw new Error(`未知物品 ${name}`);
+  if (countItem(name) < count) throw new Error(`背包里只有 ${countItem(name)} 个 ${blockLabel(name)}`);
+  let furnaceBlock = nearbyBlock('furnace', 16);
+  let placed = false;
+  if (!furnaceBlock) {
+    if (!bot.inventory.items().some((entry) => entry.name === 'furnace')) {
+      throw new Error('附近没有熔炉，背包里也没有熔炉');
+    }
+    furnaceBlock = await placeInventoryBlock('furnace', '熔炉');
+    placed = true;
+  }
+  if (bot.entity.position.distanceTo(furnaceBlock.position) > 3) {
+    await travelTo(furnaceBlock.position.x, furnaceBlock.position.y, furnaceBlock.position.z, 2);
+  }
+  const outputName = SMELT_OUTPUTS[name] || name;
+  const before = countItem(outputName);
+  const furnace = await bot.openFurnace(furnaceBlock);
+  try {
+    await furnace.putInput(item.id, null, count);
+    const fuel = findFuelItem();
+    if (!fuel) throw new Error('没有燃料（煤、木炭或木板）');
+    const fuelCount =
+      fuel.name === 'coal' || fuel.name === 'charcoal'
+        ? Math.max(1, Math.ceil(count / 8))
+        : Math.max(1, Math.ceil(count / 1.5));
+    await furnace.putFuel(fuel.id, null, Math.min(fuelCount, fuel.count));
+    let waited = 0;
+    while (waited < 90 && (furnace.outputItem()?.count || 0) < count) {
+      if (interrupted) throw new Error('被新的指令打断');
+      await sleep(1000);
+      waited += 1;
+    }
+    const output = furnace.outputItem();
+    if (output) await furnace.takeOutput();
+    const gained = countItem(outputName) - before;
+    if (gained <= 0) throw new Error(`熔炼了 ${name}，但没有取到 ${outputName}`);
+    return `熔炼出 ${gained} 个 ${blockLabel(outputName)}，背包共 ${countItem(outputName)} 个`;
+  } finally {
+    try {
+      await furnace.close();
+    } catch (error) {
+      log('关闭熔炉失败', error.message);
+    }
+    if (placed) {
+      try {
+        await bot.dig(furnaceBlock);
+      } catch (error) {
+        log('回收熔炉失败', error.message);
+      }
+    }
+  }
 }
 
 const GOLDEN_FOODS = new Set(['golden_apple', 'enchanted_golden_apple']);

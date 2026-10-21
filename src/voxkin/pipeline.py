@@ -341,6 +341,7 @@ class ConversationPipeline:
             "goto_block": "好，我过去。",
             "pickup_items": "好，我去捡。",
             "craft": "好，我合成。",
+            "smelt": "好，我去熔炼。",
             "attack_nearest": "好，我打它。",
             "inventory": "好，我看看背包。",
             "observe": "好，我看看四周。",
