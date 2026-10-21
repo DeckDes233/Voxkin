@@ -56,6 +56,28 @@ def test_runner_blocks_when_verification_fails(tmp_path: Path) -> None:
     assert store.get_task(result.task_id).status == "blocked"
 
 
+def test_runner_waits_for_fresh_state(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    inventory: dict[str, int] = {}
+    polls = {"count": 0}
+
+    async def executor(tool: str, arguments: dict) -> str:
+        inventory["oak_log"] = 3
+        return "ok"
+
+    def state() -> dict:
+        polls["count"] += 1
+        if polls["count"] <= 5:
+            return {"inventory": {}}
+        return {"inventory": dict(inventory)}
+
+    steps = [StepSpec("收集木头", "collect_blocks", {"block": "oak_log"}, {"type": "inventory", "items": {"oak_log": 3}})]
+    runner = TaskRunner(executor, state, store)
+    result = asyncio.run(runner.run("S0", steps))
+    assert result.ok
+    assert polls["count"] > 5
+
+
 def test_runner_retries_then_succeeds(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     attempts = {"count": 0}

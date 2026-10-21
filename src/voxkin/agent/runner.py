@@ -112,6 +112,18 @@ class TaskRunner:
         if self._announce is not None:
             await self._announce(text)
 
+    async def _verify_with_wait(self, rule: dict[str, Any]) -> tuple[bool, str]:
+        """桥接状态 5 秒一帧；动作刚结束时允许短暂等待新状态。"""
+        state = self._state_provider()
+        ok, reason = self._verifier.check(rule, state)
+        for _ in range(15):
+            if ok:
+                break
+            await asyncio.sleep(0.1)
+            state = self._state_provider()
+            ok, reason = self._verifier.check(rule, state)
+        return ok, reason
+
     async def run(
         self,
         objective: str,
@@ -147,8 +159,7 @@ class TaskRunner:
                     ok = False
                     reason = "exception"
                 else:
-                    state = self._state_provider()
-                    ok, reason = self._verifier.check(step.verify, state)
+                    ok, reason = await self._verify_with_wait(step.verify)
                 if self._logger is not None:
                     self._logger.log(
                         "step",
