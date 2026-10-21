@@ -58,6 +58,23 @@ function pushEvent(kind, text, cls) {
   while (box.childElementCount > 400) box.removeChild(box.firstChild);
 }
 
+const streamRows = new Map();
+
+function streamDelta(requestId, text) {
+  if (!text) return;
+  const box = $("events");
+  let row = streamRows.get(requestId);
+  if (!row) {
+    row = document.createElement("div");
+    row.className = "event";
+    row.innerHTML = `<span class="t">${stamp()}</span><span class="k">模型</span><span></span>`;
+    box.appendChild(row);
+    streamRows.set(requestId, row);
+  }
+  row.lastElementChild.textContent += text.replace(/\n/g, " ");
+  box.scrollTop = box.scrollHeight;
+}
+
 function fmt(value) {
   return value === null || value === undefined ? "-" : value;
 }
@@ -69,7 +86,7 @@ function renderTurns() {
     .map(
       (turn, index) => `<tr>
         <td>${index + 1}</td>
-        <td>${fmt(turn.stt_ms)}</td>
+        <td>${turn.stt_ms ? fmt(turn.stt_ms) : "-"}</td>
         <td>${fmt(turn.llm_ttft_ms)}</td>
         <td>${fmt(turn.first_sentence_ms)}</td>
         <td>${fmt(turn.tts_first_audio_ms)}</td>
@@ -107,16 +124,18 @@ function handleEvent(payload) {
       pushEvent("开始", payload.text);
       break;
     case "llm_delta":
-      pushEvent("模型", payload.text.replace(/\n/g, " "));
+      streamDelta(payload.request_id, payload.text);
       break;
     case "sentence_ready":
       pushEvent("分句", payload.text, "sentence");
       break;
     case "turn_finished": {
       const s = payload.summary;
+      streamRows.delete(s.request_id);
+      const stt = s.stt_ms ? `识别 ${s.stt_ms}ms · ` : "";
       pushEvent(
         "完成",
-        `识别 ${fmt(s.stt_ms)}ms · 首字 ${fmt(s.llm_ttft_ms)}ms · 首次可听 ${fmt(s.first_audible_ms)}ms`,
+        `${stt}首字 ${fmt(s.llm_ttft_ms)}ms · 首次可听 ${fmt(s.first_audible_ms)}ms`,
         "sentence"
       );
       loadMetrics();
@@ -124,9 +143,11 @@ function handleEvent(payload) {
     }
     case "turn_interrupted":
     case "turn_cancelled":
+      streamRows.delete(payload.request_id);
       pushEvent("打断", payload.reason || payload.request_id, "error");
       break;
     case "turn_failed":
+      streamRows.delete(payload.request_id);
       pushEvent("失败", payload.error, "error");
       break;
     case "action_started":
@@ -148,6 +169,8 @@ function handleEvent(payload) {
       pushEvent("回复", `首次可听 ${payload.summary.first_audible_ms} ms`, "sentence");
       break;
     }
+    case "bridge_state":
+      break;
     case "mic_error":
       pushEvent("麦克风", payload.error, "error");
       break;
@@ -216,7 +239,8 @@ async function saveConfig() {
 async function loadMic() {
   const response = await fetch("/api/mic");
   const data = await response.json();
-  const state = data.state === "running" || data.state === "ready" ? "正在聆听" : data.state;
+  const labels = { stopped: "未启动", starting: "启动中", running: "正在聆听", ready: "正在聆听" };
+  const state = labels[data.state] || data.state;
   $("micState").textContent = `${state}${data.last_stt_ms ? " · 上次识别 " + data.last_stt_ms + " ms" : ""}`;
 }
 
