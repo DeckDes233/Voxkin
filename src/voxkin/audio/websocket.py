@@ -18,6 +18,7 @@ class WebSocketAudioSink(AudioSink):
         self.sample_rate = sample_rate
         self._clients: set[Sender] = set()
         self._sequence = 0
+        self._started_turns: set[str] = set()
 
     def describe(self) -> dict:
         return {
@@ -36,6 +37,10 @@ class WebSocketAudioSink(AudioSink):
         return None
 
     async def play(self, turn_id: str, pcm: np.ndarray) -> None:
+        first_chunk = turn_id not in self._started_turns
+        if first_chunk:
+            self._started_turns.add(turn_id)
+            self._notify_playback_start(turn_id)
         self._sequence += 1
         header = json.dumps(
             {
@@ -55,6 +60,7 @@ class WebSocketAudioSink(AudioSink):
             await sender(payload)
 
     async def flush(self) -> None:
+        self._started_turns.clear()
         message = json.dumps({"type": "flush"})
         for sender in list(self._clients):
             await sender(message)
