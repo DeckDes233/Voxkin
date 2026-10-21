@@ -65,6 +65,7 @@ class ConversationPipeline:
         self._summarize_task: asyncio.Task | None = None
         self.sink.set_playback_start_callback(self._on_playback_start)
         self._spoken_texts: dict[str, list[str]] = {}
+        self._action_notes: deque[str] = deque(maxlen=5)
 
     def set_action_handler(self, handler: ActionHandler) -> None:
         self._action_handler = handler
@@ -111,6 +112,13 @@ class ConversationPipeline:
         if state_line:
             index = 1 if messages and messages[0].get("role") == "system" else 0
             messages.insert(index, {"role": "system", "content": state_line})
+        notes = list(self._action_notes)
+        self._action_notes.clear()
+        if notes:
+            messages.insert(
+                max(0, len(messages) - 1),
+                {"role": "system", "content": "[最近动作] " + "；".join(notes)},
+            )
         return messages
 
     @property
@@ -357,6 +365,7 @@ class ConversationPipeline:
             }
         )
         if self._action_handler is None:
+            self._action_notes.append(f"{call.get('name')} 未执行：没有配置动作执行器")
             await self._broadcast(
                 {
                     "type": "action_skipped",
@@ -370,6 +379,7 @@ class ConversationPipeline:
             detail = await self._action_handler(call, turn)
         except Exception as error:
             turn.meta.setdefault("action_errors", []).append(str(error))
+            self._action_notes.append(f"{call.get('name')} 失败：{str(error)[:160]}")
             self.metrics.update(turn)
             await self._broadcast(
                 {
@@ -382,6 +392,7 @@ class ConversationPipeline:
             await self.announce("这次没做成，我换个地方看看。")
             return
         turn.mark("t8_action_done")
+        self._action_notes.append(f"{call.get('name')} 完成：{str(detail)[:160]}")
         self.metrics.update(turn)
         await self.announce(f"好了，{detail}。")
         await self._broadcast(
