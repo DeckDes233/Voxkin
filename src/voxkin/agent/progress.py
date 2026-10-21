@@ -10,6 +10,7 @@ class Stage:
     goals: tuple[str, ...]
     requires: dict[str, int]
     produces: dict[str, int]
+    event: str = ""
 
 
 STAGES: tuple[Stage, ...] = (
@@ -32,7 +33,7 @@ STAGES: tuple[Stage, ...] = (
         title="食物与庇护所",
         goals=("获得食物", "建临时庇护所", "准备床"),
         requires={"stone_pickaxe": 1},
-        produces={"bread": 3},
+        produces={"bed": 1, "cooked_beef": 3},
     ),
     Stage(
         id="S3",
@@ -43,10 +44,10 @@ STAGES: tuple[Stage, ...] = (
     ),
     Stage(
         id="S4",
-        title="钻石与附魔",
-        goals=("挖钻石", "合成钻石镐", "合成附魔台"),
+        title="钻石与钻石镐",
+        goals=("挖钻石", "合成钻石镐"),
         requires={"iron_pickaxe": 1},
-        produces={"diamond_pickaxe": 1, "enchanting_table": 1},
+        produces={"diamond_pickaxe": 1},
     ),
     Stage(
         id="S5",
@@ -61,6 +62,7 @@ STAGES: tuple[Stage, ...] = (
         goals=("找到要塞", "激活末地门", "击败末影龙"),
         requires={"blaze_rod": 7, "ender_pearl": 16},
         produces={},
+        event="ender_dragon_killed",
     ),
 )
 
@@ -80,6 +82,8 @@ def next_stage(stage_id: str) -> Stage | None:
 
 
 def is_complete(stage: Stage, inventory: dict[str, int]) -> bool:
+    if stage.event:
+        return False
     return all(inventory.get(item, 0) >= count for item, count in stage.produces.items())
 
 
