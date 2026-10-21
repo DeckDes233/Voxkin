@@ -895,6 +895,7 @@ function survivalTick() {
   }
   const hostile = findHostile(16);
   if (hostile && Date.now() - lastCombatAt > 5000) {
+    lastActivity = Date.now();
     if (hostile.name === 'creeper') {
       const distance = bot.entity.position.distanceTo(hostile.position);
       if (distance <= 8) {
@@ -1041,7 +1042,7 @@ async function startWander() {
 }
 
 function idleTick() {
-  if (!bot || !bot.entity || followSession || actionBusy || wanderActive) return;
+  if (!bot || !bot.entity || followSession || actionBusy || wanderActive || combatBusy) return;
   if (Date.now() - lastActivity < IDLE_WANDER_MS) return;
   if (bot.health < 10) return;
   const player = nearestPlayer(64);
