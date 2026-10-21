@@ -83,6 +83,14 @@ class Runtime:
                 device=config.audio.device,
                 volume=config.audio.volume,
             )
+        dispatcher = ActionDispatcher()
+        store: MemoryStore | None = None
+        writer: MemoryWriter | None = None
+        if config.memory.enabled:
+            store = MemoryStore(config.memory)
+            store.initialize()
+            if isinstance(llm, OpenAICompatLLM):
+                writer = MemoryWriter(store, llm, config.memory)
         pipeline = ConversationPipeline(
             config=config,
             llm=llm,
@@ -93,14 +101,6 @@ class Runtime:
             memory=store,
             memory_writer=writer,
         )
-        dispatcher = ActionDispatcher()
-        store: MemoryStore | None = None
-        writer: MemoryWriter | None = None
-        if config.memory.enabled:
-            store = MemoryStore(config.memory)
-            store.initialize()
-            if isinstance(llm, OpenAICompatLLM):
-                writer = MemoryWriter(store, llm, config.memory)
 
         async def handle_action(call: dict[str, Any], turn) -> str:
             return await dispatcher.dispatch(call["name"], call.get("arguments") or {})

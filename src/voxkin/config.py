@@ -103,6 +103,7 @@ class MemoryConfig:
     retrieve_limit: int = 5
     recent_turns: int = 8
     context_token_budget: int = 900
+    summarize_delay_s: float = 10.0
 
 
 @dataclass

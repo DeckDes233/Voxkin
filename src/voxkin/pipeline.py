@@ -60,6 +60,7 @@ class ConversationPipeline:
         self._accept_audio = False
         self._action_handler: ActionHandler | None = None
         self._started = False
+        self._summarize_task: asyncio.Task | None = None
         self.sink.set_playback_start_callback(self._on_playback_start)
         self._spoken_texts: dict[str, list[str]] = {}
 
@@ -135,6 +136,8 @@ class ConversationPipeline:
     async def respond(self, user_text: str, request_id: str | None = None) -> dict[str, Any]:
         if not self._started:
             await self.start()
+        if self._summarize_task is not None and not self._summarize_task.done():
+            self._summarize_task.cancel()
         if self._active_turn is not None:
             await self.interrupt("superseded")
         self._generation += 1
@@ -233,11 +236,11 @@ class ConversationPipeline:
             if collected:
                 self.memory.add_turn(turn.request_id, "assistant", "".join(collected))
             if self.memory_writer is not None:
-                summarize_task = asyncio.create_task(
-                    self.memory_writer.maybe_summarize(), name=f"memory-{turn.request_id}"
+                self._summarize_task = asyncio.create_task(
+                    self._delayed_summarize(), name=f"memory-{turn.request_id}"
                 )
-                self._background_tasks.add(summarize_task)
-                summarize_task.add_done_callback(self._background_tasks.discard)
+                self._background_tasks.add(self._summarize_task)
+                self._summarize_task.add_done_callback(self._background_tasks.discard)
         else:
             self._local_history.append({"role": "user", "content": user_text})
             if collected:
@@ -246,6 +249,11 @@ class ConversationPipeline:
         summary = turn.summary()
         await self._broadcast({"type": "turn_finished", "summary": summary})
         return summary
+
+    async def _delayed_summarize(self) -> None:
+        await asyncio.sleep(self.config.memory.summarize_delay_s)
+        if self.memory_writer is not None:
+            await self.memory_writer.maybe_summarize()
 
     async def announce(self, text: str) -> None:
         """把一句系统侧的话送进语音通道，不经过 LLM。"""

@@ -68,3 +68,4 @@ memory:
   retrieve_limit: 5
   recent_turns: 8
   context_token_budget: 900
+  summarize_delay_s: 10
