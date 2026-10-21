@@ -9,7 +9,7 @@
 | 仓库审计 | MiddleAPI、Minecraft Mod、GPT-SoVITS 运行包、MindCraft 上游调用链 | 源码阅读与行号引用，见 `docs/REPO_AUDIT.md`、`docs/research/MINDCRAFT_AUDIT.md` |
 | 语音管线 | 流式 LLM、增量分句、流式 TTS、播放队列、打断、时间线 | 43 个自动化测试通过；5 轮真实 TTS 基准 |
 | TTS 接入 | GPT-SoVITS `api_v2.py` 的 `streaming_mode`，复用 `xiaote` 音色 | 本机真实合成并播放 |
-| 识别 | faster-whisper small，中文文件识别 | 本机实测 |
+| 识别 | faster-whisper small，中文识别；模板幻觉、重复循环与低置信片段过滤 | 本机实测；17 个过滤测试；5 秒静音返回空文本 |
 | 端点检测 | 能量 VAD，合成音频测试 | 5 个测试用例 |
 | 桥接 | WebSocket 协议、动作派发、mineflayer 客户端 | 真实 WebSocket 集成测试；Paper 1.21.1 上完成聊天到动作的端到端验证 |
 | Studio | 状态、试听、事件流、延迟表、配置、受管服务、日志、麦克风启停 | HTTP 接口实测；服务管理用真实子进程测试 |

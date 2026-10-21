@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Awaitable, Callable
 
 from voxkin.bridge.protocol import ActionRequest, ActionResult
@@ -22,6 +23,8 @@ class ActionDispatcher:
         self._pending: dict[str, asyncio.Future[ActionResult]] = {}
         self._lock = asyncio.Lock()
         self.bridge_name = ""
+        self.latest_state: dict[str, Any] = {}
+        self._state_at = 0.0
 
     @property
     def connected(self) -> bool:
@@ -30,6 +33,17 @@ class ActionDispatcher:
     @property
     def pending_count(self) -> int:
         return len(self._pending)
+
+    def update_state(self, data: dict[str, Any]) -> None:
+        self.latest_state = data or {}
+        self._state_at = time.monotonic()
+
+    def state_snapshot(self, max_age_s: float = 30.0) -> dict[str, Any]:
+        if not self.latest_state:
+            return {}
+        if time.monotonic() - self._state_at > max_age_s:
+            return {}
+        return self.latest_state
 
     def attach(self, sender: Sender, bridge_name: str = "") -> None:
         if self._sender is not None:

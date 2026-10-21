@@ -70,6 +70,7 @@ class STTConfig:
     to_simplified: bool = True
     input_gain: float = 1.0
     local_files_only: bool = False
+    hallucination_filter: bool = True
     playback_cooldown_s: float = 1.5
     input_device: str = ""
     barge_in: bool = False

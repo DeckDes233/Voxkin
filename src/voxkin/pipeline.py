@@ -14,6 +14,7 @@ from voxkin.llm.base import LLMAdapter, LLMDelta
 from voxkin.memory import ContextBuilder, MemoryStore, MemoryWriter
 from voxkin.text import SentenceSplitter
 from voxkin.tts.base import TTSAdapter
+from voxkin.world_state import format_world_state
 
 EventEmitter = Callable[[dict[str, Any]], Awaitable[None]]
 ActionHandler = Callable[[dict[str, Any], TurnTimeline], Awaitable[str]]
@@ -59,6 +60,7 @@ class ConversationPipeline:
         self._tts_active = False
         self._accept_audio = False
         self._action_handler: ActionHandler | None = None
+        self._state_provider = None
         self._started = False
         self._summarize_task: asyncio.Task | None = None
         self.sink.set_playback_start_callback(self._on_playback_start)
@@ -66,6 +68,9 @@ class ConversationPipeline:
 
     def set_action_handler(self, handler: ActionHandler) -> None:
         self._action_handler = handler
+
+    def set_state_provider(self, provider) -> None:
+        self._state_provider = provider
 
     @property
     def is_speaking(self) -> bool:
@@ -94,12 +99,18 @@ class ConversationPipeline:
 
     def _build_messages(self, user_text: str) -> list[dict[str, str]]:
         if self._context_builder is not None:
-            return self._context_builder.build(user_text)
-        messages: list[dict[str, str]] = []
-        if self._system_prompt:
-            messages.append({"role": "system", "content": self._system_prompt})
-        messages.extend(self._local_history)
-        messages.append({"role": "user", "content": user_text})
+            messages = self._context_builder.build(user_text)
+        else:
+            messages = []
+            if self._system_prompt:
+                messages.append({"role": "system", "content": self._system_prompt})
+            messages.extend(self._local_history)
+            messages.append({"role": "user", "content": user_text})
+        state = self._state_provider() if self._state_provider is not None else None
+        state_line = format_world_state(state)
+        if state_line:
+            index = 1 if messages and messages[0].get("role") == "system" else 0
+            messages.insert(index, {"role": "system", "content": state_line})
         return messages
 
     @property
@@ -310,10 +321,27 @@ class ConversationPipeline:
         finally:
             self._tts_active = False
 
+    def _action_acknowledgement(self, call: dict[str, Any]) -> str:
+        name = str(call.get("name") or "")
+        return {
+            "follow_player": "好，我跟着你。",
+            "come_to_player": "好，我过去。",
+            "goto": "好，我过去。",
+            "collect_blocks": "好，我去挖。",
+            "break_block": "好，我去挖。",
+            "place_block": "好，我放。",
+            "goto_block": "好，我过去。",
+            "pickup_items": "好，我去捡。",
+            "attack_nearest": "好，我打它。",
+            "inventory": "好，我看看背包。",
+            "look_at_player": "好，我看你。",
+            "stop": "好，我停下。",
+        }.get(name, "好的，我这就去。")
+
     async def _run_action(self, call: dict[str, Any], turn: TurnTimeline) -> None:
         turn.mark("t7_action_start")
         if not turn.has("t5_first_audio"):
-            await self.announce("好的，我这就去。")
+            await self.announce(self._action_acknowledgement(call))
         await self._broadcast(
             {
                 "type": "action_started",

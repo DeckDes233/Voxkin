@@ -18,6 +18,10 @@ node minecraft_bridge.js
 
 Core 必须先启动（`python -m voxkin serve`）。桥接进程会自行处理 Core 断线与 Minecraft 断线，分别在 3 秒与 5 秒后重连。
 
+## 来源
+
+跟随、挖掘、放置、战斗等动作与自主行为的设计参考了 [MindCraft](https://github.com/mindcraft-bots/mindcraft)（MIT）。桥接没有引入它的运行时代码与 agent 循环，按函数重写并保留这份声明。
+
 ## 协议
 
 所有消息都是 JSON 文本帧。
