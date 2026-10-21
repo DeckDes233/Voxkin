@@ -87,6 +87,7 @@ let lastCreeperWarnAt = 0;
 const IDLE_WANDER_MS = 20000;
 const FAR_DISTANCE = Number(process.env.VOXKIN_FAR_DISTANCE || 128);
 const DISTANCE_ASK_COOLDOWN_MS = 180000;
+const INDEPENDENT = process.env.VOXKIN_INDEPENDENT === '1';
 
 function log(...args) {
   console.log(new Date().toISOString(), '[bridge]', ...args);
@@ -195,6 +196,7 @@ async function runAction(message) {
         detail = '已停止移动';
         break;
       case 'follow_player': {
+        if (INDEPENDENT) throw new Error('独立模式不跟随玩家');
         const player = resolvePlayer(args.player);
         const distance = Math.min(Math.max(Number(args.distance) || 2, 1), 6);
         startFollow(player, distance);
@@ -1124,6 +1126,9 @@ function isStopIntent(text) {
 }
 
 function createBot() {
+  if (INDEPENDENT) {
+    log('独立模式已启用：不向玩家索要坐标，不跟随玩家');
+  }
   bot = mineflayer.createBot({
     host: config.host,
     port: config.port,
@@ -1236,8 +1241,12 @@ function createBot() {
 
 function sendState() {
   if (!bot || !bot.entity) return;
-  checkPlayerDistance();
+  if (!INDEPENDENT) checkPlayerDistance();
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  const inventory = {};
+  for (const item of bot.inventory.items()) {
+    inventory[item.name] = (inventory[item.name] || 0) + item.count;
+  }
   const position = bot.entity.position;
   const players = Object.values(bot.players)
     .filter((player) => player.username !== bot.username && player.entity)
@@ -1268,6 +1277,8 @@ function sendState() {
         weather:
           bot.thunderState > 0 ? 'thunder' : bot.rainState > 0 ? 'rain' : 'clear',
         players,
+        inventory,
+        held: bot.heldItem ? bot.heldItem.name : '',
       },
     })
   );

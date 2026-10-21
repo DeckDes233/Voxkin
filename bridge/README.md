@@ -13,6 +13,7 @@ $env:MC_VERSION = "1.21.1"     # 留空则自动协商
 $env:MC_USERNAME = "Voxkin"
 $env:MC_AUTH = "offline"       # 正版账号改成 microsoft
 $env:VOXKIN_WS = "ws://127.0.0.1:8765/ws/bridge"
+$env:VOXKIN_INDEPENDENT = "1"  # 独立通关模式：不向玩家索要坐标，不跟随玩家
 node minecraft_bridge.js
 ```
 

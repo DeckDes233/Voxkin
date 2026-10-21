@@ -67,6 +67,12 @@ class TaskStore:
                 payload text not null default '{}',
                 created_at real not null
             );
+            create table if not exists checkpoints (
+                task_id integer primary key,
+                cursor integer not null default 0,
+                payload text not null default '{}',
+                updated_at real not null
+            );
             """
         )
         self._connection.commit()
@@ -165,6 +171,29 @@ class TaskStore:
             "select id from steps where task_id = ? order by position, id", (task_id,)
         ).fetchall()
         return [self.get_step(row["id"]) for row in rows]
+
+    def save_checkpoint(
+        self, task_id: int, cursor: int, payload: dict[str, Any] | None = None
+    ) -> None:
+        self._connection.execute(
+            "insert into checkpoints (task_id, cursor, payload, updated_at) "
+            "values (?, ?, ?, ?) on conflict(task_id) do update set "
+            "cursor = excluded.cursor, payload = excluded.payload, updated_at = excluded.updated_at",
+            (task_id, cursor, json.dumps(payload or {}, ensure_ascii=False), time.time()),
+        )
+        self._connection.commit()
+
+    def load_checkpoint(self, task_id: int) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "select * from checkpoints where task_id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {"cursor": row["cursor"], "payload": json.loads(row["payload"])}
+
+    def resume_cursor(self, task_id: int) -> int:
+        checkpoint = self.load_checkpoint(task_id)
+        return int(checkpoint["cursor"]) if checkpoint else 0
 
     def log_event(self, task_id: int, kind: str, payload: dict[str, Any] | None = None) -> None:
         self._connection.execute(

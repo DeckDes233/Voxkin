@@ -7,7 +7,7 @@
 | --- | --- | --- | --- |
 | 阶段推进 | `src/voxkin/agent/progress.py` 只有 S0-S6 背包判定；`agent/tasks.py` 有 TaskStore 三张表 | 阶段与任务持久化 | 无 TaskRunner、无 `/api/run/*` |
 | 动作取消 | `actions.py` 只有 `dispatch`；桥接的 `attack_nearest`/`stop` 可打断当前动作 | 抢占、超时后清场、step 级取消 | 无 Core 侧 `cancel`，无 step 进度 |
-| 技能覆盖 | `bridge/minecraft_bridge.js` 12 个动作；顶层直接连 Core 与建 bot | craft/smelt/chest/sleep/trade/portal/bow | 均未实现；技能函数不可单测 |
+| 技能覆盖 | `bridge/minecraft_bridge.js` 12 个动作；顶层直接连 Core 与建 bot；弓射击已具备 | craft/smelt/chest/sleep/trade/portal/bow_craft | 弓与箭矢合成缺失；技能函数不可单测 |
 | 死亡恢复 | `death` 事件停跟随与闲逛（`bridge:1071`）；重生依赖 mineflayer 默认行为 | 5 秒重生、续做、回收掉落 | 无显式 `respawn`、无任务恢复 |
 | 状态帧 | 5 秒一帧（`bridge:1027`），无背包与耐久 | 每步可追溯 | 无 `runlog`、无 `state_age` |
 | 轨迹 | `MetricsStore` 环形 200 条 | JSONL 全量、checkpoint | 无 `runlog`、无世界快照 |
@@ -76,7 +76,7 @@ powershell -File scripts\soak.ps1 -Hours 24 -FaultEvery 20m
 | `doImmediateRespawn` | false | false | 保留 death 事件供审计 |
 | `announceAdvancements` | false | false | 减少聊天噪声 |
 
-预置箱子只存在于 `scenario`，坐标固定：`(2,71,2)` 阶段物资、`(-2,71,2)` 恢复物资、`(2,71,-2)` 空箱（背包满用）。阶段箱只放上一阶段产物（例如 S3 放 8 个铁矿石、8 个煤、1 个熔炉），用来隔离测试目标；恢复箱放 `water_bucket`、`flint_and_steel`、`obsidian 10`、`cooked_beef 8`、`bed`、`diamond_pickaxe`、`oak_planks 16`。`g1` 不放任何评测箱；读取自然生成的箱子属于正常玩法，计入资源日志；只有读取模板预置坐标的箱子才判失败。
+预置箱子只存在于 `scenario`，坐标固定：`(2,71,2)` 阶段物资、`(-2,71,2)` 恢复物资、`(2,71,-2)` 空箱（背包满用）。阶段箱只放上一阶段产物（例如 S3 放 8 个铁矿石、8 个煤、1 个熔炉），用来隔离测试目标；恢复箱放 `water_bucket`、`flint_and_steel`、`obsidian 10`、`cooked_beef 8`、`bed`、`diamond_pickaxe`、`oak_planks 16`，只在故障注入用例中启用，阶段验收前移除。`g1` 不放任何评测箱；读取自然生成的箱子属于正常玩法，计入资源日志；只有读取模板预置坐标的箱子才判失败。
 
 ```powershell
 # 模板只生成一次；每次 run 前重置
@@ -92,7 +92,7 @@ Remove-Item $target -Recurse -Force; Copy-Item work\mc\world_template $target -R
 | --- | --- | --- | --- |
 | 阶段耗时 | `stage_start` 到 `stage_complete` 的单调时钟差 | `stages.json` | M2 ≤10 分钟，M3 ≤15 分钟，M4 3 游戏日，M5 ≤20 分钟，M6 ≤25 分钟，M7 烈焰棒 ≤40 分钟/珍珠 ≤90 分钟，M8 龙 ≤60 分钟，G1 ≤12 小时（软目标 8 小时） |
 | 死亡次数 | `death` 事件数；另记重生到恢复任务的秒数 | `deaths.json` | M2/M3 0，M4 ≤1，M5 ≤1，M6 岩浆死 0，M7 ≤2，M8 ≤2，G1 ≤20；单次恢复 ≤5 分钟；同点 10 分钟内 3 次判死亡循环 |
-| 卡住次数 | 同一 step 90 秒位移 <2 格且 verifier 无进展 | 状态帧 + verifier | 同一 step ≤5 次，G1 总卡住 ≤30；单次 ≤15 分钟 |
+| 卡住次数 | 技能级 3 秒位移 <0.3 格，任务级 90 秒 <2 格且 verifier 无进展 | 状态帧 + verifier | 同一 step ≤5 次，G1 总卡住 ≤30；单次 ≤15 分钟 |
 | 重规划次数 | 失败触发的 Planner 调用，按 `plan_id` 去重 | `actions.jsonl` | ≤3 次/阶段，G1 ≤21；同一 `(stage, step)` 连续 3 次相同计划判规划错误 |
 | LLM 调用与 token | Planner/Executor 调用次数与 token；按阶段汇总 | LLM usage | Planner ≤3/阶段、≤60/小时；Executor ≤40/小时；G1 ≤2M token、单请求 ≤32k 上下文 |
 | 无效工具调用率 | schema 非法、未知工具、缺参、60 秒内重复且状态无变化的调用 / 总调用 | `actions.jsonl` | M2-M8 ≤5%；G1 ≤3% |
@@ -107,7 +107,7 @@ Remove-Item $target -Recurse -Force; Copy-Item work\mc\world_template $target -R
 
 ## 4. 日志与回放
 
-每次 run 一个目录：`runs/<run_id>/`，含 `state.jsonl`（5 秒采样）、`actions.jsonl`（每动作一行）、`stages.json`、`deaths.json`、`checkpoint.json`、`report.json`、`video/`。`runlog.py` 负责写入；`report.json` 是审计入口，固定字段：run_id、seed、manifest_hash、起止时间、各阶段耗时、死亡与恢复、卡住与重规划、LLM 调用与 token、无效调用率、资源损失率、人工干预计数、桥接可用率、RSS 峰值、日志与 SQLite 大小、回放抽样、`pass/fail` 与失败分类计数。
+每次 run 一个目录：`runs/<run_id>/`，含 `state.jsonl`（5 秒采样）、`actions.jsonl`（每动作一行）、`stages.json`、`deaths.json`、`checkpoint.json`、`report.json`、`video/`。`src/voxkin/agent/runlog.py` 负责写入；`report.json` 是审计入口，固定字段：run_id、seed、manifest_hash、起止时间、各阶段耗时、死亡与恢复、卡住与重规划、LLM 调用与 token、无效调用率、资源损失率、人工干预计数、桥接可用率、RSS 峰值、日志与 SQLite 大小、回放抽样、`pass/fail` 与失败分类计数。
 
     {"ts":"2026-10-22T01:02:03.456+08:00","run_id":"g1-01","seq":842,"event":"verify","stage":"S3","plan_id":"p17","step":3,"state":{"pos":[12.5,64.0,-3.2],"dim":"overworld","health":18.0,"food":14.0,"time":18000,"day":3,"inv":{"iron_ore":5},"state_age_ms":120,"tps":19.8},"plan":{"goal":"smelt 3 iron_ingot","done_when":"inventory.iron_ingot>=3"},"tool":{"name":"smelt","args":{"item":"iron_ingot","count":3}},"result":{"ok":true,"detail":"烧出 3 个铁锭"},"verifier":{"rule":"inv_delta","pass":true,"evidence":{"before":{"iron_ingot":0},"after":{"iron_ingot":3}}},"llm":{"calls":1,"prompt_tokens":812,"completion_tokens":44},"wall_ms":91234}
 
@@ -146,7 +146,7 @@ Remove-Item $target -Recurse -Force; Copy-Item work\mc\world_template $target -R
 | 传送门被拆 | 拆掉 2 格黑曜石；`/setblock <x> <y> <z> air` | 用打火石重开；无打火石则重做 | 15 分钟内回到主世界或下界 | 是（自然） |
 | 末影龙回血 | 留一块末地水晶不拆，或 `/summon end_crystal <portal_top>` | 先拆水晶再打龙；龙回血 >20% 触发重规划 | 10 分钟内水晶清空；龙血不再回满 | 是（自然） |
 
-注入调度由 `scripts/inject.ps1` 执行，尖括号坐标从最近一次 `place_block` 记录填入，每条注入在 `actions.jsonl` 写 `fault` 事件。G1 只允许自然发生的故障；认证 run 额外注入全部 13 项各一次，注入不算人工干预。
+注入调度由 `scripts/inject.ps1` 执行，尖括号坐标从最近一次 `place_block` 或 manifest 记录填入，每条注入在 `actions.jsonl` 写 `fault` 事件。G1 只允许自然发生的故障；认证 run 额外注入全部 13 项各一次，注入不算人工干预。
 
 ## 6. 失败分类
 
@@ -167,9 +167,9 @@ Remove-Item $target -Recurse -Force; Copy-Item work\mc\world_template $target -R
 | M2 木镐 | S0 | 空背包 ≤10 分钟做出木镐与工作台；10 次 ≥8 次；无人工给料 | 10 分钟/次 |
 | M3 石器与第一夜 | S1 | ≤15 分钟石镐、石剑、熔炉；连续 3 夜不死 | 15 分钟/阶段 |
 | M4 食物与床 | S2 | 跨 3 游戏日 food ≥8；睡眠 3/3；死亡 ≤1，死后 5 分钟恢复 | 3 游戏日 |
-| M5 铁装 | S3 | ≤20 分钟铁镐、铁剑、盾；铁锭 ≥6；死亡 ≤1 | 20 分钟/次 |
+| M5 铁装 | S3 | ≤20 分钟铁镐、铁剑、盾；铁锭 ≥6；死亡 ≤1；3 次 ≥3 | 20 分钟/次 |
 | M6 钻石 | S4 | ≤25 分钟 ≥3 钻石并成镐；5 次 ≥4；岩浆死 0 | 25 分钟/次 |
-| M7 下界 | S5 | 7 烈焰棒 ≤40 分钟；16 珍珠 ≤90 分钟；死亡 ≤2；能回主世界 | 2 小时/次 |
+| M7 下界 | S5 | 7 烈焰棒 ≤40 分钟；16 珍珠 ≤90 分钟；死亡 ≤2；能回主世界；5 次 ≥3 | 2 小时/次 |
 | M8 末地 | S6 | 从主世界 checkpoint 60 分钟内击杀末影龙；3 次 ≥2 | 60 分钟/次 |
 | G1 全流程 | S0-S6 | 单个 run_id 从空背包到龙死并回主世界；人工干预 0；死亡 ≤20；无 `/locate`、无预置结构/箱子；1% 步数回放一致；桥接可用率 ≥99% | 12 小时（软 8 小时） |
 
