@@ -218,4 +218,8 @@ def build_sink(choice: str, **kwargs) -> AudioSink:
         return WavDirSink(Path(kwargs["directory"]))
     if choice == "minecraft_file":
         return MinecraftFileSink(Path(kwargs["directory"]), lead_s=kwargs.get("lead_s", 0.05))
+    if choice == "websocket":
+        from voxkin.audio.websocket import WebSocketAudioSink
+
+        return WebSocketAudioSink(sample_rate=kwargs.get("sample_rate", 32000))
     raise ValueError(f"未知的音频输出方式: {choice}")

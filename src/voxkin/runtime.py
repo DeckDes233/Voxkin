@@ -76,6 +76,8 @@ class Runtime:
             )
         elif config.audio.output == "wav_dir":
             sink = build_sink("wav_dir", directory=config.audio.wav_dir)
+        elif config.audio.output == "websocket":
+            sink = build_sink("websocket", sample_rate=32000)
         else:
             sink = build_sink(
                 "speaker",

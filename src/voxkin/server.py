@@ -12,6 +12,7 @@ from aiohttp import WSMsgType, web
 
 from voxkin.audio.capture import Microphone
 from voxkin.audio.wav import arrays_to_wav_bytes
+from voxkin.audio.websocket import WebSocketAudioSink
 from voxkin.agent.actions import ActionError
 from voxkin.bridge.protocol import ActionResult, parse_chat
 from voxkin.config import load_config, save_config
@@ -47,6 +48,7 @@ class StudioServer:
         app.router.add_post("/api/llm/test", self.llm_test)
         app.router.add_get("/ws", self.websocket)
         app.router.add_get("/ws/bridge", self.bridge_socket)
+        app.router.add_get("/ws/audio", self.audio_socket)
         return app
 
     async def index(self, request: web.Request) -> web.StreamResponse:
@@ -194,6 +196,40 @@ class StudioServer:
         current.validate()
         save_config(current, self.config_path)
         return web.json_response({"saved": True, "changed": changed, "restart_required": changed})
+
+    async def audio_socket(self, request: web.Request) -> web.StreamResponse:
+        sink = self.runtime.pipeline.sink
+        if not isinstance(sink, WebSocketAudioSink):
+            raise web.HTTPConflict(text="当前音频输出不是 websocket，请把 audio.output 改为 websocket")
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+
+        async def send(payload: bytes | str) -> None:
+            if ws.closed:
+                raise ConnectionError("音频连接已关闭")
+            if isinstance(payload, bytes):
+                await ws.send_bytes(payload)
+            else:
+                await ws.send_str(payload)
+
+        sink.attach(send)
+        await send(
+            json.dumps(
+                {
+                    "type": "welcome",
+                    "sample_rate": sink.sample_rate,
+                    "channels": 1,
+                    "format": "s16le",
+                }
+            )
+        )
+        try:
+            async for message in ws:
+                if message.type == WSMsgType.TEXT and message.data == "ping":
+                    await send("pong")
+        finally:
+            sink.detach(send)
+        return ws
 
     async def bridge_socket(self, request: web.Request) -> web.StreamResponse:
         ws = web.WebSocketResponse(heartbeat=30)

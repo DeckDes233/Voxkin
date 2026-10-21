@@ -121,7 +121,7 @@ class VoxkinConfig:
             raise ValueError(f"未知的 LLM provider: {self.llm.provider}")
         if self.tts.engine not in {"genie", "gpt_sovits"}:
             raise ValueError(f"未知的 TTS engine: {self.tts.engine}")
-        if self.audio.output not in {"speaker", "wav_dir", "minecraft_file"}:
+        if self.audio.output not in {"speaker", "wav_dir", "minecraft_file", "websocket"}:
             raise ValueError(f"未知的音频输出: {self.audio.output}")
         if self.audio.output == "minecraft_file" and not self.audio.minecraft_audio_dir:
             raise ValueError("minecraft_file 输出必须配置 minecraft_audio_dir")
