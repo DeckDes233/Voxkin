@@ -152,7 +152,7 @@
 | 7 | `collect_blocks` 拾取掉落 + 背包增量校验 | 3、4 | 挖 3 原木后 `oak_log` +3，detail 报实际数量 | 资源循环的入口，掉落 5 分钟消失 |
 | 8 | `craft_item` 材料预检与工作台回收；`equip_item` 统一装备/工具/食物 | 5 | 材料不足时不留工作台；合成后 `crafting_table` 回背包；剑可被点名装备 | 直接决定 S0 成功率 |
 
-工作树已在做的 `observe`、`eat`、`locate_*`、`sleep` 覆盖批次 2、5 的一部分，合并后按上表场景补测试与验收。
+工作树已在做的 `observe`、`eat`、`locate_*`、`sleep` 已在 `e1ee85e` 合并，覆盖批次 2、5 的一部分；合并后仍需按上表场景补真实世界验收。
 
 ## 5. 未验证与文档漂移
 
@@ -160,11 +160,11 @@
 | --- | --- | --- |
 | 真实 Minecraft 端到端 | 本次未运行；`node --check` 通过 | 审计命令 |
 | bridge 逻辑测试 | 无 JS 单测；`test_bridge` 只验 WebSocket 帧与派发 | `tests/test_bridge.py:104-127` |
-| 测试数量 | 文档写 62 / 90 / 92，实跑 111 | `docs/STATUS.md:27`；`docs/MILESTONE.md:46`；`docs/plans/EVALUATION.md:17` |
+| 测试数量 | 文档已统一为 134；本次实跑 134 | `docs/STATUS.md:27`；`docs/MILESTONE.md:46`；`docs/plans/EVALUATION.md:17` |
 | 路线图交付物 | `scripts/run_stage.py`、`bridge/skills/manifest.js` 不存在 | `docs/plans/INDEPENDENT_RUN_ROADMAP.md:102-107` |
 | 独立模式接线 | `VOXKIN_INDEPENDENT` 只在 bridge 读取，Python 侧零引用 | `bridge:90,1209-1211` |
-| 动作数量 | 文档写 12 个，HEAD 实际 14 个 `case` | `docs/plans/EVALUATION.md:10`；`bridge:189-271` |
-| 并发改动 | 截至 00:53，工作树改动 5 个文件（+651 行）：bridge 新增 `observe`、`eat`、`sleep`、`locate_block`、`locate_entity` 分支，`tools.py` 同步 5 个 schema，`pipeline.py` 补 ack；未提交、未验证，本表未计入 | `git status`；`git diff --stat` |
+| 动作数量 | 文档写 19 个，新增 5 个技能后 `case` 为 19 个 | `bridge:189-380` |
+| 并发改动 | `observe`、`eat`、`locate_block`、`locate_entity`、`sleep` 已在 `e1ee85e` 提交；本表状态仍按 `b602e1d` 基线，这 5 项未逐行重评 | `git show e1ee85e --stat` |
 | 行号基线 | 本表按 `b602e1d`，工作树行号已偏移；核对用 `git show b602e1d:bridge/minecraft_bridge.js` | 同上 |
 
 最大风险：没有真实服务器证据，且超时/取消没有世界侧确认。动作在 Core 侧已判失败时，bridge 仍可能继续执行并推进队列，界面与语音会报告「好了」或「没做成」，世界状态却已改变，后续步骤据此继续。
