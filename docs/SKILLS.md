@@ -160,7 +160,7 @@
 | --- | --- | --- |
 | 真实 Minecraft 端到端 | 本次未运行；`node --check` 通过 | 审计命令 |
 | bridge 逻辑测试 | 无 JS 单测；`test_bridge` 只验 WebSocket 帧与派发 | `tests/test_bridge.py:104-127` |
-| 测试数量 | 文档已统一为 138；本次实跑 138 | `docs/STATUS.md:27`；`docs/MILESTONE.md:46`；`docs/plans/EVALUATION.md:17` |
+| 测试数量 | 文档已统一为 139；本次实跑 139 | `docs/STATUS.md:28`；`docs/MILESTONE.md:46`；`docs/plans/EVALUATION.md:17` |
 | 路线图交付物 | `scripts/run_stage.py`、`bridge/skills/manifest.js` 不存在 | `docs/plans/INDEPENDENT_RUN_ROADMAP.md:102-107` |
 | 独立模式接线 | `VOXKIN_INDEPENDENT` 只在 bridge 读取，Python 侧零引用 | `bridge:90,1209-1211` |
 | 动作数量 | 文档写 21 个，新增 5 个技能、smelt 与 attack_target 后 `case` 为 21 个 | `bridge:189-420` |
