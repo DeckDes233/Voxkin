@@ -113,10 +113,10 @@ class TaskRunner:
             await self._announce(text)
 
     async def _verify_with_wait(self, rule: dict[str, Any]) -> tuple[bool, str]:
-        """桥接状态 5 秒一帧；动作刚结束时允许短暂等待新状态。"""
+        """桥接状态 5 秒一帧；动作刚结束时允许等待下一帧完整状态。"""
         state = self._state_provider()
         ok, reason = self._verifier.check(rule, state)
-        for _ in range(15):
+        for _ in range(60):
             if ok:
                 break
             await asyncio.sleep(0.1)
