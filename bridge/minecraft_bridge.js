@@ -1,13 +1,19 @@
 // 沃心 Minecraft 桥接进程：mineflayer 负责游戏内身份，WebSocket 负责与 Voxkin Core 通信。
 // 部分动作与自主行为参考 MindCraft（MIT，https://github.com/mindcraft-bots/mindcraft）。
+import fs from 'node:fs';
 import mineflayer from 'mineflayer';
 import pathfinderPkg from 'mineflayer-pathfinder';
 import WebSocket from 'ws';
 import { Vec3 } from 'vec3';
 import armorManager from 'mineflayer-armor-manager';
 import toolModule from 'mineflayer-tool';
+import { loadSkills } from './skills/registry.js';
+import { BLOCK_NAMES } from './skills/labels.js';
 
 const { pathfinder, Movements, goals } = pathfinderPkg;
+
+// 技能模块注册表：bridge/skills/ 下每个模块导出的 skills 会合并到这里。
+const skillRegistry = await loadSkills();
 
 const config = {
   host: process.env.MC_HOST || '127.0.0.1',
@@ -16,31 +22,6 @@ const config = {
   username: process.env.MC_USERNAME || 'Voxkin',
   auth: process.env.MC_AUTH || 'offline',
   ws: process.env.VOXKIN_WS || 'ws://127.0.0.1:8765/ws/bridge',
-};
-
-const BLOCK_NAMES = {
-  dirt: '泥土',
-  grass_block: '草方块',
-  stone: '石头',
-  cobblestone: '圆石',
-  oak_log: '橡木',
-  birch_log: '白桦木',
-  sand: '沙子',
-  gravel: '沙砾',
-  coal_ore: '煤矿',
-  iron_ore: '铁矿',
-  wheat: '小麦',
-  zombie: '僵尸',
-  skeleton: '骷髅',
-  spider: '蜘蛛',
-  creeper: '苦力怕',
-  witch: '女巫',
-  enderman: '末影人',
-  slime: '史莱姆',
-  drowned: '溺尸',
-  husk: '尸壳',
-  stray: '流浪者',
-  phantom: '幻翼',
 };
 
 const HOSTILE_MOBS = new Set([
@@ -132,14 +113,110 @@ function itemLabel(name) {
   return text;
 }
 
+// 技能清单是技能元数据的唯一事实来源：默认优先级与能不能被抢占都从这里推导。
+const SKILL_MANIFEST = JSON.parse(
+  fs.readFileSync(new URL('./skills/manifest.json', import.meta.url), 'utf8')
+);
+
+const SKILL_META = new Map(
+  SKILL_MANIFEST.skills.map((skill) => [
+    skill.skill_id,
+    { type: skill.type, cancellable: skill.cancellable === true },
+  ])
+);
+
+// 避险技能：低血量、水中困住、下落、离开庇护所等场景下必须先跑。
+const SAFETY_REFLEX_SKILLS = new Set([
+  'flee_low_health',
+  'swim_escape',
+  'safe_descend',
+  'leave_shelter',
+  'parkour_safe',
+  'safe_travel',
+  'sleep_safe',
+]);
+
+const FINAL_ACTION_STATUSES = new Set([
+  'succeeded',
+  'partial',
+  'failed',
+  'cancelled',
+  'disconnected',
+  'blocked',
+]);
+
+// 动作的中文名，用于进度回报。
+const ACTION_LABELS = {
+  observe: '观察周围',
+  inventory: '查看背包',
+  locate_block: '查找方块',
+  locate_entity: '查找实体',
+  look_at_player: '看向玩家',
+  goto: '前往坐标',
+  goto_block: '前往方块',
+  follow_player: '跟随玩家',
+  come_to_player: '走到玩家身边',
+  stop: '停止当前动作',
+  eat: '进食',
+  attack_nearest: '攻击最近的敌人',
+  attack_target: '攻击指定目标',
+  collect_blocks: '采集方块',
+  break_block: '破坏方块',
+  place_block: '放置方块',
+  pickup_items: '拾取物品',
+  craft: '合成物品',
+  smelt: '熔炼物品',
+  sleep: '睡觉',
+  chat: '发送聊天',
+  activate_end_portal: '激活末地传送门',
+  break_crystal: '破坏末影水晶',
+  checkpoint_stock: '盘点物资储备',
+  collect_blaze_rods: '收集烈焰棒',
+  craft_bed: '合成床',
+  craft_tool_set: '合成工具套装',
+  craft_torch: '合成火把',
+  deep_mine: '深层采矿',
+  eat_if_hungry: '饥饿时进食',
+  equip_shield: '装备盾牌',
+  fight_blaze: '战斗烈焰人',
+  fight_dragon: '战斗末影龙',
+  find_diamond: '寻找钻石',
+  flee_low_health: '低血量逃生',
+  hunt_animal: '狩猎动物',
+  hunt_enderman: '狩猎末影人',
+  leave_shelter: '离开庇护所',
+  list_chest: '列出箱子内容',
+  make_nether_portal: '建造下界传送门',
+  make_shelter: '建造庇护所',
+  mine_collect: '采矿并收集',
+  nether_travel: '前往下界',
+  parkour_safe: '安全跑酷',
+  raid_fortress: '突袭堡垒',
+  return_home: '返回据点',
+  safe_descend: '安全下降',
+  safe_travel: '安全行进',
+  sleep_safe: '安全睡眠',
+  smelt_batch: '批量熔炼',
+  store_items: '存入箱子',
+  strip_mine: '挖矿道采集',
+  swim_escape: '水中脱困',
+  swim_out: '游出水面',
+  throw_eye: '投掷末影之眼',
+  wait_for_day: '等待天亮',
+  withdraw_items: '从箱子取出物资',
+};
+
 let socket = null;
 let bot = null;
 let reconnectTimer = null;
 const actionQueue = [];
 let actionRunning = false;
 let currentTool = '';
+let currentActionId = '';
+let currentActionPriority = 3;
+let currentCancellable = false;
 let interrupted = false;
-const PRIORITY_ACTIONS = new Set(['attack_nearest', 'stop']);
+let cancelReason = '';
 let followTimer = null;
 let followSession = null;
 let actionBusy = false;
@@ -184,6 +261,8 @@ function connectCore() {
     }
     if (message.type === 'action') {
       enqueueAction(message);
+    } else if (message.type === 'action_cancel') {
+      handleActionCancel(message);
     } else if (message.type === 'welcome') {
       log('Core 握手完成', message.name);
     } else if (message.type === 'error') {
@@ -203,30 +282,128 @@ function connectCore() {
   });
 }
 
-function interruptCurrent(reason) {
-  if (!currentTool) return;
-  log('打断当前动作', currentTool, reason);
+// 技能的默认优先级：避险技能最高，其次是 stop，只读与语音最低，其余是普通任务。
+function defaultPriority(tool) {
+  if (tool === 'stop') return 1;
+  if (SAFETY_REFLEX_SKILLS.has(tool)) return 0;
+  const meta = SKILL_META.get(tool);
+  if (meta && (meta.type === 'sense' || meta.type === 'voice')) return 5;
+  return 3;
+}
+
+// Core 传来的 priority 是权威值；老消息没有这个字段时回落到清单推导的默认值。
+function actionPriority(message) {
+  const raw = message.priority;
+  if (raw === undefined || raw === null) return defaultPriority(message.tool);
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : defaultPriority(message.tool);
+}
+
+function metaForAction(message) {
+  return SKILL_META.get(message.tool) || SKILL_META.get(message.skill_id || '');
+}
+
+// 只读与语音类技能没有进度概念，不发进度消息。
+function progressEnabled(tool) {
+  const meta = SKILL_META.get(tool);
+  if (!meta) return false;
+  return meta.type !== 'sense' && meta.type !== 'voice';
+}
+
+function actionLabel(tool) {
+  return ACTION_LABELS[tool] || tool;
+}
+
+function sendProgress(message, phase, detail, progress) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  const value = Math.min(Math.max(Number(progress) || 0, 0), 1);
+  socket.send(
+    JSON.stringify({
+      type: 'action_progress',
+      action_id: message.action_id,
+      skill_id: message.skill_id || message.tool,
+      phase,
+      detail: String(detail).slice(0, 200),
+      progress: value,
+    })
+  );
+}
+
+// 打断动作。actionId 为空表示无条件打断；给了 id 且与当前动作不一致时不动手，
+// 避免过期的取消请求误伤新动作。
+function interruptAction(reason, actionId) {
+  if (!currentTool) return false;
+  const target = String(actionId || '');
+  if (target && target !== currentActionId) {
+    log('取消请求与当前动作不匹配，忽略', target, '当前', currentActionId, currentTool);
+    return false;
+  }
+  log('打断当前动作', currentTool, target || '无条件', reason);
   interrupted = true;
+  cancelReason = reason;
   if (bot) {
     bot.pathfinder.stop();
     bot.stopDigging();
     bot.clearControlStates();
   }
+  if (followSession) stopFollow();
+  return true;
+}
+
+// 处理 Core 的取消请求：可以按 action_id 取消单个动作，也可以清空整个队列。
+function handleActionCancel(message) {
+  const reason = String(message.reason || '收到取消请求');
+  const actionId = String(message.action_id || '');
+  if (message.scope === 'all') {
+    const dropped = actionQueue.splice(0, actionQueue.length);
+    for (const item of dropped) {
+      reply(item, false, `已取消：${reason}`, 'cancelled');
+    }
+    log('清空动作队列', dropped.length, reason);
+    interruptAction(reason, '');
+    return;
+  }
+  if (!actionId) {
+    log('取消请求缺少 action_id，忽略');
+    return;
+  }
+  const index = actionQueue.findIndex((item) => String(item.action_id || '') === actionId);
+  if (index >= 0) {
+    const [removed] = actionQueue.splice(index, 1);
+    reply(removed, false, `已取消：${reason}`, 'cancelled');
+    log('已从队列移除动作', actionId, reason);
+    return;
+  }
+  if (actionId === currentActionId) {
+    interruptAction(reason, actionId);
+    return;
+  }
+  log('取消请求没有匹配的动作', actionId, '当前', currentActionId);
+}
+
+// 抢占条件：优先级严格更高，且当前动作在清单里允许被取消。
+function shouldPreempt(message) {
+  if (!actionRunning || !currentTool || !currentCancellable) return false;
+  return actionPriority(message) < currentActionPriority;
+}
+
+// 按优先级排队，数值小的先跑；V8 的 sort 是稳定的，同优先级保持先来先到。
+function sortQueue() {
+  actionQueue.sort((left, right) => actionPriority(left) - actionPriority(right));
 }
 
 function enqueueAction(message) {
   if (message.tool === 'stop') {
     const dropped = actionQueue.splice(0, actionQueue.length);
     for (const item of dropped) {
-      reply(item, false, '被停止指令取消');
+      reply(item, false, '被停止指令取消', 'cancelled');
     }
+    interruptAction('收到停止指令', '');
+  } else if (shouldPreempt(message)) {
+    interruptAction('被更高优先级的动作抢占', currentActionId);
   }
-  if (PRIORITY_ACTIONS.has(message.tool)) {
-    interruptCurrent(message.tool);
-    actionQueue.unshift(message);
-  } else {
-    actionQueue.push(message);
-  }
+  actionQueue.push(message);
+  sortQueue();
   pumpActions();
 }
 
@@ -243,19 +420,97 @@ async function pumpActions() {
   }
 }
 
+// 技能模块上下文：把桥接内部已有的能力按稳定接口暴露出去。
+// 每次动作都重新构造，保证 bot 重连后拿到的是最新实例。
+function buildSkillContext() {
+  return {
+    bot,
+    log,
+    sleep,
+    blockLabel,
+    itemLabel,
+    travelTo,
+    travelToBlock,
+    walkOnce,
+    collectDrops,
+    countItem,
+    syncInventory,
+    nearbyBlock,
+    equipToolFor,
+    equipWeapon,
+    breakBlock,
+    placeBlock,
+    placeBlockWithFacing,
+    pickupItems,
+    placeInventoryBlock,
+    placeCraftingTable,
+    recoverPlacedTable,
+    clickWindowSlot,
+    craftWithWindow,
+    pickRecipe,
+    materialsShortage,
+    recipeRequirements,
+    missingMaterials,
+    findFuelItem,
+    craftItem,
+    smeltItem,
+    findFoodForEating,
+    findFood,
+    eatFood,
+    findNearbyBed,
+    sleepInBed,
+    isSleepTime,
+    isThunderstorm,
+    sleepErrorText,
+    sleepAdvancedTime,
+    approach,
+    retreatFrom,
+    attackEntity,
+    defendAgainst,
+    findRangedWeapon,
+    aimPoint,
+    shootAt,
+    nearbyPlayers,
+    nearbyHostiles,
+    entityMatches,
+    entityDisplayName,
+    entityTypeLabel,
+    playerNameOf,
+    findHostile,
+    findAttackTarget,
+    resolvePlayer,
+    isNearDanger,
+    escapeEnvironment,
+    blockIsWater,
+    findShore,
+    swimToShore,
+    describeEntity,
+    INDEPENDENT,
+    get registry() {
+      return bot.registry;
+    },
+  };
+}
+
 async function runAction(message) {
   if (!bot || !bot.entity) {
-    reply(message, false, 'bot 尚未进入世界');
+    reply(message, false, 'bot 尚未进入世界', 'blocked');
     return;
   }
   const args = message.arguments || {};
-  currentTool = message.tool;
   interrupted = false;
+  cancelReason = '';
+  currentTool = message.tool;
+  currentActionId = message.action_id || '';
+  currentActionPriority = actionPriority(message);
+  currentCancellable = Boolean(metaForAction(message)?.cancellable);
   actionBusy = true;
   lastActivity = Date.now();
   const timeoutMs = Math.min(Math.max(Number(message.timeout_s) || 120, 5), 300) * 1000;
+  let timedOut = false;
   const deadline = setTimeout(() => {
     log('动作超时', message.tool, `${Math.round(timeoutMs / 1000)}s`);
+    timedOut = true;
     interrupted = true;
     if (bot) {
       bot.pathfinder.stop();
@@ -263,6 +518,10 @@ async function runAction(message) {
       bot.clearControlStates();
     }
   }, timeoutMs);
+  if (progressEnabled(message.tool)) {
+    sendProgress(message, 'running', `开始执行 ${actionLabel(message.tool)}`, 0);
+  }
+  let outcomeStatus = 'succeeded';
   try {
     if (
       ['goto', 'come_to_player', 'collect_blocks', 'attack_nearest', 'attack_target', 'stop', 'break_block', 'place_block', 'goto_block', 'pickup_items', 'craft', 'smelt', 'eat', 'sleep'].includes(
@@ -345,7 +604,19 @@ async function runAction(message) {
         detail = await goTo(Number(args.x), Number(args.y), Number(args.z));
         break;
       case 'collect_blocks':
-        detail = await collectBlocks(String(args.block), Number(args.count || 1), Number(args.range) || 32);
+        detail = await collectBlocks(
+          String(args.block),
+          Number(args.count || 1),
+          Number(args.range) || 32,
+          (gained, total, label) => {
+            sendProgress(
+              message,
+              'running',
+              `已采集 ${gained}/${total} ${label}`,
+              total > 0 ? gained / total : 0
+            );
+          }
+        );
         break;
       case 'break_block':
         detail = await breakBlock(args);
@@ -381,34 +652,75 @@ async function runAction(message) {
       case 'sleep':
         detail = await sleepInBed();
         break;
-      default:
-        throw new Error(`未知动作 ${message.tool}`);
+      default: {
+        const skill = skillRegistry[message.tool];
+        if (!skill) throw new Error(`未知动作 ${message.tool}`);
+        const outcome = await skill.handler(args, buildSkillContext());
+        detail = outcome && outcome.detail ? outcome.detail : '已完成';
+        const reportedStatus = outcome && outcome.status ? outcome.status : 'succeeded';
+        outcomeStatus = FINAL_ACTION_STATUSES.has(reportedStatus)
+          ? reportedStatus
+          : 'failed';
+        break;
+      }
     }
-    reply(message, true, detail);
+    if (cancelReason) {
+      reply(message, false, `已取消：${cancelReason}`, 'cancelled');
+    } else if (timedOut) {
+      reply(message, false, `动作超时（${Math.round(timeoutMs / 1000)}s）`, 'failed');
+    } else {
+      reply(
+        message,
+        outcomeStatus === 'succeeded',
+        detail,
+        outcomeStatus
+      );
+    }
   } catch (error) {
-    reply(message, false, error.message);
+    if (cancelReason) {
+      reply(message, false, `已取消：${cancelReason}`, 'cancelled');
+    } else if (timedOut) {
+      reply(message, false, `动作超时（${Math.round(timeoutMs / 1000)}s）`, 'failed');
+    } else {
+      reply(message, false, error.message, statusForError(error));
+    }
   } finally {
     clearTimeout(deadline);
     actionBusy = false;
     currentTool = '';
+    currentActionId = '';
     interrupted = false;
+    cancelReason = '';
     lastActivity = Date.now();
   }
 }
 
-function reply(message, ok, detail) {
+// 把异常映射成结构化状态：取消、部分完成、被环境阻塞、失败。
+function statusForError(error) {
+  const text = String((error && error.message) || error || '');
+  if (text.includes('还差') || text.includes('只拿到')) return 'partial';
+  if (text.includes('断开') || text.includes('连接结束')) return 'disconnected';
+  if (text.includes('打断') || text.includes('取消')) return 'cancelled';
+  if (text.includes('没有') || text.includes('材料不够')) return 'blocked';
+  return 'failed';
+}
+
+function reply(message, ok, detail, status) {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   // 先把动作后的世界状态推给 Core，再回结果；否则 TaskRunner 可能拿到 5 秒前的旧背包。
   sendState();
+  const finalStatus = status || (ok ? 'succeeded' : 'failed');
   socket.send(
     JSON.stringify({
       type: 'action_result',
       action_id: message.action_id,
+      skill_id: message.skill_id || message.tool,
       ok,
+      status: finalStatus,
       detail: String(detail).slice(0, 500),
     })
   );
-  log(ok ? '动作完成' : '动作失败', message.tool, detail);
+  log(ok ? '动作完成' : '动作失败', message.tool, `${finalStatus} ${detail}`);
 }
 
 async function travelTo(x, y, z, radius = 2) {
@@ -460,32 +772,180 @@ async function goTo(x, y, z) {
   return `已到达 (${x}, ${y}, ${z}) 附近，距离 ${result.distance.toFixed(1)} 格`;
 }
 
-async function collectDrops(range = 6) {
-  for (let pass = 0; pass < 2; pass += 1) {
-    for (let index = 0; index < 8; index += 1) {
-      const item = bot.nearestEntity(
-        (entity) =>
-          entity.name === 'item' &&
-          entity.position.distanceTo(bot.entity.position) <= range
-      );
-      if (!item) break;
-      try {
-        await bot.pathfinder.goto(
-          new goals.GoalNear(item.position.x, item.position.y, item.position.z, 1)
-        );
-      } catch {
+const COLLECT_WALK_TIMEOUT_MS = 30000;
+const COLLECT_DROP_RANGE = 6;
+const COLLECT_DROP_WAIT_MS = 1500;
+const COLLECT_DROP_TIMEOUT_MS = 8000;
+const COLLECT_LOW_HEALTH = 8;
+const COLLECT_RECOVER_HEALTH = 12;
+const COLLECT_COMBAT_WAIT_MS = 30000;
+const COLLECT_RECOVER_WAIT_MS = 20000;
+
+// 库的 stop() 只把内部标志置位，真正的停止要等下一次路径重置才发生。
+// 采集开始前先清一次目标，这次重置会把残留的标志一起清掉，
+// 否则接下来的 goto 会立刻被 path_stop 打回。
+function resetPathfinderGoal() {
+  if (!bot || !bot.entity || !bot.pathfinder) return;
+  bot.pathfinder.setGoal(null);
+}
+
+// 超时后必须同时置停止标志并清目标，否则旧 goto 会和新 goto 叠在一起。
+function stopPathfinding() {
+  if (!bot || !bot.pathfinder) return;
+  bot.pathfinder.stop();
+  resetPathfinderGoal();
+}
+
+// goto 的错误名见 mineflayer-pathfinder/lib/goto.js：
+// NoPath（走不到）、Timeout（算路超时）、GoalChanged（目标被换掉）、PathStopped（路径被停）。
+function classifyPathFailure(error) {
+  const name = String(error?.name || '');
+  if (name === 'NoPath' || name === 'Timeout' || name === 'CollectTimeout') return 'unreachable';
+  if (name === 'GoalChanged' || name === 'PathStopped') return 'stopped';
+  return 'unknown';
+}
+
+function withTimeout(promise, ms, message, onTimeout = null) {
+  let timer = null;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      if (onTimeout) onTimeout();
+      const error = new Error(message);
+      error.name = 'CollectTimeout';
+      reject(error);
+    }, ms);
+  });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+}
+
+// 外部取消的三个来源：新的动作或停止指令、动作超时、与服务器断开。
+function externalCancelReason() {
+  if (interrupted) return '收到新的指令或动作超时';
+  if (!bot || !bot.entity) return '与 Minecraft 的连接已断开';
+  return '';
+}
+
+// 战斗打断的三个迹象：反击正在进行、刚受过伤、附近有敌对生物。
+function isCombatInterrupt() {
+  if (combatBusy) return true;
+  if (Date.now() - lastHurtAt < 3000) return true;
+  return nearbyHostiles(12).length > 0;
+}
+
+function isDroppedItem(entity) {
+  return Boolean(
+    entity &&
+      entity.position &&
+      (entity.name === 'item' || entity.name === 'Item' || entity.name === 'item_stack')
+  );
+}
+
+// 掉落物实体的物品名。实体刚生成时元数据还没到，这时读不到名字。
+function droppedItemName(entity) {
+  if (!entity || typeof entity.getDroppedItem !== 'function') return '';
+  try {
+    const item = entity.getDroppedItem();
+    return item?.name || '';
+  } catch {
+    return '';
+  }
+}
+
+function inventorySnapshot() {
+  const snapshot = {};
+  for (const item of bot.inventory.items()) {
+    snapshot[item.name] = (snapshot[item.name] || 0) + item.count;
+  }
+  return snapshot;
+}
+
+// 捡掉落物：等实体出现、走到拾取范围内、核对背包数量变化。
+// 返回 { picked: { 物品名: 数量 }, missed: [没捡到的物品名] }。
+async function collectDrops(range = COLLECT_DROP_RANGE, expectName = '') {
+  const before = inventorySnapshot();
+  const expectedBefore = expectName ? before[expectName] || 0 : 0;
+  const missed = [];
+  const collected = [];
+  const onCollect = (collector, entity) => {
+    if (collector !== bot.entity) return;
+    collected.push(droppedItemName(entity) || '未知物品');
+  };
+  bot.on('playerCollect', onCollect);
+  const deadline = Date.now() + COLLECT_DROP_TIMEOUT_MS;
+  let entityDeadline = Date.now() + COLLECT_DROP_WAIT_MS;
+  let walks = 0;
+  try {
+    while (Date.now() < deadline) {
+      const cancel = externalCancelReason();
+      if (cancel) {
+        log('捡掉落物被外部取消', cancel);
         break;
       }
-      await sleep(600);
+      if (expectName && countItem(expectName) > expectedBefore) break;
+      const item = bot.nearestEntity(
+        (entity) =>
+          isDroppedItem(entity) &&
+          entity.position.distanceTo(bot.entity.position) <= range &&
+          (!expectName || droppedItemName(entity) === expectName)
+      );
+      if (!item) {
+        // 掉落物实体还没生成，等它出现；等不到就说明这次没有掉落物。
+        if (Date.now() > entityDeadline) break;
+        await sleep(200);
+        continue;
+      }
+      const name = droppedItemName(item);
+      const position = item.position.clone();
+      walks += 1;
+      if (walks > 3) {
+        log('掉落物捡不到，放弃这个掉落物', name || '未知物品');
+        if (name && !missed.includes(name)) missed.push(name);
+        break;
+      }
+      try {
+        resetPathfinderGoal();
+        await withTimeout(
+          bot.pathfinder.goto(new goals.GoalNear(position.x, position.y, position.z, 1)),
+          5000,
+          '走到掉落物超时',
+          stopPathfinding,
+        );
+      } catch (error) {
+        const cancel = externalCancelReason();
+        if (cancel) {
+          log('捡掉落物被外部取消', cancel);
+          break;
+        }
+        if (name && !missed.includes(name)) missed.push(name);
+        log('没走到掉落物', name || '未知物品', error.message);
+        resetPathfinderGoal();
+        await sleep(200);
+        continue;
+      }
+      await sleep(400);
+      entityDeadline = Date.now() + COLLECT_DROP_WAIT_MS;
     }
-    await sleep(300);
+  } finally {
+    bot.removeListener('playerCollect', onCollect);
   }
   await syncInventory();
+  const after = inventorySnapshot();
+  const picked = {};
+  for (const key of Object.keys(after)) {
+    const delta = after[key] - (before[key] || 0);
+    if (delta > 0) picked[key] = delta;
+  }
+  if (expectName && !picked[expectName] && !missed.includes(expectName)) missed.push(expectName);
+  if (collected.length > 0) log('拾取事件', collected.join('、'));
+  return { picked, missed };
 }
 
 async function waitForCombat(timeoutMs = 20000) {
+  // 反击由 defendAgainst 负责，这里只等它打完。
   const deadline = Date.now() + timeoutMs;
-  while (combatBusy && Date.now() < deadline) {
+  while (Date.now() < deadline) {
+    if (interrupted) return false;
+    if (!combatBusy) return true;
     await sleep(300);
   }
   return !combatBusy;
@@ -495,6 +955,7 @@ async function waitForQuietAround(radius = 10, timeoutMs = 30000) {
   // 附近还有怪就先等反击把它们清掉，别在打架的时候走远。
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    if (interrupted) return false;
     await waitForCombat(5000);
     const hostiles = nearbyHostiles(radius);
     if (hostiles.length === 0) return true;
@@ -503,36 +964,97 @@ async function waitForQuietAround(radius = 10, timeoutMs = 30000) {
   return nearbyHostiles(radius).length === 0;
 }
 
-async function travelToBlock(position, timeoutMs = 30000) {
-  // 走到方块附近。被怪物打断时先等反击结束再重试，而不是直接放弃。
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      await Promise.race([
-        bot.pathfinder.goto(
-          new goals.GoalNear(position.x, Math.max(0, position.y - 1), position.z, 2)
-        ),
-        sleep(timeoutMs).then(() => {
-          throw new Error('走到目标超时');
-        }),
-      ]);
-      return true;
-    } catch (error) {
-      const message = String(error.message || error);
-      bot.pathfinder.stop();
-      if (message.includes('走到目标超时')) {
-        log('放弃这个采集目标', message);
-        return false;
-      }
-      log('采集被打断，等反击结束后重试', message);
-      await waitForQuietAround(10, 30000);
-      await sleep(1000);
-    }
+// 撤退之后等血量恢复；血量一直上不来就放弃这次采集。
+async function waitForHealth(minHealth, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!bot || !bot.entity) return false;
+    if (bot.health >= minHealth) return true;
+    await sleep(500);
   }
-  log('放弃这个采集目标', '连续被打断');
-  return false;
+  return Boolean(bot && bot.entity && bot.health >= minHealth);
 }
 
-async function collectBlocks(blockName, count, range = 32) {
+// 走一次并分类结果：'reached' | 'unreachable' | 'stopped' | 'cancelled'。
+async function walkOnce(x, y, z, radius, timeoutMs) {
+  const cancel = externalCancelReason();
+  if (cancel) {
+    log('采集被外部取消', cancel);
+    return 'cancelled';
+  }
+  resetPathfinderGoal();
+  try {
+    await withTimeout(
+      bot.pathfinder.goto(new goals.GoalNear(x, y, z, radius)),
+      timeoutMs,
+      '走到目标超时',
+      stopPathfinding,
+    );
+    return 'reached';
+  } catch (error) {
+    const cancel = externalCancelReason();
+    if (cancel) {
+      log('采集被外部取消', cancel, error.message);
+      return 'cancelled';
+    }
+    const kind = classifyPathFailure(error);
+    log(kind === 'unreachable' ? '走不到目标' : '寻路被外部停止', error.message);
+    resetPathfinderGoal();
+    return kind === 'unreachable' ? 'unreachable' : 'stopped';
+  }
+}
+
+// 走到方块附近并处理打断。
+// 返回 'reached' | 'unreachable'（换目标）| 'cancelled'（外部取消）| 'low_health'（撤退中止）。
+async function travelToBlock(position, timeoutMs = COLLECT_WALK_TIMEOUT_MS) {
+  const target = bot.blockAt(position);
+  const targetName = target?.name || '';
+  const place = `${targetName} (${position.x}, ${position.y}, ${position.z})`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let outcome = await walkOnce(position.x, Math.max(0, position.y - 1), position.z, 2, timeoutMs);
+    if (outcome === 'reached' && bot.entity.position.distanceTo(position) > 4.5) {
+      // 离原木还远，靠近一点再挖。
+      const close = await walkOnce(position.x, position.y, position.z, 2, 8000);
+      if (close === 'reached') return 'reached';
+      outcome = close;
+    }
+    if (outcome === 'reached') return 'reached';
+    if (outcome === 'cancelled') return 'cancelled';
+    if (outcome === 'unreachable') {
+      log('这个目标走不过去，换一个', place);
+      return 'unreachable';
+    }
+    // 路径被停：先分清是战斗打断还是外部取消。
+    if (!isCombatInterrupt()) {
+      log('寻路被外部停止，结束采集', place);
+      return 'cancelled';
+    }
+    if (bot.health <= COLLECT_LOW_HEALTH) {
+      log('战斗里血量不足，先撤退等恢复', `血量 ${bot.health}`);
+      resetPathfinderGoal();
+      await waitForCombat(COLLECT_COMBAT_WAIT_MS);
+      const recovered = await waitForHealth(COLLECT_RECOVER_HEALTH, COLLECT_RECOVER_WAIT_MS);
+      if (!recovered) {
+        log('血量没有恢复，结束采集', `血量 ${bot.health}`);
+        return 'low_health';
+      }
+      log('血量恢复，继续采集', `血量 ${bot.health}`);
+    } else {
+      log('采集被怪打断，等反击结束后再试', place);
+      await waitForCombat(COLLECT_COMBAT_WAIT_MS);
+      await waitForQuietAround(10, 10000);
+    }
+    const current = bot.blockAt(position);
+    if (!current || current.name !== targetName) {
+      log('采集目标不见了，换一个', place);
+      return 'unreachable';
+    }
+  }
+  log('这个目标试了两次都没到，换一个', place);
+  return 'unreachable';
+}
+
+async function collectBlocks(blockName, count, range = 32, onProgress = null) {
   const radius = Math.min(Math.max(Number(range) || 32, 8), 64);
   const blockIds = bot.registry.blocksByName[blockName];
   if (!blockIds) throw new Error(`未知方块 ${blockName}`);
@@ -571,34 +1093,30 @@ async function collectBlocks(blockName, count, range = 32) {
     return leftDistance - rightDistance || left.y - right.y;
   });
   let tried = 0;
+  let mined = 0;
+  let lost = 0;
+  let reported = 0;
   for (const position of positions) {
     if (interrupted) throw new Error('被新的指令打断');
     if (countItem(blockName) - owned >= need) break;
-    const block = bot.blockAt(position);
-    if (!block || block.name !== blockName) continue;
+    const target = bot.blockAt(position);
+    if (!target || target.name !== blockName) continue;
     tried += 1;
     const distance = bot.entity.position.distanceTo(position);
     log('采集目标', `${blockName} (${position.x}, ${position.y}, ${position.z}) 距离 ${distance.toFixed(1)}`);
     if (distance > 4) {
-      if (!(await travelToBlock(position, 30000))) {
-        continue;
+      const outcome = await travelToBlock(position, COLLECT_WALK_TIMEOUT_MS);
+      if (outcome === 'cancelled') throw new Error('采集被取消：收到新的指令或连接断开');
+      if (outcome === 'low_health') {
+        throw new Error(`血量不足，撤退中止采集（血量 ${bot.health}）`);
       }
+      if (outcome !== 'reached') continue;
     }
-    if (bot.entity.position.distanceTo(position) > 4.5) {
-      try {
-        await Promise.race([
-          bot.pathfinder.goto(
-            new goals.GoalNear(position.x, position.y, position.z, 2)
-          ),
-          sleep(8000).then(() => {
-            throw new Error('靠近原木超时');
-          }),
-        ]);
-      } catch (error) {
-        log('够不到这个原木', error.message);
-        bot.pathfinder.stop();
-        continue;
-      }
+    // 走过去了也要重新读一次方块，走的过程中可能已经被别人挖掉。
+    const block = bot.blockAt(position);
+    if (!block || block.name !== blockName) {
+      log('采集目标不见了，换一个', `${blockName} (${position.x}, ${position.y}, ${position.z})`);
+      continue;
     }
     if (!bot.canDigBlock(block)) {
       log('这个原木现在不能挖', `${blockName} (${position.x}, ${position.y}, ${position.z})`);
@@ -607,17 +1125,44 @@ async function collectBlocks(blockName, count, range = 32) {
     try {
       await equipToolFor(block);
       await bot.dig(block);
-      // 掉落物实体要等服务器下一 tick 才生成，立即扫描会以为没有掉落物。
-      await sleep(600);
-      await collectDrops(5);
+      mined += 1;
     } catch (error) {
       log('挖原木失败', error.message);
+      continue;
+    }
+    // 掉落物实体要等服务器下一 tick 才生成，collectDrops 会等到它出现再捡。
+    const drops = await collectDrops(COLLECT_DROP_RANGE, blockName);
+    const picked = drops.picked[blockName] || 0;
+    if (picked > 0) {
+      log('捡到掉落物', `${blockLabel(blockName)} x${picked}`);
+    } else {
+      lost += 1;
+      log(
+        '掉落物没捡到',
+        blockLabel(blockName),
+        drops.missed.length > 0 ? `丢失 ${drops.missed.join('、')}` : '附近没有掉落物实体'
+      );
+    }
+    // 只有真的采到手才汇报进度，避免把挖到但没捡到的东西算进去。
+    const collected = countItem(blockName) - owned;
+    if (onProgress && collected > reported) {
+      reported = collected;
+      onProgress(collected, need, blockLabel(blockName));
     }
   }
-  await collectDrops(6);
+  if (countItem(blockName) - owned < need) {
+    // 最后再扫一遍地上还剩下的掉落物。
+    await collectDrops(COLLECT_DROP_RANGE, blockName);
+  }
   const gained = countItem(blockName) - owned;
   if (gained <= 0) {
-    throw new Error(`试了 ${tried} 个目标，没有捡到 ${blockLabel(blockName)}`);
+    const detail = mined > 0 ? `，挖了 ${mined} 个但掉落物没捡到` : '';
+    throw new Error(`试了 ${tried} 个目标，没有捡到 ${blockLabel(blockName)}${detail}`);
+  }
+  if (gained < need) {
+    throw new Error(
+      `只拿到 ${gained} 个 ${blockLabel(blockName)}，还差 ${need - gained} 个（挖了 ${mined} 个，丢了 ${lost} 个掉落物）`
+    );
   }
   return `获得 ${gained} 个 ${blockLabel(blockName)}，背包共 ${countItem(blockName)} 个`;
 }
@@ -693,6 +1238,35 @@ async function placeBlock(args) {
   throw new Error(lastError ? `放置失败: ${lastError.message}` : '周围没有可以依附的方块');
 }
 
+// 按指定朝向放置方块。
+// 床这类方块的朝向由放置那一刻的视角决定，通用 placeBlock 会依次试六个面，
+// 床会放反或者被服务端拒绝；这里先转好视角再放到目标位置下方的方块上。
+async function placeBlockWithFacing(name, target, yaw) {
+  const item = bot.inventory.items().find((entry) => entry.name === name);
+  if (!item) throw new Error(`背包里没有 ${blockLabel(name)}`);
+  if (bot.entity.position.distanceTo(target) > 4) {
+    await bot.pathfinder.goto(new goals.GoalNear(target.x, target.y, target.z, 2));
+  }
+  const support = bot.blockAt(target.offset(0, -1, 0));
+  if (!support || support.boundingBox !== 'block') {
+    throw new Error('目标位置下方没有可以依附的方块');
+  }
+  await bot.equip(item, 'hand');
+  if (typeof yaw === 'number' && Number.isFinite(yaw)) {
+    await bot.look(yaw, 0, true);
+    await sleep(120);
+  }
+  await bot.placeBlock(support, vec(0, 1, 0));
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const placed = bot.blockAt(target);
+    if (placed && placed.name === name) {
+      return `放置 ${blockLabel(name)} 于 (${target.x}, ${target.y}, ${target.z})`;
+    }
+    await sleep(100);
+  }
+  throw new Error(`放置 ${blockLabel(name)} 后位置仍是空气`);
+}
+
 async function gotoBlock(args) {
   const range = Math.min(Math.max(Number(args.range) || 32, 4), 64);
   const position = findBlockPosition(String(args.block), range);
@@ -748,19 +1322,219 @@ function nearbyBlock(name, range) {
   return bot.findBlock({ matching: block.id, maxDistance: range });
 }
 
-async function placeIngredient(window, ingredient, destSlot) {
-  const source = window.findInventoryItem(ingredient.id, ingredient.metadata ?? null);
-  if (!source) throw new Error(`缺少材料 ${ingredient.id}`);
-  await bot.clickWindow(source.slot, 0, 0);
-  await sleep(80);
-  const need = Math.max(1, Number(ingredient.count) || 1);
-  for (let index = 0; index < need; index += 1) {
-    await bot.clickWindow(destSlot, 1, 0);
-    await sleep(80);
+// 合成窗口的点击参数。
+// 两次点击之间的间隔：服务端处理上一个 window_click 需要时间，间隔太短会连点。
+const CRAFT_CLICK_GAP = 80;
+// 等服务端算出产物的时间上限。
+const CRAFT_RESULT_TIMEOUT = 5000;
+// 让服务端重发窗口状态的时间上限。
+const CRAFT_SYNC_TIMEOUT = 2000;
+
+// bot.recipesAll 的第三个参数只当作「有没有工作台」的真假标记：
+// 传 null 只列出 2×2 背包格能做的配方，传真值才会把需要工作台的配方也列出来。
+const HAS_TABLE = true;
+
+// 1.17 之后 window_click 用状态编号代替了 action id：客户端把服务端最后下发的编号回传，
+// 编号对不上时服务端会重发整个窗口，但不会拒绝这次点击
+// （mineflayer 的 _syncWindow 就是靠发一个不可能的编号来强制服务端重发窗口的）。
+let craftStateId = -1;
+
+// 合成材料的中文名，缺材料时要直接说清楚缺的是什么。
+const CRAFT_ITEM_LABELS = {
+  oak_planks: '橡木木板',
+  spruce_planks: '云杉木板',
+  birch_planks: '白桦木板',
+  jungle_planks: '丛林木板',
+  acacia_planks: '金合欢木板',
+  dark_oak_planks: '深色橡木木板',
+  oak_log: '橡木原木',
+  spruce_log: '云杉原木',
+  birch_log: '白桦原木',
+  jungle_log: '丛林原木',
+  acacia_log: '金合欢原木',
+  dark_oak_log: '深色橡木原木',
+  stick: '木棍',
+  coal: '煤炭',
+  charcoal: '木炭',
+  cobblestone: '圆石',
+  stone: '石头',
+  iron_ingot: '铁锭',
+  gold_ingot: '金锭',
+  copper_ingot: '铜锭',
+  diamond: '钻石',
+  netherite_ingot: '下界合金锭',
+  redstone: '红石粉',
+  glass: '玻璃',
+  paper: '纸',
+  book: '书',
+  leather: '皮革',
+  string: '线',
+  feather: '羽毛',
+  flint: '燧石',
+  gunpowder: '火药',
+  sand: '沙子',
+  wheat: '小麦',
+  sugar: '糖',
+  egg: '鸡蛋',
+  bucket: '桶',
+  water_bucket: '水桶',
+  lava_bucket: '岩浆桶',
+};
+
+function craftItemLabel(name) {
+  return CRAFT_ITEM_LABELS[name] || blockLabel(name);
+}
+
+// 按物品 id 找名字，registry 的 items 就是按 id 建索引的。
+function itemNameById(id) {
+  const entry = bot.registry.items?.[id];
+  if (entry?.name) return entry.name;
+  for (const candidate of Object.values(bot.registry.itemsByName || {})) {
+    if (candidate.id === id) return candidate.name;
   }
+  return '';
+}
+
+function itemLabelById(id) {
+  const name = itemNameById(id);
+  return name ? craftItemLabel(name) : String(id);
+}
+
+// 记录服务端下发的窗口状态编号，window_click 要把它回传回去。
+function trackCraftStateId() {
+  if (!bot || !bot._client || bot._voxkinCraftState) return;
+  bot._voxkinCraftState = true;
+  const track = (packet) => {
+    craftStateId = packet.stateId;
+  };
+  bot._client.on('window_items', track);
+  bot._client.on('set_slot', track);
+}
+
+// 协议里的 Slot 结构在 1.20.5 之后换成了按数量计数的写法。
+// 物品实例的构造函数就是 prismarine-item 的 Item 类，直接复用它的转换函数。
+function toNotchSlot(item) {
+  if (!item) {
+    return bot.registry.supportFeature('itemsWithComponents')
+      ? { itemCount: 0, components: [], removeComponents: [] }
+      : { present: false };
+  }
+  const itemClass = item.constructor;
+  if (typeof itemClass?.toNotch === 'function') return itemClass.toNotch(item);
+  return { present: true, itemId: item.type, itemCount: item.count };
+}
+
+// 自己发 window_click，不走 mineflayer 的 bot.clickWindow。
+// mineflayer 点完合成格后会去等结果槽位重发（lib/plugins/inventory.js 的 waitForWindowUpdate）：
+// 合成格还没凑齐配方时服务端不会重发结果槽位，那次等待必然超时，
+// once 的默认超时是 20000 毫秒（lib/promise_utils.js），所以摆第一个材料就会卡满 20 秒。
+// 这里改成自己发包、自己跟踪窗口状态：本地按 prismarine-windows 的规则推演这次点击，
+// 把要上报的槽位变化和鼠标物品一起发给服务端，之后只按固定间隔等待。
+async function clickWindowSlot(window, slot, mouseButton, mode) {
+  const click = {
+    slot,
+    mouseButton,
+    mode,
+    item: slot === -999 ? null : window.slots[slot] ?? null,
+  };
+  const changed = window.acceptClick(click) || [];
+  const changedSlots = changed.map((location) => ({
+    location,
+    item: toNotchSlot(window.slots[location]),
+  }));
+  bot._client.write('window_click', {
+    windowId: window.id,
+    stateId: craftStateId,
+    slot,
+    mouseButton,
+    mode,
+    changedSlots,
+    cursorItem: toNotchSlot(window.selectedItem),
+  });
+  await sleep(CRAFT_CLICK_GAP);
+}
+
+// 让服务端把整个窗口重发一遍：既刷新本地模型，也拿到最新的状态编号。
+async function refreshWindowState(window, timeoutMs = CRAFT_SYNC_TIMEOUT) {
+  if (!bot || typeof bot._syncWindow !== 'function') return;
+  await Promise.race([
+    bot._syncWindow(window).catch(() => {}),
+    sleep(timeoutMs),
+  ]);
+}
+
+// 把合成格清空：先拿起格里的东西，再放进背包空位，材料不会被弄丢。
+async function clearCraftGrid(window, width, height) {
+  for (let gridSlot = 1; gridSlot <= width * height; gridSlot += 1) {
+    if (!window.slots[gridSlot]) continue;
+    await clickWindowSlot(window, gridSlot, 0, 0);
+    const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
+    if (empty === null) throw new Error('背包满了，无法清空合成格');
+    await clickWindowSlot(window, empty, 0, 0);
+  }
+}
+
+// 按配方把材料摆进合成格：一次拿一叠，右键一个一个放进去，剩下的放回背包。
+async function placeIngredient(window, ingredient, destSlot) {
+  const need = Math.max(1, Number(ingredient.count) || 1);
+  let placed = 0;
+  while (placed < need) {
+    const source = window.findInventoryItem(ingredient.id, ingredient.metadata ?? null);
+    if (!source) {
+      throw new Error(
+        `材料不够，还缺 ${need - placed} 个 ${itemLabelById(ingredient.id)}`
+      );
+    }
+    await clickWindowSlot(window, source.slot, 0, 0);
+    const held = window.selectedItem;
+    if (!held) throw new Error(`材料 ${itemLabelById(ingredient.id)} 拿不到手上`);
+    const take = Math.min(need - placed, held.count);
+    for (let index = 0; index < take; index += 1) {
+      await clickWindowSlot(window, destSlot, 1, 0);
+    }
+    placed += take;
+    if (window.selectedItem) {
+      const back = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
+      if (back === null) throw new Error('背包满了，无法放回剩余材料');
+      await clickWindowSlot(window, back, 0, 0);
+    }
+  }
+}
+
+// 等服务端算出产物：结果槽位的内容只有服务端会下发，本地推演算不出来。
+async function waitForCraftResult(window, expectedId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const output = window.slots[0];
+    if (output && (expectedId == null || output.type === expectedId)) return output;
+    await sleep(100);
+  }
+  return null;
+}
+
+// 取走产物：先点结果槽把产物拿到鼠标上，再放进背包空位。
+async function takeCraftResult(window) {
+  const output = window.slots[0];
+  if (!output) return null;
+  await clickWindowSlot(window, window.craftingResultSlot, 0, 0);
+  const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
+  if (empty === null) throw new Error('背包满了，无法取走产物');
+  await clickWindowSlot(window, empty, 0, 0);
+  return output;
+}
+
+// 失败时把鼠标上的东西和合成格里的东西退回背包，别让材料卡在窗口里。
+async function restoreCraftWindow(window, width, height) {
   if (window.selectedItem) {
-    await bot.clickWindow(source.slot, 0, 0);
-    await sleep(80);
+    const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
+    if (empty !== null) await clickWindowSlot(window, empty, 0, 0);
+  }
+  for (let gridSlot = 1; gridSlot <= width * height; gridSlot += 1) {
+    if (!window.slots[gridSlot]) continue;
+    await clickWindowSlot(window, gridSlot, 0, 0);
+    const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
+    if (empty === null) return;
+    await clickWindowSlot(window, empty, 0, 0);
   }
 }
 
@@ -773,49 +1547,40 @@ async function craftWithWindow(recipe, window, width, height, times) {
     if (inventorySlots.length === 0) {
       throw new Error('合成窗口里看不到背包内容');
     }
-    for (let gridSlot = 1; gridSlot <= width * height; gridSlot += 1) {
-      if (!window.slots[gridSlot]) continue;
-      await bot.clickWindow(gridSlot, 0, 0);
-      await sleep(80);
-      const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
-      if (empty === null) throw new Error('背包满了，无法清空合成格');
-      await bot.clickWindow(empty, 0, 0);
-      await sleep(80);
-    }
-    if (recipe.inShape) {
-      for (let y = 0; y < recipe.inShape.length; y += 1) {
-        const row = recipe.inShape[y];
-        for (let x = 0; x < row.length; x += 1) {
-          const ingredient = row[x];
-          if (!ingredient || ingredient.id === -1) continue;
-          await placeIngredient(window, ingredient, 1 + x + width * y);
+    try {
+      await clearCraftGrid(window, width, height);
+      if (recipe.inShape) {
+        for (let y = 0; y < recipe.inShape.length; y += 1) {
+          const row = recipe.inShape[y];
+          for (let x = 0; x < row.length; x += 1) {
+            const ingredient = row[x];
+            if (!ingredient || ingredient.id === -1) continue;
+            await placeIngredient(window, ingredient, 1 + x + width * y);
+          }
         }
+      } else if (recipe.ingredients) {
+        let gridSlot = 1;
+        for (const ingredient of recipe.ingredients) {
+          await placeIngredient(window, ingredient, gridSlot);
+          gridSlot += 1;
+        }
+      } else {
+        throw new Error('不认识的合成配方');
       }
-    } else if (recipe.ingredients) {
-      let gridSlot = 1;
-      for (const ingredient of recipe.ingredients) {
-        await placeIngredient(window, ingredient, gridSlot);
-        gridSlot += 1;
+      const output = await waitForCraftResult(window, recipe.result?.id, CRAFT_RESULT_TIMEOUT);
+      if (!output) throw new Error('合成格摆好后没有产物');
+      await takeCraftResult(window);
+      log('合成产出', `${output.name}x${output.count}`);
+      // 产物被取走后材料会被服务端消耗掉，本地模型要同步清空合成格。
+      for (let gridSlot = 1; gridSlot <= width * height; gridSlot += 1) {
+        window.updateSlot(gridSlot, null);
       }
-    } else {
-      throw new Error('不认识的合成配方');
+    } catch (error) {
+      await restoreCraftWindow(window, width, height);
+      throw error;
     }
-    let output = null;
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      output = window.slots[0];
-      if (output) break;
-      await sleep(100);
-    }
-    if (!output) throw new Error('合成格摆好后没有产物');
-    await bot.clickWindow(0, 0, 0);
-    await sleep(80);
-    const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
-    if (empty === null) throw new Error('背包满了，无法取走产物');
-    await bot.clickWindow(empty, 0, 0);
-    await sleep(80);
-    log('合成产出', `${output.name}x${output.count}`);
   }
-  await syncInventory();
+  await refreshWindowState(window);
 }
 
 async function placeInventoryBlock(name, label) {
@@ -867,8 +1632,68 @@ async function recoverPlacedTable(table) {
   }
   for (let attempt = 0; attempt < 10 && countItem('crafting_table') === 0; attempt += 1) {
     await sleep(400);
-    await collectDrops(4);
+    await collectDrops(4, 'crafting_table');
   }
+}
+
+// 按配方算出每种材料要做多少次、总共需要几个。
+function recipeRequirements(recipe) {
+  const needs = new Map();
+  const collect = (entry) => {
+    if (!entry || entry.id === -1) return;
+    const key = `${entry.id}:${entry.metadata ?? 'any'}`;
+    const amount = Math.max(1, Number(entry.count) || 1);
+    const current = needs.get(key);
+    if (current) current.need += amount;
+    else needs.set(key, { id: entry.id, metadata: entry.metadata ?? null, need: amount });
+  };
+  if (recipe.inShape) {
+    for (const row of recipe.inShape) {
+      for (const cell of row) collect(cell);
+    }
+  } else if (recipe.ingredients) {
+    for (const entry of recipe.ingredients) collect(entry);
+  }
+  return [...needs.values()];
+}
+
+// 背包里还差哪些材料。
+function missingMaterials(recipe, operations) {
+  const missing = [];
+  for (const need of recipeRequirements(recipe)) {
+    const total = need.need * operations;
+    const have = bot.inventory.count(need.id, need.metadata);
+    if (have < total) missing.push({ id: need.id, need: total, have });
+  }
+  return missing;
+}
+
+// 在候选配方里挑一个材料够做完的。
+function pickRecipe(recipes, count) {
+  for (const recipe of recipes) {
+    const operations = Math.max(1, Math.ceil(count / Math.max(1, recipe.result?.count || 1)));
+    if (missingMaterials(recipe, operations).length === 0) return { recipe, operations };
+  }
+  return null;
+}
+
+// 材料不够时直接说明缺什么、缺多少，一个物品都不动。
+function materialsShortage(item, recipes, count) {
+  if (!recipes.length) return `没有 ${blockLabel(item.name)} 的配方`;
+  let worst = null;
+  for (const recipe of recipes) {
+    const operations = Math.max(1, Math.ceil(count / Math.max(1, recipe.result?.count || 1)));
+    const missing = missingMaterials(recipe, operations);
+    if (!missing.length) continue;
+    if (!worst || missing.length < worst.length) worst = missing;
+  }
+  if (!worst) return `没有 ${blockLabel(item.name)} 的配方`;
+  const parts = worst.map((entry) => {
+    const label = itemLabelById(entry.id);
+    const owned = entry.have > 0 ? `背包里只有 ${entry.have} 个${label}` : `背包里没有${label}`;
+    return `${owned}，合成${blockLabel(item.name)}需要 ${entry.need} 个`;
+  });
+  return parts.join('；');
 }
 
 async function craftItem(args) {
@@ -876,10 +1701,32 @@ async function craftItem(args) {
   const count = Math.max(1, Math.min(Number(args.count) || 1, 64));
   const item = bot.registry.itemsByName[name];
   if (!item) throw new Error(`未知物品 ${name}`);
+  trackCraftStateId();
+  // bot.recipesFor(item.id, null, 1, null) 的第四个参数是工作台：
+  // 传 null 时只有 2×2 背包格能完成的配方会被留下（requiresTable 为真的会被过滤掉），
+  // 所以这里先用它判断这种物品是不是必须借工作台。
+  // 它同时还按「材料够合成一次」过滤，返回空数组也可能是材料不够，
+  // 因此另外用 bot.recipesAll 把候选配方完整列出来，把这两种情况分开。
+  let recipes = bot.recipesFor(item.id, null, 1, null);
+  const packRecipes = bot.recipesAll(item.id, null, null);
   let table = null;
   let placed = false;
-  let recipes = bot.recipesFor(item.id, null, 1, null);
+  let recipe = null;
+  let operations = 1;
   if (recipes.length === 0) {
+    if (packRecipes.length > 0) {
+      // 2×2 背包格就能做，只是材料不够：直接报缺什么，不消耗任何物品。
+      throw new Error(materialsShortage(item, packRecipes, count));
+    }
+    // 这种物品只能借助工作台。先按工作台配方核对材料，材料不够就不放工作台。
+    const tableRecipes = bot.recipesAll(item.id, null, HAS_TABLE).filter(
+      (entry) => entry.requiresTable
+    );
+    if (tableRecipes.length === 0) throw new Error(`没有 ${blockLabel(name)} 的配方`);
+    const picked = pickRecipe(tableRecipes, count);
+    if (!picked) throw new Error(materialsShortage(item, tableRecipes, count));
+    recipe = picked.recipe;
+    operations = picked.operations;
     // 先找已经放下的工作台；空闲闲逛会把 bot 带离上一轮放下的工作台。
     table = nearbyBlock('crafting_table', 32);
     if (!table) {
@@ -890,53 +1737,71 @@ async function craftItem(args) {
       placed = true;
     }
     recipes = bot.recipesFor(item.id, null, 1, table);
-  }
-  if (recipes.length === 0) {
-    throw new Error(`没有 ${blockLabel(name)} 的配方或材料不够`);
+    if (recipes.length === 0) {
+      throw new Error(`没有 ${blockLabel(name)} 的配方或材料不够`);
+    }
+  } else {
+    const picked = pickRecipe(packRecipes, count);
+    if (!picked) throw new Error(materialsShortage(item, packRecipes, count));
+    recipe = picked.recipe;
+    operations = picked.operations;
   }
   if (table && bot.entity.position.distanceTo(table.position) > 3) {
     await travelTo(table.position.x, table.position.y, table.position.z, 2);
   }
   const before = countItem(name);
-  const yieldCount = Math.max(1, Number(recipes[0].result?.count) || 1);
-  const operations = Math.max(1, Math.ceil(count / yieldCount));
+  const yieldCount = Math.max(1, Number(recipe.result?.count) || 1);
   log(
     '合成参数',
     `${name} 已有 ${before}，工作台 ${table ? `(${table.position.x}, ${table.position.y}, ${table.position.z})` : '无'}，` +
       `现放 ${placed}，距离 ${table ? bot.entity.position.distanceTo(table.position).toFixed(1) : '-'}，` +
-      `配方 id=${recipes[0].result?.id} x${yieldCount}，需台 ${recipes[0].requiresTable}，操作 ${operations}`
+      `配方 id=${recipe.result?.id} x${yieldCount}，需台 ${recipe.requiresTable}，操作 ${operations}`
   );
-  if (table) {
-    const window = await bot.openBlock(table);
-    try {
-      await craftWithWindow(recipes[0], window, 3, 3, operations);
-    } finally {
+  try {
+    if (table) {
+      const window = await bot.openBlock(table);
       try {
-        await bot.closeWindow(window);
-      } catch {
-        // 关窗失败不影响已取走的产物
+        await craftWithWindow(recipe, window, 3, 3, operations);
+      } finally {
+        try {
+          await bot.closeWindow(window);
+        } catch {
+          // 关窗失败不影响已取走的产物
+        }
+        await sleep(200);
       }
-      await sleep(200);
+    } else {
+      await craftWithWindow(recipe, bot.inventory, 2, 2, operations);
     }
-  } else {
-    await craftWithWindow(recipes[0], bot.inventory, 2, 2, operations);
+    const after = countItem(name);
+    log(
+      '合成结果',
+      `${name} 背包 ${after}，手持 ${bot.heldItem?.name || '空'}，` +
+        `物品 ${bot.inventory
+          .items()
+          .map((entry) => `${entry.name}x${entry.count}`)
+          .join(',')}`
+    );
+    if (after <= before) {
+      throw new Error(`合成 ${blockLabel(name)} 没有产出`);
+    }
+    const expected = before + operations * yieldCount;
+    if (after !== expected) {
+      // 数量对不上时让服务端重发一次背包再核对，确认不是本地模型算错。
+      await refreshWindowState(bot.inventory);
+      const confirmed = countItem(name);
+      if (confirmed !== expected) {
+        throw new Error(
+          `合成 ${blockLabel(name)} 数量不对：期望 ${expected} 个，实际 ${confirmed} 个`
+        );
+      }
+    }
+    return `合成 ${after - before} 个 ${blockLabel(name)}`;
+  } finally {
+    if (placed && table) {
+      await recoverPlacedTable(table);
+    }
   }
-  const after = countItem(name);
-  log(
-    '合成结果',
-    `${name} 背包 ${after}，手持 ${bot.heldItem?.name || '空'}，` +
-      `物品 ${bot.inventory
-        .items()
-        .map((entry) => `${entry.name}x${entry.count}`)
-        .join(',')}`
-  );
-  if (after <= before) {
-    throw new Error(`合成 ${blockLabel(name)} 没有产出`);
-  }
-  if (placed && table) {
-    await recoverPlacedTable(table);
-  }
-  return `合成 ${after - before} 个 ${blockLabel(name)}`;
 }
 
 const SMELT_OUTPUTS = {
@@ -947,7 +1812,7 @@ const SMELT_OUTPUTS = {
   cobblestone: 'stone',
   clay_ball: 'brick',
   porkchop: 'cooked_porkchop',
-  beef: 'steak',
+  beef: 'cooked_beef',
   chicken: 'cooked_chicken',
   mutton: 'cooked_mutton',
   cod: 'cooked_cod',
@@ -1489,8 +2354,13 @@ async function approach(target) {
   if (!target || !target.position) return;
   if (bot.entity.position.distanceTo(target.position) <= 3) return;
   try {
-    await bot.pathfinder.goto(
-      new goals.GoalNear(target.position.x, target.position.y, target.position.z, 2)
+    await withTimeout(
+      bot.pathfinder.goto(
+        new goals.GoalNear(target.position.x, target.position.y, target.position.z, 2)
+      ),
+      10000,
+      '接近目标超时',
+      stopPathfinding
     );
   } catch (error) {
     log('接近目标失败', error.message);
@@ -2201,6 +3071,9 @@ function createBot() {
   bot.loadPlugin(pathfinder);
   bot.loadPlugin(armorManager);
   bot.loadPlugin(toolModule.plugin || toolModule);
+  // 窗口状态编号必须一直跟踪：自己发的 window_click 要把最新编号回传给服务端，
+  // 只有在 craftItem 里才开启跟踪的话，箱子等窗口第一次点击会被服务端按编号不符忽略。
+  trackCraftStateId();
   // 服务器没开时，底层 socket 会抛未捕获的 error 直接结束进程；这里接住并等重连。
   if (bot._client && typeof bot._client.on === 'function') {
     bot._client.on('error', (error) => log('连接 Minecraft 失败', error.message));
@@ -2297,11 +3170,31 @@ function createBot() {
   });
 
   bot.on('death', () => {
-    log('死亡，等待重生');
+    log('死亡，准备请求重生');
     lastHealth = 20;
     stopFollow();
     wanderToken += 1;
     wanderActive = false;
+    requestRespawn();
+  });
+
+  // 1.19.3 起客户端用 client_command(actionId=0) 请求重生，服务端回应 clientbound_respawn。
+  function requestRespawn() {
+    setTimeout(() => {
+      if (!bot || !bot._client) return;
+      try {
+        bot._client.write('client_command', { actionId: 0 });
+        log('已发送重生请求');
+      } catch (error) {
+        log('重生请求失败', error.message);
+      }
+    }, 1200);
+  }
+
+  bot._client.on('respawn', () => {
+    log('已重生');
+    lastHealth = 20;
+    sendState();
   });
 
   bot.on('error', (error) => log('mineflayer 错误', error.message));

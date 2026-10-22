@@ -52,6 +52,12 @@ def test_current_stage_advances() -> None:
     assert current_stage(inventory).id == "S3"
 
 
+def test_stage_accepts_colored_bed_items() -> None:
+    stage = stage_by_id("S2")
+    assert stage is not None
+    assert is_complete(stage, {"red_bed": 1, "cooked_beef": 3})
+
+
 def test_end_stage_needs_an_event() -> None:
     stage = stage_by_id("S6")
     assert stage is not None

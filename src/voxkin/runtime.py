@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from voxkin.agent.actions import ActionDispatcher
+from voxkin.agent.arbiter import ActionArbiter, ActionTicket
 from voxkin.agent.run_manager import RunManager
 from voxkin.agent.tasks import TaskStore
 from voxkin.audio.sinks import AudioSink, build_sink
@@ -66,6 +67,7 @@ class Runtime:
     dispatcher: ActionDispatcher
     pipeline: ConversationPipeline
     supervisor: ServiceSupervisor
+    arbiter: ActionArbiter | None = None
     memory: MemoryStore | None = None
     run_manager: RunManager | None = None
     voice_loop: VoiceLoop | None = None
@@ -100,6 +102,19 @@ class Runtime:
                 volume=config.audio.volume,
             )
         dispatcher = ActionDispatcher()
+        arbiter = ActionArbiter(dispatcher, on_event=hub.publish)
+
+        async def dispatch_task(
+            tool: str, arguments: dict[str, Any], timeout_s: float | None = None
+        ) -> Any:
+            """任务步骤也走仲裁器：同一个世界里只允许一个动作在改世界。"""
+            ticket = ActionTicket(
+                tool=tool,
+                arguments=dict(arguments or {}),
+                origin="task",
+                timeout_s=float(timeout_s or 0.0),
+            )
+            return await arbiter.submit(ticket)
         store: MemoryStore | None = None
         writer: MemoryWriter | None = None
         if config.memory.enabled:
@@ -118,15 +133,12 @@ class Runtime:
             memory_writer=writer,
         )
 
-        async def handle_action(call: dict[str, Any], turn) -> str:
-            return await dispatcher.dispatch(call["name"], call.get("arguments") or {})
-
-        pipeline.set_action_handler(handle_action)
+        pipeline.set_action_controller(arbiter)
         pipeline.set_state_provider(dispatcher.state_snapshot)
         task_store = TaskStore(Path("data") / "tasks.db")
         task_store.initialize()
         run_manager = RunManager(
-            dispatch=dispatcher.dispatch,
+            dispatch=dispatch_task,
             state_provider=dispatcher.state_snapshot,
             announce=pipeline.announce,
             store=task_store,
@@ -151,6 +163,7 @@ class Runtime:
             metrics=metrics,
             hub=hub,
             dispatcher=dispatcher,
+            arbiter=arbiter,
             pipeline=pipeline,
             supervisor=supervisor,
             memory=store,
@@ -246,18 +259,26 @@ class Runtime:
             await self.pipeline.start()
 
     def status(self) -> dict[str, Any]:
+        cache = self.pipeline.cache
         return {
             "llm": self.llm.describe(),
             "tts": self.tts.describe(),
             "stt": self.stt.describe(),
             "audio": self.sink.describe(),
             "metrics": self.metrics.aggregate(),
+            "voice_cache": cache.describe() if cache is not None else {"enabled": False},
+            "fast_path": {
+                "enabled": self.config.fast_path.enabled,
+                "min_confidence": self.config.fast_path.min_confidence,
+                "action_min_confidence": self.config.fast_path.action_min_confidence,
+            },
             "speaking": self.pipeline.is_speaking,
             "bridge": {
                 "connected": self.dispatcher.connected,
                 "name": self.dispatcher.bridge_name,
                 "pending_actions": self.dispatcher.pending_count,
             },
+            "arbiter": self.arbiter.status() if self.arbiter is not None else {"enabled": False},
             "memory": self.memory.counts() if self.memory is not None else {"enabled": False},
             "persona": self.config.persona.name,
             "project_root": str(Path.cwd()),

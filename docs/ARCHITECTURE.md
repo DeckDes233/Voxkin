@@ -13,6 +13,8 @@ graph TD
     subgraph Core["Voxkin Core（Python 进程）"]
         SRV[aiohttp 服务<br/>Studio + 桥接 WebSocket]
         PIPE[ConversationPipeline<br/>回合/队列/打断]
+        INT[IntentPlan<br/>本地意图快路]
+        CACHE[SpeechCache<br/>预合成确认语]
         SPLIT[SentenceSplitter<br/>可朗读文本]
         DISP[ActionDispatcher]
         SUP[ServiceSupervisor<br/>启停/健康检查]
@@ -44,6 +46,10 @@ graph TD
     MC -->|真实动作| BR
 
     SRV --> PIPE
+    PIPE --> INT
+    INT --> DISP
+    PIPE --> CACHE
+    CACHE --> PIPE
     PIPE --> SPLIT
     SPLIT --> PIPE
     PIPE --> LLM
@@ -95,6 +101,15 @@ graph LR
 ```
 
 语音通道不会等待行动通道；行动结果通过事件与时间线单独记录，`t8` 只有在桥接返回成功后才写入。
+
+### 2.1 本地快路
+
+`ConversationPipeline.respond()` 在请求模型之前先做一次本地规则判断。规则能确定命令时产出 `IntentPlan`（技能、参数、置信度、确认语、去重键），随后并行做两件事：
+
+1. 从 `SpeechCache` 取预合成确认语直接送到输出；缓存缺失才走动态 TTS，并受 `voice_cache.ack_deadline_ms` 约束，超时或失败如实降级。
+2. 把动作提交给 `ActionDispatcher`，不等待确认语播放结束。
+
+模型随后返回的调用会与快路提交过的动作比对，同一回合里相同的技能与参数只执行一次。规则判断不了、能力询问和复杂请求照旧走模型路径。实现边界与未完成的部分见 [plans/VOICE_ACTION_LATENCY_PLAN.md](plans/VOICE_ACTION_LATENCY_PLAN.md)。
 
 ## 3. 完整时序
 

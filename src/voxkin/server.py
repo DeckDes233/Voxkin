@@ -14,7 +14,7 @@ from voxkin.audio.capture import Microphone
 from voxkin.audio.wav import arrays_to_wav_bytes
 from voxkin.audio.websocket import WebSocketAudioSink
 from voxkin.agent.actions import ActionError
-from voxkin.bridge.protocol import ActionResult, parse_chat
+from voxkin.bridge.protocol import ActionProgress, ActionResult, parse_chat
 from voxkin.config import load_config, save_config
 from voxkin.intent import is_stop
 from voxkin.logging_setup import tail_log
@@ -321,6 +321,19 @@ class StudioServer:
                     asyncio.create_task(self.runtime.pipeline.respond(chat["text"]))
                 elif kind == "action_result":
                     self.runtime.dispatcher.resolve(ActionResult.from_message(data))
+                elif kind == "action_progress":
+                    progress = ActionProgress.from_message(data)
+                    self.runtime.dispatcher.on_progress(progress)
+                    await self.runtime.hub.publish(
+                        {
+                            "type": "action_progress",
+                            "action_id": progress.action_id,
+                            "skill_id": progress.skill_id,
+                            "phase": progress.phase,
+                            "detail": progress.detail,
+                            "progress": progress.progress,
+                        }
+                    )
                 elif kind == "hello":
                     self.runtime.dispatcher.bridge_name = str(data.get("bridge", name))
                     await send({"type": "welcome", "name": self.runtime.dispatcher.bridge_name})

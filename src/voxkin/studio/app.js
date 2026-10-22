@@ -12,10 +12,17 @@ function pill(label, text, kind) {
 
 function renderPills(status) {
   const llmOk = status.llm.api_key_configured;
+  const cache = status.voice_cache || {};
+  const cacheLabel = cache.enabled === false
+    ? "未启用"
+    : cache.count
+      ? `${cache.voice_id} ${cache.count} 条 · 命中 ${cache.hits} 未命中 ${cache.misses}`
+      : "未构建";
   const pills = [
     pill("LLM", llmOk ? status.llm.model : "未配置密钥", llmOk ? "ok" : "warn"),
     pill("TTS", status.tts.loaded ? `已加载 ${status.tts.character}` : "未加载", status.tts.loaded ? "ok" : "warn"),
     pill("STT", status.stt.loaded ? status.stt.model : `${status.stt.model} 待加载`, status.stt.loaded ? "ok" : "warn"),
+    pill("语音缓存", cacheLabel, cache.count ? "ok" : "warn"),
     pill("音频", status.audio.output, "ok"),
     pill("状态", status.speaking ? "正在说话" : "空闲", status.speaking ? "warn" : "ok"),
   ];
@@ -128,6 +135,15 @@ function handleEvent(payload) {
       break;
     case "sentence_ready":
       pushEvent("分句", payload.text, "sentence");
+      break;
+    case "fast_path_started":
+      pushEvent("快路", `${payload.tool}（置信度 ${payload.confidence}）`, "sentence");
+      break;
+    case "action_deduped":
+      pushEvent("去重", `${payload.tool} 与快路重复，已跳过`, "sentence");
+      break;
+    case "tts_failed":
+      pushEvent("语音失败", payload.error || payload.text || "合成失败", "error");
       break;
     case "turn_finished": {
       const s = payload.summary;

@@ -17,7 +17,7 @@ def test_run_manager_completes_s0(tmp_path: Path) -> None:
 
     async def dispatch(tool: str, arguments: dict) -> str:
         if tool == "collect_blocks":
-            inventory["oak_log"] = 3
+                inventory["oak_log"] = 4
         elif tool == "craft":
             inventory[arguments["item"]] = int(arguments.get("count", 1))
         return "ok"

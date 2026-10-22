@@ -7,8 +7,9 @@ from typing import Any, Awaitable, Callable
 
 from voxkin.agent.runlog import RunLogger
 from voxkin.agent.tasks import TaskStore
+from voxkin.bridge.protocol import ActionResult
 
-Executor = Callable[..., Awaitable[str]]
+Executor = Callable[..., Awaitable[Any]]
 StateProvider = Callable[[], dict[str, Any]]
 Announce = Callable[[str], Awaitable[None]]
 
@@ -63,6 +64,15 @@ class Verifier:
             return (food >= float(rule.get("min", 1)), f"饥饿 {food:.0f}")
         return False, f"未知判定规则 {kind}"
 
+    def classify(self, rule: dict[str, Any], state: dict[str, Any]) -> str:
+        """判定失败属于哪一类：有进展算部分完成，没进展算被环境阻塞。"""
+        if rule.get("type") == "inventory":
+            inventory = state.get("inventory") or {}
+            wanted = rule.get("items") or {}
+            progress = any(int(inventory.get(item, 0)) > 0 for item in wanted)
+            return "partial" if progress else "blocked"
+        return "blocked"
+
 
 @dataclass
 class RunResult:
@@ -72,6 +82,7 @@ class RunResult:
     detail: str
     steps_done: int = 0
     steps_total: int = 0
+    status: str = "succeeded"
 
 
 class TaskRunner:
@@ -119,7 +130,7 @@ class TaskRunner:
             return False
         return len(parameters) >= 3
 
-    async def _execute(self, step: StepSpec) -> str:
+    async def _execute(self, step: StepSpec) -> Any:
         if self._executor_takes_timeout:
             return await self._executor(step.tool, step.arguments, step.timeout_s)
         return await self._executor(step.tool, step.arguments)
@@ -128,7 +139,9 @@ class TaskRunner:
         if self._announce is not None:
             await self._announce(text)
 
-    async def _verify_with_wait(self, rule: dict[str, Any]) -> tuple[bool, str]:
+    async def _verify_with_wait(
+        self, rule: dict[str, Any]
+    ) -> tuple[bool, str, str]:
         """桥接状态 5 秒一帧；动作刚结束时允许等待下一帧完整状态。"""
         state = self._state_provider()
         ok, reason = self._verifier.check(rule, state)
@@ -138,7 +151,8 @@ class TaskRunner:
             await asyncio.sleep(0.1)
             state = self._state_provider()
             ok, reason = self._verifier.check(rule, state)
-        return ok, reason
+        status = "succeeded" if ok else self._verifier.classify(rule, state)
+        return ok, reason, status
 
     async def run(
         self,
@@ -158,24 +172,55 @@ class TaskRunner:
             if self._cancelled:
                 self._store.save_checkpoint(task.id, index, {"reason": "cancelled"})
                 self._store.set_status(task.id, "cancelled")
-                return RunResult(False, task.id, index, "任务已取消", done, total)
+                return RunResult(
+                    False, task.id, index, "任务已取消", done, total, status="cancelled"
+                )
             while self._paused and not self._cancelled:
                 await asyncio.sleep(0.2)
             step = steps[index]
             detail = ""
             ok = False
             reason = ""
+            status = "failed"
+            skill_id = step.tool
+            action_id = ""
             for attempt in range(step.retries + 1):
                 try:
-                    detail = await asyncio.wait_for(
+                    outcome = await asyncio.wait_for(
                         self._execute(step), timeout=step.timeout_s
                     )
                 except Exception as error:  # noqa: BLE001 - 执行器失败要转成步骤失败
                     detail = f"执行失败: {error}"
                     ok = False
                     reason = "exception"
+                    status = getattr(error, "status", "failed")
                 else:
-                    ok, reason = await self._verify_with_wait(step.verify)
+                    if isinstance(outcome, ActionResult):
+                        detail = outcome.detail
+                        status = outcome.status
+                        skill_id = outcome.skill_id or step.tool
+                        action_id = outcome.action_id
+                        if step.verify.get("type") == "always":
+                            ok = outcome.ok and status == "succeeded"
+                            reason = (
+                                "动作报告成功"
+                                if ok
+                                else f"动作未报告成功：{status}"
+                            )
+                        else:
+                            ok, reason, verify_status = await self._verify_with_wait(
+                                step.verify
+                            )
+                            if not ok:
+                                status = verify_status
+                    else:
+                        detail = str(outcome)
+                        status = "succeeded"
+                        ok, reason, verify_status = await self._verify_with_wait(
+                            step.verify
+                        )
+                        if not ok:
+                            status = verify_status
                 if self._logger is not None:
                     self._logger.log(
                         "step",
@@ -189,22 +234,54 @@ class TaskRunner:
                             "detail": detail,
                             "ok": ok,
                             "reason": reason,
+                            "status": status,
+                            "skill_id": skill_id,
+                            "action_id": action_id,
                         },
                     )
                 if ok:
+                    status = "succeeded"
+                    break
+                if status in ("cancelled", "disconnected"):
                     break
                 await asyncio.sleep(0.2)
             if not ok:
                 self.cursor = index
                 self._store.save_checkpoint(
-                    task.id, index, {"step": step.description, "reason": reason}
+                    task.id,
+                    index,
+                    {
+                        "step": step.description,
+                        "reason": reason,
+                        "status": status,
+                    },
                 )
-                self._store.set_status(task.id, "blocked")
+                if status == "cancelled":
+                    self._store.set_status(task.id, "cancelled")
+                    self._store.log_event(
+                        task.id, "step_cancelled", {"index": index, "reason": reason}
+                    )
+                    return RunResult(
+                        False, task.id, index, "步骤已取消", done, total, status="cancelled"
+                    )
+                self._store.set_status(
+                    task.id, "blocked" if status == "blocked" else "failed"
+                )
+                event_kind = (
+                    "step_disconnected" if status == "disconnected" else "step_blocked"
+                )
                 self._store.log_event(
-                    task.id, "step_blocked", {"index": index, "reason": reason}
+                    task.id,
+                    event_kind,
+                    {"index": index, "reason": reason, "status": status},
                 )
-                await self._say(f"{step.description}没做成，先停一下。")
-                return RunResult(False, task.id, index, reason, done, total)
+                if status == "disconnected":
+                    await self._say("Minecraft 桥接断开了，我先停在这一步。")
+                else:
+                    await self._say(f"{step.description}没做成，先停一下。")
+                return RunResult(
+                    False, task.id, index, detail or reason, done, total, status=status
+                )
             done += 1
             self.cursor = index + 1
             self._store.save_checkpoint(

@@ -137,15 +137,39 @@
 
 回声处理：修复前，音箱播放的回复会被麦克风再次识别并触发新回合，形成连续自问自答。加入「实际播放状态 + 播放结束后的冷却」后，同一测试只产生一轮回复。冷却时间最初为 0.9 秒，实测仍有尾部音频被收进去，当前默认 1.5 秒。
 
-## 9. 未测量的部分
+## 9. 语音快路与缓存的结构自检
+
+条件：`scripts/latency_scenarios.py`，脚本化模型与等幅 PCM 替身；无真实网络、无真实 TTS、无真实服务器。
+
+| 场景 | 确认语来源 | 合成调用 | 动作 | 音频块 | 缺失观测点 |
+| --- | --- | --- | --- | --- | --- |
+| `cache_miss` | dynamic | 3 | 1 | 6 | 无 |
+| `cache_hit` | cache | 2 | 1 | 5 | 无 |
+| `action_success` | cache | 2 | 1 | 5 | 无 |
+| `action_failure` | cache | 2 | 1 | 5 | 无 |
+| `stop` | dynamic | 3 | 1 | 6 | 无 |
+| `tts_unavailable` | cache | 2 | 1 | 1 | 无 |
+
+这张表只能证明结构，不能当延迟结论：
+
+- `cache_hit` 的合成调用比 `cache_miss` 少一次，差额正好是确认语本身，说明缓存命中时确认语不经过 TTS。
+- `tts_unavailable` 仍然有 1 个音频块，确认语来自缓存；动态部分如实降级，整轮没有崩。
+- 六种场景的观测点都齐全，缺一个观测点脚本就以非零码退出。
+- 合成场景里的毫秒数不可信：Windows 事件循环的定时粒度会把 5 毫秒等待压成零点几毫秒，所以脚本刻意不制造真实延时，只看顺序与调用次数。
+
+缓存命中时的首音延迟、真实 TTS 下的缓存收益、真实扬声器的可听延迟都还没有测量，见下一节的未测量项。
+
+## 10. 未测量的部分
 
 - 真实 DeepSeek 的首 token 与网络往返：没有费用授权，未调用。
 - 游戏内 Mod 播放：没有运行 Minecraft 客户端，空间音效与端到端时间未测。
 - 真人对着麦克风实时说话：当前用扬声器回放问题音频驱动采集链路，未做真人实时说话测量。
 - 多人空间音频、YSM 联动：未实现。
 - 旧系统 60-120 秒的原始测量：来自用户描述，本仓库没有复现。
+- 语音快路（本地意图 + 缓存确认语）的真实首音延迟：未测量。缓存已在 `work/voice_cache/` 生成时才能测，当前仓库没有带缓存的真实运行记录。
+- 缓存命中相对动态合成的真实收益：未测量。
 
-## 10. 复现
+## 11. 复现
 
 ```powershell
 # 终端 A：本地测试 LLM
@@ -158,4 +182,10 @@ runtime\python.exe api_v2.py -a 127.0.0.1 -p 9880 -c GPT_SoVITS\configs\tts_infe
 # 终端 C：基准
 cd D:\AI-Workspace\Voxkin
 .\.venv\Scripts\python.exe -m voxkin bench --turns 5 --json work\bench.json
+
+# 语音快路与缓存的结构自检（不访问外网）
+.\.venv\Scripts\python.exe scripts\latency_scenarios.py --json work\latency_scenarios.json
+
+# 生成确认语缓存（需要终端 B 的 GPT-SoVITS 在跑）
+.\.venv\Scripts\python.exe scripts\build_voice_cache.py
 ```

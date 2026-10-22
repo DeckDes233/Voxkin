@@ -113,6 +113,27 @@ class MemoryConfig:
 
 
 @dataclass
+class VoiceCacheConfig:
+    """预合成确认语缓存。关闭后管线退回纯动态 TTS。"""
+
+    enabled: bool = True
+    root: str = "work/voice_cache"
+    voice_id: str = ""
+    preload: bool = True
+    ack_deadline_ms: int = 400
+    chunk_ms: int = 200
+
+
+@dataclass
+class FastPathConfig:
+    """本地意图快路：命中就提交动作并播确认语，不等云端模型。"""
+
+    enabled: bool = True
+    min_confidence: float = 0.75
+    action_min_confidence: float = 0.9
+
+
+@dataclass
 class VoxkinConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
@@ -121,6 +142,8 @@ class VoxkinConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     persona: PersonaConfig = field(default_factory=PersonaConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    voice_cache: VoiceCacheConfig = field(default_factory=VoiceCacheConfig)
+    fast_path: FastPathConfig = field(default_factory=FastPathConfig)
 
     def validate(self) -> None:
         if self.llm.provider not in {"openai_compat", "scripted"}:
@@ -135,6 +158,12 @@ class VoxkinConfig:
             raise ValueError("tts.manage_service 开启时必须配置 tts.start_command")
         if self.memory.enabled and not self.memory.db_path:
             raise ValueError("memory.enabled 开启时必须配置 memory.db_path")
+        if self.voice_cache.enabled and not self.voice_cache.root:
+            raise ValueError("voice_cache.enabled 开启时必须配置 voice_cache.root")
+        if self.voice_cache.ack_deadline_ms <= 0:
+            raise ValueError("voice_cache.ack_deadline_ms 必须为正数")
+        if self.fast_path.min_confidence <= 0 or self.fast_path.action_min_confidence <= 0:
+            raise ValueError("fast_path 的置信度阈值必须为正数")
 
 
 def _build(cls: type, data: Any) -> Any:
@@ -191,6 +220,8 @@ def save_config(config: VoxkinConfig, path: Path | str | None = None) -> Path:
         "server": config.server.__dict__,
         "persona": config.persona.__dict__,
         "memory": config.memory.__dict__,
+        "voice_cache": config.voice_cache.__dict__,
+        "fast_path": config.fast_path.__dict__,
     }
     target.write_text(
         yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8"

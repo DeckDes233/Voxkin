@@ -27,6 +27,7 @@ DEFAULT_JAVA = (
     if _ENV_JAVA
     else Path.home() / "AppData/Roaming/.minecraft/runtime/java-runtime-delta/bin/java.exe"
 )
+DEFAULT_NODE = os.environ.get("VOXKIN_NODE", "").strip() or shutil.which("node") or "node"
 
 
 def rcon(host: str, port: int, password: str, command: str, timeout: float = 10.0) -> str:
@@ -90,6 +91,24 @@ def log_dir() -> Path:
     return target
 
 
+def node_version(node: str) -> str:
+    """返回桥接使用的 Node 版本，评测记录里必须能追到具体运行时。"""
+    try:
+        completed = subprocess.run(
+            [node, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError as error:
+        raise SystemExit(f"找不到 Node 可执行文件 {node}: {error}") from error
+    if completed.returncode != 0:
+        message = (completed.stderr or completed.stdout).strip()
+        raise SystemExit(f"Node 不可用 {node}: {message}")
+    return completed.stdout.strip()
+
+
 def ensure_studio(args: argparse.Namespace) -> subprocess.Popen[bytes] | None:
     """Studio 没起来就自己拉起来，评测脚本不依赖外部会话。"""
     if port_open("127.0.0.1", 8765):
@@ -134,8 +153,10 @@ def ensure_bridge(args: argparse.Namespace) -> subprocess.Popen[bytes] | None:
     env["PYTHONUTF8"] = "1"
     out = (log_dir() / "bridge.out.log").open("ab")
     err = (log_dir() / "bridge.err.log").open("ab")
+    node = getattr(args, "node", DEFAULT_NODE)
+    print(f"bridge 运行时: {node} ({node_version(node)})", flush=True)
     process = subprocess.Popen(
-        ["node", "bridge/minecraft_bridge.js"],
+        [node, "bridge/minecraft_bridge.js"],
         cwd=str(ROOT),
         stdout=out,
         stderr=err,
@@ -323,6 +344,11 @@ def main() -> int:
     parser.add_argument("--stage-timeout", type=float, default=900.0, help="单次阶段超时（秒）")
     parser.add_argument("--server-timeout", type=float, default=120.0, help="服务器启停超时（秒）")
     parser.add_argument("--java", default=str(DEFAULT_JAVA))
+    parser.add_argument(
+        "--node",
+        default=DEFAULT_NODE,
+        help="桥接使用的 Node 可执行文件，也可用 VOXKIN_NODE 指定",
+    )
     args = parser.parse_args()
 
     ensure_studio(args)
@@ -337,6 +363,7 @@ def main() -> int:
     summary = {
         "stage": args.stage,
         "difficulty": args.difficulty,
+        "node": {"path": args.node, "version": node_version(args.node)},
         "runs": len(records),
         "passed": len(passed),
         "success_rate": round(len(passed) / len(records), 3) if records else 0.0,

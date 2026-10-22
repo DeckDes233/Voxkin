@@ -1,6 +1,6 @@
 # 当前状态
 
-更新时间：2026-10-22 11:56（Asia/Shanghai）。
+更新时间：2026-10-22 23:40（Asia/Shanghai）。
 
 ## 已完成
 
@@ -12,7 +12,9 @@
 | 识别 | faster-whisper small，中文识别；模板幻觉、重复循环与低置信片段过滤 | 本机实测；17 个过滤测试；5 秒静音返回空文本 |
 | 端点检测 | 能量 VAD，合成音频测试 | 5 个测试用例 |
 | 桥接 | WebSocket 协议、动作派发、mineflayer 客户端 | 真实 WebSocket 集成测试；Paper 1.21.1 上完成聊天到动作的端到端验证 |
-| 自主任务 | TaskRunner、checkpoint、`/api/run/*`；S0 空背包到木镐连续 2 次 5/5 | 固定 seed 重置世界，JSONL 逐步判定；证据见 `docs/evidence/S0_20261022.md` |
+| 自主任务 | TaskRunner、checkpoint、`/api/run/*`；S0 空背包到木镐在 Normal 难度下连续 10 次 5/5；S1 石镐/石剑/熔炉在同一世界接 S0 跑通 1 次 5/5（78.9 秒） | 固定 seed 重置世界，JSONL 逐步判定；证据见 `docs/evidence/S0_NORMAL_20261022.md` 与 `docs/evidence/S1_NORMAL_20261022.md` |
+| 技能清单 | `bridge/skills/manifest.js` 与导出的 `manifest.json`：57 个技能（21 个桥接内建 + 36 个模块技能）的参数、前置条件、后置条件、失败条件、恢复策略、超时与判定依据 | `scripts/merge_module_skills.js` 合并、`scripts/dump_manifest.js` 导出；`tests/test_skill_manifest.py` 校验清单、桥接分支与 Core 工具定义一致 |
+| 动作状态 | accepted/running/succeeded/partial/failed/cancelled/disconnected/blocked 八档状态贯穿协议、派发、桥接与运行记录 | 每步记录 `status`、`skill_id`、`action_id`；`tests/test_action_status.py` 覆盖 |
 | Studio | 状态、试听、事件流、延迟表、配置、受管服务、日志、麦克风启停 | HTTP 接口实测；服务管理用真实子进程测试 |
 | 基准 | `voxkin bench` 输出 JSON 与分位数；真实模型与 Minecraft 端到端计时 | `docs/BENCHMARK_RESULTS.md` |
 | 真实模型 | OpenCode Go（`deepseek-v4.1-flash`）流式对话、工具调用与延迟测量 | 3 轮基准首次可听 3134.9–4434.9 ms；游戏内触发 `collect_blocks` 成功 |
@@ -21,14 +23,19 @@
 | 客户端 Mod | Fabric 1.21.1，WebSocket 接收 PCM，Minecraft 流式声源与实体定位 | 构建成功（`voxkin-audio-0.1.0.jar`）；Mixin 目标字段与 1.21.1 映射一致；未在真实客户端验证 |
 | 音频推送 | `/ws/audio` 向客户端广播 PCM | 真实 TTS 推送 412160 字节 / 6.44 秒，共 4 个分块 |
 | 麦克风对话 | 采集、VAD 校准、识别、语音回复、回声冷却；Studio 内启停 | 真实麦克风：识别 1577.3 ms，播放回复；外放回声不再触发新回合 |
+| 语音快路 | 本地规则意图产出 `IntentPlan`（停止、跟随、过来、攻击、进食、睡觉、观察、背包、采集），命中即提交动作并播确认语，不等云端模型；同一回合里模型重复的相同调用会被去重 | `tests/test_intent.py` 与 `tests/test_pipeline.py`；能力询问不触发动作 |
+| 语音缓存 | `src/voxkin/voice/phrase_catalog.py` 47 条确认语目录（覆盖 54 个可缓存条目），`src/voxkin/voice/cache.py` 预合成缓存（WAV + sidecar，哈希、音色、引擎或参考音频不匹配一律 miss 并记账） | `tests/test_phrase_catalog.py`、`tests/test_voice_cache.py`；`scripts/build_voice_cache.py` 生成，`work/voice_cache/` 不入库 |
+| 时间线 | 保留原有 `t0`–`t8`，补 `t_cmd_final`、`t_intent_done`、`t_ack_ready`、`t_audio_start`、`t_action_submit`、`t_action_start`；缺观测点显式失败 | `tests/test_events.py`；`scripts/latency_scenarios.py` 跑六个合成场景 |
 
 ## 测试结果
 
 ```
-139 passed
+265 passed
 ```
 
-覆盖：文本分句与过滤、时间线与指标、配置加载与保存、端点检测、对话管线（含打断）、动作派发、桥接 WebSocket 协议、聊天触发回合、动作与语音并行完成、外部服务启停与健康检查。
+覆盖：文本分句与过滤、时间线与指标、配置加载与保存、端点检测、对话管线（含打断、语音快路、缓存确认语、重复调用去重）、动作派发、桥接 WebSocket 协议、聊天触发回合、动作与语音并行完成、外部服务启停与健康检查、技能清单一致性、结构化动作状态（含部分完成与 Runner 终态判定）、方块词表与技能清单的一致性。
+
+新增部分（2026-10-22 晚）落地了 [docs/plans/VOICE_ACTION_LATENCY_PLAN.md](plans/VOICE_ACTION_LATENCY_PLAN.md) 的阶段 0 与阶段 1，以及阶段 2 的最小闭环：缓存命中时确认语不经过 TTS、缓存缺失时走动态合成并受截止时间约束、动作与确认语并行提交。真实扬声器与真实 TTS 下的首音延迟尚未测量，见 [docs/BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) 的未测量项。
 
 ## 已知问题
 
@@ -40,8 +47,10 @@
 6. Studio 配置修改需要重启服务生效。
 7. mineflayer 在 1.21.1 上对部分物品包报 `PartialReadError`，当前不影响动作执行。
 8. 记忆压缩依赖模型调用，离线时只保留原始对话，不生成摘要。
-9. mineflayer 4.39.0 的 `bot.craft` 在 1.21.1 上会偶发只点第一排材料；`craft` 已改为自己操作合成窗口，并在每次点击间留 80 ms。
-10. S0 目前只在 Peaceful 功能试跑中连续通过 2 次；Normal 难度的 10 次 ≥8 回归、P50 ≤6 分钟尚未完成。
+9. mineflayer 的 `clickWindow` 在 1.21.1 上点完合成格会等服务端重发结果槽位，凑不齐配方时必然等满 20 秒；桥接已改为自己发 `window_click` 包并推演本地窗口状态，10 次回归均通过。
+10. S0 在 Normal 难度下已连续 10 次 5/5、P50 36.4 秒；S1 已在 Node 24 上完成 3/3 轮 S0→S1 白天链式回归（S1 为 95.0、78.9、78.8 秒），但 3 夜生存、换种子与夜间怪物场景尚未回归。
+11. 技能清单已扩展到 57 条（36 条模块技能），真实服务器证据只覆盖 S0 的 `collect_blocks`/`craft` 与 S1 的 `mine_collect`/`craft`；S2–S6 计划与其余模块技能都没有实跑，不能据清单存在就判定可用。
+12. 断桥已从 `cancelled` 拆成 `disconnected`，任务保留 checkpoint；Node 22.23.2 在采集阶段出现过 V8 原生崩溃，当前评测改用 Node 24.19.0，连续 3 轮没有复现。
 
 ## 阻塞与前置条件
 
@@ -53,6 +62,6 @@
 
 ## 下一步三件事
 
-1. 在 Normal 难度下跑 10 次 S0，达到 ≥8/10 且 P50 ≤6 分钟，再开始 S1。
-2. 做死亡重生与掉落物回收，把 `/kill` 后的继续跑通到 S1 checkpoint。
-3. 实现 S1：石头、石镐/石剑、熔炉与第一夜庇护所。
+1. S1 已完成 3/3 轮白天链式回归；下一步做真实夜间场景，先修可容纳床的封闭庇护所与 `sleep_safe`，再跑 3 夜。
+2. 做死亡重生与掉落物回收，把 `/kill` 后的继续跑通到 S1 checkpoint；当前 `TaskRunner` 的恢复只覆盖进程级，不覆盖死亡掉落。
+3. 用真实服务器逐段验收 S2–S6，优先补 S2 的羊毛采集与 S5 的燧石/黑曜石获取缺口；不要直接跳到末地。

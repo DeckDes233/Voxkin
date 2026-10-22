@@ -2,399 +2,99 @@ from __future__ import annotations
 
 from typing import Any
 
-MINECRAFT_TOOLS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "collect_blocks",
-            "description": "走到附近的方块并挖掘指定数量，返回实际挖到的数量；可以指定搜索半径。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "block": {"type": "string", "description": "方块 ID，例如 dirt、oak_log、stone"},
-                    "count": {"type": "integer", "description": "需要挖掘的数量", "minimum": 1},
-                    "range": {
-                        "type": "number",
-                        "description": "搜索半径，默认 32 格，最大 64",
-                        "minimum": 8,
-                        "maximum": 64,
-                    },
-                },
-                "required": ["block", "count"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "goto",
-            "description": "走到指定坐标附近两格。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "x": {"type": "number"},
-                    "y": {"type": "number"},
-                    "z": {"type": "number"},
-                },
-                "required": ["x", "y", "z"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stop",
-            "description": "停止当前移动与操作。",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "look_at_player",
-            "description": "转向指定玩家。",
-            "parameters": {
-                "type": "object",
-                "properties": {"player": {"type": "string"}},
-                "required": ["player"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "follow_player",
-            "description": "持续跟随玩家，玩家移动时自动跟上，直到收到停止指令。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "player": {"type": "string", "description": "玩家名，省略时跟随最近的玩家"},
-                    "distance": {
-                        "type": "number",
-                        "description": "保持的距离，默认 2 格",
-                        "minimum": 1,
-                        "maximum": 6,
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "come_to_player",
-            "description": "走到玩家当前所在位置附近，到一次就结束。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "player": {"type": "string", "description": "玩家名，省略时走向最近的玩家"}
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "inventory",
-            "description": "查看背包里有哪些物品和数量。",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "attack_nearest",
-            "description": "攻击附近最近的敌对生物，自动装备剑或斧。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "range": {
-                        "type": "number",
-                        "description": "搜索范围，默认 16 格",
-                        "minimum": 3,
-                        "maximum": 32,
-                    }
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "attack_target",
-            "description": "攻击指定名字或类型的实体；默认只打敌对生物，玩家不会被攻击。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "实体名字，例如 zombie、husk",
-                    },
-                    "type": {
-                        "type": "string",
-                        "description": "hostile、player 或具体实体类型",
-                    },
-                    "id": {
-                        "type": "integer",
-                        "description": "实体 ID，可选，来自 locate_entity",
-                    },
-                    "range": {
-                        "type": "number",
-                        "description": "搜索范围，默认 16 格",
-                        "minimum": 3,
-                        "maximum": 32,
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "break_block",
-            "description": "挖掉一个方块。给方块名会自动找最近的，给坐标则挖指定位置。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "block": {"type": "string", "description": "方块 ID，例如 oak_log、stone"},
-                    "x": {"type": "number"},
-                    "y": {"type": "number"},
-                    "z": {"type": "number"},
-                    "range": {
-                        "type": "number",
-                        "description": "按方块名搜索的范围，默认 16 格",
-                        "minimum": 2,
-                        "maximum": 32,
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "place_block",
-            "description": "在指定坐标放置背包里的方块，会依附相邻方块。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "block": {"type": "string", "description": "方块 ID，例如 cobblestone"},
-                    "x": {"type": "number"},
-                    "y": {"type": "number"},
-                    "z": {"type": "number"},
-                },
-                "required": ["block", "x", "y", "z"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "goto_block",
-            "description": "走到附近指定方块旁边，不挖掘。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "block": {"type": "string", "description": "方块 ID，例如 iron_ore"},
-                    "range": {
-                        "type": "number",
-                        "description": "搜索范围，默认 32 格",
-                        "minimum": 4,
-                        "maximum": 64,
-                    },
-                },
-                "required": ["block"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "pickup_items",
-            "description": "走到附近最近的掉落物旁边。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "range": {
-                        "type": "number",
-                        "description": "搜索范围，默认 16 格",
-                        "minimum": 3,
-                        "maximum": 32,
-                    }
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "craft",
-            "description": "用背包里的材料合成物品；需要工作台时会自动放置并回收。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "item": {
-                        "type": "string",
-                        "description": "物品 ID，例如 oak_planks、stick、wooden_pickaxe",
-                    },
-                    "count": {
-                        "type": "integer",
-                        "description": "合成数量，默认 1",
-                        "minimum": 1,
-                        "maximum": 64,
-                    },
-                },
-                "required": ["item"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "eat",
-            "description": "吃背包里的食物。饥饿值已满时不会吃；不指定 item 时自动挑一种食物，不会主动吃金苹果。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "item": {
-                        "type": "string",
-                        "description": "食物物品 ID，例如 bread、cooked_beef；省略时自动选择",
-                    },
-                    "count": {
-                        "type": "integer",
-                        "description": "最多吃几个，默认 1",
-                        "minimum": 1,
-                        "maximum": 16,
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "observe",
-            "description": "用一句话报告自身状态和周围环境：坐标、朝向、维度、血量、饥饿、时间天气、手持、护甲、背包前 8 项、附近玩家与敌对生物。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "radius": {
-                        "type": "number",
-                        "description": "观察半径，默认 16 格",
-                        "minimum": 1,
-                        "maximum": 64,
-                    },
-                    "block": {
-                        "type": "string",
-                        "description": "可选，额外报告附近某一种方块，例如 iron_ore",
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "locate_block",
-            "description": "按方块 ID 搜索附近方块，返回候选坐标、距离和垂直差，并指出最近的一个；找不到时明确说明。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "block": {
-                        "type": "string",
-                        "description": "方块 ID，例如 iron_ore、oak_log",
-                    },
-                    "radius": {
-                        "type": "number",
-                        "description": "搜索半径，默认 32 格",
-                        "minimum": 1,
-                        "maximum": 64,
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "最多返回几个候选，默认 5",
-                        "minimum": 1,
-                        "maximum": 16,
-                    },
-                },
-                "required": ["block"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "locate_entity",
-            "description": "搜索附近实体，返回名字、类型、距离和坐标；玩家使用真实用户名，找不到时明确说明。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "type": {
-                        "type": "string",
-                        "description": "可选，实体类型，例如 player、zombie、hostile",
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "可选，实体或玩家名字",
-                    },
-                    "radius": {
-                        "type": "number",
-                        "description": "搜索半径，默认 32 格",
-                        "minimum": 1,
-                        "maximum": 64,
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "最多返回几个，默认 5",
-                        "minimum": 1,
-                        "maximum": 16,
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "sleep",
-            "description": "走到 16 格内的床睡觉；下界、末地、白天（非雷暴）、附近有敌对生物或床被占用时会说明原因，不会假报天亮。",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "smelt",
-            "description": "把矿石或生食放进熔炉熔炼；附近没有熔炉时会尝试放置背包里的熔炉，结束后回收。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "item": {
-                        "type": "string",
-                        "description": "原料 ID，例如 raw_iron、raw_gold、beef",
-                    },
-                    "count": {
-                        "type": "integer",
-                        "description": "熔炼数量，默认 1",
-                        "minimum": 1,
-                        "maximum": 64,
-                    },
-                },
-                "required": ["item"],
-            },
-        },
-    },
-]
+from voxkin.agent.skills import load_manifest, tool_schemas
+
+# chat 只在游戏内生效：Core 用 TTS 说话，不把它当成模型可调的工具。
+BRIDGE_ONLY_SKILLS: frozenset[str] = frozenset({"chat"})
+
+# 清单里写成联合类型的参数是桥接侧的宽松约定，模型侧按文本清单给。
+UNION_TYPE_HINTS: dict[str, str] = {
+    "string|array|object": "写成「物品 数量」的文本，多个物品用逗号分隔。",
+}
+
+
+def _model_type(declared: str) -> str:
+    """清单里的联合类型收窄成模型能填的类型。"""
+    return declared.split("|", 1)[0] if "|" in declared else declared
+
+
+def _default_note(parameter: dict[str, Any]) -> str:
+    """把清单里的默认值写进参数描述，模型才知道省略参数会发生什么。"""
+    default = parameter.get("default", None)
+    if default is None:
+        return ""
+    if isinstance(default, bool):
+        return "默认是。" if default else "默认否。"
+    return f"默认 {default}。"
+
+
+def _skill_description(skill: dict[str, Any]) -> str:
+    """工具描述 = 清单描述 + 失败情况，让模型知道什么时候别调这个技能。"""
+    description = str(skill.get("description") or "")
+    failures = [str(item).rstrip("。") for item in (skill.get("failure_conditions") or []) if item]
+    if not failures:
+        return description
+    return f"{description} 失败情况：{'；'.join(failures)}。"
+
+
+def build_tools(manifest: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """按技能清单生成模型可用的工具列表。
+
+    清单是唯一事实来源：工具名、参数名、必填项与数值范围都跟着清单走，
+    Core 只补三件事——去掉只在游戏内生效的技能、把默认值写进参数描述、
+    把联合类型收窄成模型能填的类型。
+    """
+    source = manifest if manifest is not None else load_manifest()
+    skills = {str(skill["skill_id"]): skill for skill in source["skills"]}
+    tools: list[dict[str, Any]] = []
+    for schema in tool_schemas(source):
+        name = str(schema["function"]["name"])
+        if name in BRIDGE_ONLY_SKILLS:
+            continue
+        skill = skills.get(name)
+        if skill is None:
+            raise ValueError(f"技能 {name} 不在清单里")
+        parameters = {
+            str(item.get("name")): item for item in (skill.get("parameters") or [])
+        }
+        function = schema["function"]
+        function["description"] = _skill_description(skill)
+        properties = function["parameters"]["properties"]
+        for key, item in properties.items():
+            parameter = parameters.get(key)
+            if parameter is None:
+                continue
+            declared = str(parameter.get("type") or "string")
+            item["type"] = _model_type(declared)
+            notes = []
+            hint = UNION_TYPE_HINTS.get(declared)
+            if hint:
+                notes.append(hint)
+            default_note = _default_note(parameter)
+            if default_note:
+                notes.append(default_note)
+            if notes:
+                item["description"] = f"{item['description']}{''.join(notes)}"
+        tools.append(schema)
+    return tools
+
+
+MINECRAFT_TOOLS: list[dict[str, Any]] = build_tools()
 
 TOOL_SYSTEM_HINT = (
-    "你在 Minecraft 世界里行动，可以使用工具改变游戏状态。"
+    "你在 Minecraft 世界里行动，可以用工具改变游戏状态。"
     "回答玩家时直接用语音，不要调用工具来说话；只有确实要移动、挖掘或停止时才调用工具。"
     "玩家说跟我来、跟上、别掉队时调用 follow_player；说过来、来我这、到我这里时调用 come_to_player；"
     "问背包或有什么东西时调用 inventory；让你打怪、清怪时调用 attack_nearest；指定打某一只用 attack_target。"
     "要挖单个方块用 break_block；要放置方块用 place_block；要走到某种方块用 goto_block；地上有掉落物用 pickup_items。"
-    "要合成木板、木棍、工作台、工具时用 craft。"
-    "要把粗铁、粗金或生食熔炼时用 smelt。"
-    "想知道周围情况用 observe；找方块用 locate_block；找玩家或生物用 locate_entity；饿了用 eat；晚上用 sleep 睡觉。"
+    "要合成木板、木棍、工作台用 craft；要一整套工具用 craft_tool_set；要做床用 craft_bed；要做火把用 craft_torch。"
+    "要把粗铁、粗金或生食熔炼时用 smelt；一次熔很多用 smelt_batch。"
+    "要知道周围情况用 observe；找方块用 locate_block；找玩家或生物用 locate_entity；饿了用 eat；晚上用 sleep 睡觉。"
+    "要走远路用 safe_travel；要下矿道用 deep_mine 或 strip_mine；找钻石用 find_diamond；"
+    "要过夜用 sleep_safe；在被封住的庇护所里等天亮用 wait_for_day，天亮后用 leave_shelter 挖开出口；血量太低用 flee_low_health；带盾用 equip_shield；缺庇护所用 make_shelter。"
+    "要打猎用 hunt_animal；要打末影人用 hunt_enderman；要打烈焰人用 fight_blaze；打末影龙水晶用 break_crystal。要找要塞用 throw_eye；要激活末地门用 activate_end_portal；要打末影龙用 fight_dragon；龙死后用 return_home 回主世界。"
+    "要存物资用 store_items 或 checkpoint_stock；要取物资用 withdraw_items；要找箱子用 list_chest。"
+    "箱子满了或者材料不够时，动作结果会说明还差多少，按结果调整数量再来一次。"
     "玩家问你是谁、在哪、在做什么、为什么，先用一句话直接回答，不要调用工具。"
     "调用工具前先说一句要做什么，不要只调用工具不说话。"
     "回答保持一到两句话，不要提到接口、模型、语音合成或系统内部。"

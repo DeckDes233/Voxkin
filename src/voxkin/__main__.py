@@ -236,7 +236,18 @@ async def run_bench(config, turns: int, text: str, out: Path | None) -> None:
             print(json.dumps(summary, ensure_ascii=False))
     finally:
         await runtime.close()
-    fields = ("stt_ms", "llm_ttft_ms", "first_sentence_ms", "tts_first_audio_ms", "first_audible_ms")
+    fields = (
+        "stt_ms",
+        "llm_ttft_ms",
+        "first_sentence_ms",
+        "tts_first_audio_ms",
+        "first_audible_ms",
+        "intent_ms",
+        "ack_ready_ms",
+        "audio_start_ms",
+        "action_submit_ms",
+        "action_start_ms",
+    )
     aggregate = {}
     for name in fields:
         values = [r[name] for r in results if r.get(name) is not None]

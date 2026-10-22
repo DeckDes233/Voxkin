@@ -194,7 +194,7 @@ CREATE TABLE dangers(id INTEGER PRIMARY KEY, run_id TEXT, kind TEXT, dim TEXT, x
 | 2 | 找下界要塞 | 下界石砖方块 | explore、scan、break_block | 30min 未找到 → 回主世界换方向 | places 记录 fortress |
 | 3 | 烈焰棒 ≥7 | 石剑以上、可选抗火 | attack_nearest(blaze)、pickup | 低血 → 撤退重进；刷怪笼旁建掩体 | 背包 blaze_rod ≥7（`progress.py:56`） |
 | 4 | 末影珍珠 ≥16 | 铁剑、夜晚或诡异森林 | attack_nearest(enderman)、pickup | 不足 → 猪灵以物易物或延长猎杀 | 背包 ender_pearl ≥16 |
-| 5 | 合成末影之眼 | 烈焰粉 + 珍珠 | craft | 粉不足 → 补烈焰棒 | eye_of_ender ≥12 |
+| 5 | 合成末影之眼 | 烈焰粉 + 珍珠 | craft | 粉不足 → 补烈焰棒 | ender_eye ≥12 |
 | 6 | 定位要塞 | 12 眼、两点以上三角测量 | throw_eye、goto、dig_down | 眼碎 → 补眼；无信号 → 换点重测 | 找到 end_portal_frame |
 | 7 | 激活末地门 | 12 眼、frame 有空位 | place_block、use_on | 眼不足 → 回第 5 步 | flag:end_portal_lit |
 | 8 | 末地平台 | 落点 (100,49,0) | place_block、goto、bridge | 无方块 → 拆平台边缘 | 抵达主岛 |

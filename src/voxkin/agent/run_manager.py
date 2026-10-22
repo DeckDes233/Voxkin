@@ -5,12 +5,12 @@ import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from voxkin.agent.plans import PLANS
+from voxkin.agent.plans import AUX_PLANS, PLANS
 from voxkin.agent.runlog import RunLogger
 from voxkin.agent.runner import StepSpec, TaskRunner
 from voxkin.agent.tasks import TaskStore
 
-Dispatch = Callable[[str, dict[str, Any]], Awaitable[str]]
+Dispatch = Callable[..., Awaitable[Any]]
 Announce = Callable[[str], Awaitable[None]]
 StateProvider = Callable[[], dict[str, Any]]
 
@@ -61,7 +61,7 @@ class RunManager:
     async def start(self, stage: str = "S0") -> dict[str, Any]:
         if self.running:
             return self.status()
-        steps = PLANS.get(stage)
+        steps = PLANS.get(stage) or AUX_PLANS.get(stage)
         if steps is None:
             raise KeyError(f"未知阶段 {stage}")
         self._stage = stage
@@ -88,6 +88,7 @@ class RunManager:
             "detail": result.detail,
             "steps_done": result.steps_done,
             "steps_total": result.steps_total,
+            "status": result.status,
         }
 
     async def stop(self) -> dict[str, Any]:

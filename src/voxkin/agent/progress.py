@@ -84,14 +84,25 @@ def next_stage(stage_id: str) -> Stage | None:
 def is_complete(stage: Stage, inventory: dict[str, int]) -> bool:
     if stage.event:
         return False
-    return all(inventory.get(item, 0) >= count for item, count in stage.produces.items())
+    return all(_count_item(inventory, item) >= count for item, count in stage.produces.items())
+
+
+def _count_item(inventory: dict[str, int], item: str) -> int:
+    # 床与羊毛在 1.21 里都按颜色拆成独立物品 ID；阶段目标只关心类别。
+    if item == "bed":
+        return sum(
+            count
+            for name, count in inventory.items()
+            if name == "bed" or name.endswith("_bed")
+        )
+    return inventory.get(item, 0)
 
 
 def missing_items(stage: Stage, inventory: dict[str, int]) -> dict[str, int]:
     return {
         item: count - inventory.get(item, 0)
         for item, count in stage.produces.items()
-        if inventory.get(item, 0) < count
+        if _count_item(inventory, item) < count
     }
 
 
