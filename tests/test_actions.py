@@ -24,6 +24,25 @@ async def test_dispatch_waits_for_result():
     assert await task == "collected 3 oak_log"
 
 
+async def test_dispatch_uses_step_timeout():
+    dispatcher = ActionDispatcher(default_timeout_s=5)
+    sent: list[dict] = []
+
+    async def sender(message: dict) -> None:
+        sent.append(message)
+
+    dispatcher.attach(sender, "test-bridge")
+    task = asyncio.create_task(
+        dispatcher.dispatch("collect_blocks", {"block": "oak_log"}, timeout_s=180)
+    )
+    await asyncio.sleep(0.01)
+    assert sent[0]["timeout_s"] == 180
+    dispatcher.resolve(
+        ActionResult(action_id=sent[0]["action_id"], ok=True, detail="ok")
+    )
+    assert await task == "ok"
+
+
 async def test_failed_result_raises():
     dispatcher = ActionDispatcher(default_timeout_s=5)
 

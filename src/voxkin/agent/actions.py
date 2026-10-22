@@ -45,6 +45,12 @@ class ActionDispatcher:
             return {}
         return self.latest_state
 
+    def state_age_s(self) -> float:
+        """最近一帧状态距今的秒数；没有状态时返回很大值。"""
+        if not self.latest_state:
+            return float("inf")
+        return round(time.monotonic() - self._state_at, 2)
+
     def attach(self, sender: Sender, bridge_name: str = "") -> None:
         if self._sender is not None:
             raise ActionError("已经有一个 Minecraft 桥接连接，请先断开旧连接")
@@ -68,11 +74,14 @@ class ActionDispatcher:
         if not future.done():
             future.set_result(result)
 
-    async def dispatch(self, tool: str, arguments: dict[str, Any]) -> str:
+    async def dispatch(
+        self, tool: str, arguments: dict[str, Any], timeout_s: float | None = None
+    ) -> str:
         sender = self._sender
         if sender is None:
             raise ActionError("没有已连接的 Minecraft 桥接，无法执行游戏动作")
-        request = ActionRequest(tool=tool, arguments=arguments, timeout_s=self.default_timeout_s)
+        limit = float(timeout_s) if timeout_s else self.default_timeout_s
+        request = ActionRequest(tool=tool, arguments=arguments, timeout_s=limit)
         loop = asyncio.get_running_loop()
         future: asyncio.Future[ActionResult] = loop.create_future()
         self._pending[request.action_id] = future

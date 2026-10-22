@@ -9,10 +9,7 @@ import aiohttp
 import numpy as np
 
 from voxkin.config import TTSConfig
-
-
-class TTSError(RuntimeError):
-    pass
+from voxkin.tts.base import TTSError
 
 
 def parse_wav_header(header: bytes) -> tuple[int, int]:

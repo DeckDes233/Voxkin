@@ -483,6 +483,55 @@ async function collectDrops(range = 6) {
   await syncInventory();
 }
 
+async function waitForCombat(timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (combatBusy && Date.now() < deadline) {
+    await sleep(300);
+  }
+  return !combatBusy;
+}
+
+async function waitForQuietAround(radius = 10, timeoutMs = 30000) {
+  // 附近还有怪就先等反击把它们清掉，别在打架的时候走远。
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await waitForCombat(5000);
+    const hostiles = nearbyHostiles(radius);
+    if (hostiles.length === 0) return true;
+    await sleep(500);
+  }
+  return nearbyHostiles(radius).length === 0;
+}
+
+async function travelToBlock(position, timeoutMs = 30000) {
+  // 走到方块附近。被怪物打断时先等反击结束再重试，而不是直接放弃。
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await Promise.race([
+        bot.pathfinder.goto(
+          new goals.GoalNear(position.x, Math.max(0, position.y - 1), position.z, 2)
+        ),
+        sleep(timeoutMs).then(() => {
+          throw new Error('走到目标超时');
+        }),
+      ]);
+      return true;
+    } catch (error) {
+      const message = String(error.message || error);
+      bot.pathfinder.stop();
+      if (message.includes('走到目标超时')) {
+        log('放弃这个采集目标', message);
+        return false;
+      }
+      log('采集被打断，等反击结束后重试', message);
+      await waitForQuietAround(10, 30000);
+      await sleep(1000);
+    }
+  }
+  log('放弃这个采集目标', '连续被打断');
+  return false;
+}
+
 async function collectBlocks(blockName, count, range = 32) {
   const radius = Math.min(Math.max(Number(range) || 32, 8), 64);
   const blockIds = bot.registry.blocksByName[blockName];
@@ -492,11 +541,26 @@ async function collectBlocks(blockName, count, range = 32) {
   if (need === 0) {
     return `背包里已经有 ${owned} 个 ${blockLabel(blockName)}，不需要再挖`;
   }
-  const positions = bot.findBlocks({
-    matching: blockIds.id,
-    maxDistance: radius,
-    count: Math.max(need * 4, 8),
-  });
+  // 世界刚重置时区块还没加载完，直接搜会得到空结果；先等区块再搜。
+  let positions = [];
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    positions = bot.findBlocks({
+      matching: blockIds.id,
+      maxDistance: radius,
+      count: Math.max(need * 4, 8),
+    });
+    if (positions.length > 0) break;
+    log('附近没有目标方块，等区块加载', `${blockLabel(blockName)} ${radius} 格`);
+    try {
+      await Promise.race([
+        bot.waitForChunksToLoad().catch(() => {}),
+        sleep(5000),
+      ]);
+    } catch {
+      // 等待失败就继续轮询
+    }
+    await sleep(1500);
+  }
   if (positions.length === 0) throw new Error(`附近 ${radius} 格内没有 ${blockLabel(blockName)}`);
   // 同一棵树的原木按“先树干底、再往上”排序；只走到树根的水平坐标，
   // 不再用 GoalNear 要求站在原木同一高度（那会让 pathfinder 试图爬树，极慢）。
@@ -516,19 +580,7 @@ async function collectBlocks(blockName, count, range = 32) {
     const distance = bot.entity.position.distanceTo(position);
     log('采集目标', `${blockName} (${position.x}, ${position.y}, ${position.z}) 距离 ${distance.toFixed(1)}`);
     if (distance > 4) {
-      try {
-        await Promise.race([
-          bot.pathfinder.goto(
-            new goals.GoalNear(position.x, Math.max(0, position.y - 1), position.z, 2)
-          ),
-          sleep(30000).then(() => {
-            throw new Error('走到树根超时');
-          }),
-        ]);
-      } catch (error) {
-        log('放弃这个采集目标', error.message);
-        bot.pathfinder.stop();
-        await sleep(200);
+      if (!(await travelToBlock(position, 30000))) {
         continue;
       }
     }
@@ -2117,10 +2169,13 @@ function stopFollow() {
     followTimer = null;
   }
   followSession = null;
-  if (bot) {
+  // 服务器断开时 bot 可能还没加载 pathfinder 插件，这里必须容错，否则整个桥接进程会退出。
+  if (bot && bot.pathfinder) {
     bot.pathfinder.setGoal(null);
     bot.pathfinder.stop();
-    bot.pathfinder.movements.allowSprinting = true;
+    if (bot.pathfinder.movements) {
+      bot.pathfinder.movements.allowSprinting = true;
+    }
     bot.setControlState('sprint', false);
     bot.clearControlStates();
   }
@@ -2146,13 +2201,20 @@ function createBot() {
   bot.loadPlugin(pathfinder);
   bot.loadPlugin(armorManager);
   bot.loadPlugin(toolModule.plugin || toolModule);
+  // 服务器没开时，底层 socket 会抛未捕获的 error 直接结束进程；这里接住并等重连。
+  if (bot._client && typeof bot._client.on === 'function') {
+    bot._client.on('error', (error) => log('连接 Minecraft 失败', error.message));
+  }
 
   bot.once('spawn', () => {
     log('已进入世界');
     const movements = new Movements(bot);
     const originalStop = bot.pathfinder.stop.bind(bot.pathfinder);
     bot.pathfinder.stop = (...args) => {
-      log('pathfinder.stop', currentTool || 'none');
+      if (currentTool) {
+        const stack = new Error('stop-trace').stack.split('\n').slice(1, 5).join(' | ');
+        log('pathfinder.stop', currentTool, stack);
+      }
       return originalStop(...args);
     };
     movements.canDig = true;

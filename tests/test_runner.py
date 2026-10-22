@@ -95,6 +95,21 @@ def test_runner_retries_then_succeeds(tmp_path: Path) -> None:
     assert attempts["count"] == 2
 
 
+def test_runner_passes_step_timeout_to_executor(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    seen: list[float] = []
+
+    async def executor(tool: str, arguments: dict, timeout_s: float) -> str:
+        seen.append(timeout_s)
+        return "ok"
+
+    steps = [StepSpec("收集木头", "collect_blocks", {}, {"type": "always"}, timeout_s=180)]
+    runner = TaskRunner(executor, lambda: {}, store)
+    result = asyncio.run(runner.run("S0", steps))
+    assert result.ok
+    assert seen == [180]
+
+
 def test_runner_resumes_from_checkpoint(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     task = store.create_task("S1")

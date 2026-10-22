@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -20,8 +21,11 @@ from voxkin.services import ServiceSpec, ServiceSupervisor
 from voxkin.stt.vad import VadSegmenter
 from voxkin.stt.whisper import WhisperSTT
 from voxkin.tts import build_tts
-from voxkin.tts.base import TTSAdapter
+from voxkin.tts.base import TTSAdapter, TTSError
+from voxkin.tts.silent import SilentTTS
 from voxkin.voice.loop import VoiceLoop
+
+logger = logging.getLogger("voxkin")
 
 
 class MissingKeyLLM:
@@ -231,7 +235,15 @@ class Runtime:
         return self.mic_status()
 
     async def start(self) -> None:
-        await self.pipeline.start()
+        try:
+            await self.pipeline.start()
+        except TTSError as error:
+            # 语音合成挂掉不应该让整个 Core 起不来：自主任务与桥接动作都不依赖语音。
+            logger.warning("TTS 不可用，语音输出降级为日志: %s", error)
+            silent = SilentTTS(reason=str(error))
+            self.pipeline.tts = silent
+            self.tts = silent
+            await self.pipeline.start()
 
     def status(self) -> dict[str, Any]:
         return {

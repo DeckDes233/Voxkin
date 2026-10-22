@@ -35,3 +35,5 @@ voxkin = ["studio/*.html", "studio/*.css", "studio/*.js"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
+# ddtrace 的 pytest 插件在本机会破坏 CPython 运行时（re/inspect 随机崩溃），显式关掉。
+addopts = ["-p", "no:ddtrace"]

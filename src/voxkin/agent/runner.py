@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from voxkin.agent.runlog import RunLogger
 from voxkin.agent.tasks import TaskStore
 
-Executor = Callable[[str, dict[str, Any]], Awaitable[str]]
+Executor = Callable[..., Awaitable[str]]
 StateProvider = Callable[[], dict[str, Any]]
 Announce = Callable[[str], Awaitable[None]]
 
@@ -89,6 +90,7 @@ class TaskRunner:
         announce: Announce | None = None,
     ) -> None:
         self._executor = executor
+        self._executor_takes_timeout = self._accepts_timeout(executor)
         self._state_provider = state_provider
         self._store = store
         self._logger = logger
@@ -107,6 +109,20 @@ class TaskRunner:
 
     def cancel(self) -> None:
         self._cancelled = True
+
+    @staticmethod
+    def _accepts_timeout(executor: Executor) -> bool:
+        """执行器可以多接一个 timeout_s 参数，用来把步骤预算传动作层。"""
+        try:
+            parameters = inspect.signature(executor).parameters
+        except (TypeError, ValueError):
+            return False
+        return len(parameters) >= 3
+
+    async def _execute(self, step: StepSpec) -> str:
+        if self._executor_takes_timeout:
+            return await self._executor(step.tool, step.arguments, step.timeout_s)
+        return await self._executor(step.tool, step.arguments)
 
     async def _say(self, text: str) -> None:
         if self._announce is not None:
@@ -152,7 +168,7 @@ class TaskRunner:
             for attempt in range(step.retries + 1):
                 try:
                     detail = await asyncio.wait_for(
-                        self._executor(step.tool, step.arguments), timeout=step.timeout_s
+                        self._execute(step), timeout=step.timeout_s
                     )
                 except Exception as error:  # noqa: BLE001 - 执行器失败要转成步骤失败
                     detail = f"执行失败: {error}"

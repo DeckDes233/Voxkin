@@ -36,6 +36,7 @@ class StudioServer:
         app.router.add_get("/", self.index)
         app.router.add_get("/static/{name}", self.static_file)
         app.router.add_get("/api/status", self.status)
+        app.router.add_get("/api/bridge/state", self.bridge_state)
         app.router.add_post("/api/say", self.say)
         app.router.add_post("/api/interrupt", self.interrupt)
         app.router.add_post("/api/tts", self.tts)
@@ -74,6 +75,19 @@ class StudioServer:
         payload["config_path"] = str(self.config_path)
         payload["mic"] = self.runtime.mic_status()
         return web.json_response(payload)
+
+    async def bridge_state(self, request: web.Request) -> web.Response:
+        """桥接最近一帧世界状态；用来判断 bot 是否已经进世界。"""
+        dispatcher = self.runtime.dispatcher
+        state = dispatcher.state_snapshot()
+        return web.json_response(
+            {
+                "connected": dispatcher.connected,
+                "ready": bool(state.get("position")),
+                "age_s": dispatcher.state_age_s(),
+                "state": state,
+            }
+        )
 
     async def say(self, request: web.Request) -> web.Response:
         body = await request.json()
