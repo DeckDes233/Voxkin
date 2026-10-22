@@ -1,5 +1,21 @@
 # 变更记录
 
+## Unreleased — 2026-10-22
+
+### 自主任务
+
+- 新增 `TaskRunner`、`StepSpec`、机器 `Verifier`、SQLite checkpoint 与 `RunManager`，提供 `/api/run/start|status|stop`。
+- 新增 S0 计划：空背包收集 3 原木 → 12 木板 → 工作台 → 4 木棍 → 木镐。
+- S0 在固定 seed 的 Peaceful 功能试跑中连续 2 次 5/5，证据见 `docs/evidence/S0_20261022.md`。
+
+### 修复
+
+- 掉落物过滤改用 `entity.name === 'item'`，此前 `entity.type === 'item'` 永远匹配不到，挖树后捡不到原木。
+- 采集目标改为按树干底部接近，避免 pathfinder 爬树；单棵树 30 秒上限并自动换目标。
+- 合成改为自己操作合成窗口，逐格放置并留 80 ms 确认间隔；放下工作台后回收，修复 3x3 配方找不到工作台。
+- 动作完成后先推一帧世界状态再回结果；Runner 验证最多等待 6 秒，避免用旧背包误判。
+- 采集/拾取后主动同步背包，修复 mineflayer 漏掉 `set_slot` 导致的假空背包。
+
 ## 0.1.0 — 2026-10-21
 
 ### 新增

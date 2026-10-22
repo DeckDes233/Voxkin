@@ -398,6 +398,8 @@ async function runAction(message) {
 
 function reply(message, ok, detail) {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  // 先把动作后的世界状态推给 Core，再回结果；否则 TaskRunner 可能拿到 5 秒前的旧背包。
+  sendState();
   socket.send(
     JSON.stringify({
       type: 'action_result',
@@ -463,7 +465,7 @@ async function collectDrops(range = 6) {
     for (let index = 0; index < 8; index += 1) {
       const item = bot.nearestEntity(
         (entity) =>
-          entity.type === 'item' &&
+          entity.name === 'item' &&
           entity.position.distanceTo(bot.entity.position) <= range
       );
       if (!item) break;
@@ -478,6 +480,7 @@ async function collectDrops(range = 6) {
     }
     await sleep(300);
   }
+  await syncInventory();
 }
 
 async function collectBlocks(blockName, count, range = 32) {
@@ -492,25 +495,78 @@ async function collectBlocks(blockName, count, range = 32) {
   const positions = bot.findBlocks({
     matching: blockIds.id,
     maxDistance: radius,
-    count: need,
+    count: Math.max(need * 4, 8),
   });
   if (positions.length === 0) throw new Error(`附近 ${radius} 格内没有 ${blockLabel(blockName)}`);
-  let collected = 0;
+  // 同一棵树的原木按“先树干底、再往上”排序；只走到树根的水平坐标，
+  // 不再用 GoalNear 要求站在原木同一高度（那会让 pathfinder 试图爬树，极慢）。
+  const origin = bot.entity.position;
+  positions.sort((left, right) => {
+    const leftDistance = Math.hypot(left.x - origin.x, left.z - origin.z);
+    const rightDistance = Math.hypot(right.x - origin.x, right.z - origin.z);
+    return leftDistance - rightDistance || left.y - right.y;
+  });
+  let tried = 0;
   for (const position of positions) {
     if (interrupted) throw new Error('被新的指令打断');
+    if (countItem(blockName) - owned >= need) break;
     const block = bot.blockAt(position);
-    if (!block) continue;
-    await bot.pathfinder.goto(new goals.GoalNear(position.x, position.y, position.z, 1));
-    if (bot.canDigBlock(block)) {
+    if (!block || block.name !== blockName) continue;
+    tried += 1;
+    const distance = bot.entity.position.distanceTo(position);
+    log('采集目标', `${blockName} (${position.x}, ${position.y}, ${position.z}) 距离 ${distance.toFixed(1)}`);
+    if (distance > 4) {
+      try {
+        await Promise.race([
+          bot.pathfinder.goto(
+            new goals.GoalNear(position.x, Math.max(0, position.y - 1), position.z, 2)
+          ),
+          sleep(30000).then(() => {
+            throw new Error('走到树根超时');
+          }),
+        ]);
+      } catch (error) {
+        log('放弃这个采集目标', error.message);
+        bot.pathfinder.stop();
+        await sleep(200);
+        continue;
+      }
+    }
+    if (bot.entity.position.distanceTo(position) > 4.5) {
+      try {
+        await Promise.race([
+          bot.pathfinder.goto(
+            new goals.GoalNear(position.x, position.y, position.z, 2)
+          ),
+          sleep(8000).then(() => {
+            throw new Error('靠近原木超时');
+          }),
+        ]);
+      } catch (error) {
+        log('够不到这个原木', error.message);
+        bot.pathfinder.stop();
+        continue;
+      }
+    }
+    if (!bot.canDigBlock(block)) {
+      log('这个原木现在不能挖', `${blockName} (${position.x}, ${position.y}, ${position.z})`);
+      continue;
+    }
+    try {
       await equipToolFor(block);
       await bot.dig(block);
-      collected += 1;
+      // 掉落物实体要等服务器下一 tick 才生成，立即扫描会以为没有掉落物。
+      await sleep(600);
+      await collectDrops(5);
+    } catch (error) {
+      log('挖原木失败', error.message);
     }
-    if (collected >= need) break;
   }
   await collectDrops(6);
   const gained = countItem(blockName) - owned;
-  if (gained <= 0) throw new Error(`没有捡到 ${blockLabel(blockName)}`);
+  if (gained <= 0) {
+    throw new Error(`试了 ${tried} 个目标，没有捡到 ${blockLabel(blockName)}`);
+  }
   return `获得 ${gained} 个 ${blockLabel(blockName)}，背包共 ${countItem(blockName)} 个`;
 }
 
@@ -570,7 +626,14 @@ async function placeBlock(args) {
     if (!reference || reference.boundingBox !== 'block') continue;
     try {
       await bot.placeBlock(reference, vec(-dx, -dy, -dz));
-      return `放置 ${blockLabel(name)} 于 (${target.x}, ${target.y}, ${target.z})`;
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const placed = bot.blockAt(target);
+        if (placed && placed.name === name) {
+          return `放置 ${blockLabel(name)} 于 (${target.x}, ${target.y}, ${target.z})`;
+        }
+        await sleep(100);
+      }
+      lastError = new Error(`放置后位置 (${target.x}, ${target.y}, ${target.z}) 仍是空气`);
     } catch (error) {
       lastError = error;
     }
@@ -592,11 +655,12 @@ async function pickupItems(args) {
   const range = Math.min(Math.max(Number(args.range) || 16, 3), 32);
   const item = bot.nearestEntity(
     (entity) =>
-      entity.type === 'item' &&
+      entity.name === 'item' &&
       entity.position.distanceTo(bot.entity.position) <= range
   );
   if (!item) throw new Error(`附近 ${range} 格内没有掉落物`);
-  const name = item.name || '';
+  const dropped = item.getDroppedItem ? item.getDroppedItem() : null;
+  const name = dropped?.name || '';
   const before = name ? countItem(name) : 0;
   await bot.pathfinder.goto(
     new goals.GoalNear(item.position.x, item.position.y, item.position.z, 1)
@@ -616,10 +680,90 @@ function countItem(name) {
     .reduce((total, item) => total + item.count, 0);
 }
 
+async function syncInventory() {
+  // mineflayer 在合成/快速拾取后偶尔会漏掉 set_slot，主动要一次完整背包。
+  if (!bot || typeof bot._syncWindow !== 'function') return;
+  // 服务器不回应时不能卡 20 秒；正常时 1 秒内就能拿到完整背包。
+  await Promise.race([
+    bot._syncWindow(bot.inventory).catch(() => {}),
+    sleep(1000),
+  ]);
+}
+
 function nearbyBlock(name, range) {
   const block = bot.registry.blocksByName[name];
   if (!block) return null;
   return bot.findBlock({ matching: block.id, maxDistance: range });
+}
+
+async function placeIngredient(window, ingredient, destSlot) {
+  const source = window.findInventoryItem(ingredient.id, ingredient.metadata ?? null);
+  if (!source) throw new Error(`缺少材料 ${ingredient.id}`);
+  await bot.clickWindow(source.slot, 0, 0);
+  await sleep(80);
+  const need = Math.max(1, Number(ingredient.count) || 1);
+  for (let index = 0; index < need; index += 1) {
+    await bot.clickWindow(destSlot, 1, 0);
+    await sleep(80);
+  }
+  if (window.selectedItem) {
+    await bot.clickWindow(source.slot, 0, 0);
+    await sleep(80);
+  }
+}
+
+async function craftWithWindow(recipe, window, width, height, times) {
+  // 自己点合成格：mineflayer 的 bot.craft 在 1.21.1 上偶尔只点第一排材料就取产物。
+  for (let round = 0; round < times; round += 1) {
+    const inventorySlots = window.slots
+      .slice(window.inventoryStart, window.inventoryEnd)
+      .filter(Boolean);
+    if (inventorySlots.length === 0) {
+      throw new Error('合成窗口里看不到背包内容');
+    }
+    for (let gridSlot = 1; gridSlot <= width * height; gridSlot += 1) {
+      if (!window.slots[gridSlot]) continue;
+      await bot.clickWindow(gridSlot, 0, 0);
+      await sleep(80);
+      const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
+      if (empty === null) throw new Error('背包满了，无法清空合成格');
+      await bot.clickWindow(empty, 0, 0);
+      await sleep(80);
+    }
+    if (recipe.inShape) {
+      for (let y = 0; y < recipe.inShape.length; y += 1) {
+        const row = recipe.inShape[y];
+        for (let x = 0; x < row.length; x += 1) {
+          const ingredient = row[x];
+          if (!ingredient || ingredient.id === -1) continue;
+          await placeIngredient(window, ingredient, 1 + x + width * y);
+        }
+      }
+    } else if (recipe.ingredients) {
+      let gridSlot = 1;
+      for (const ingredient of recipe.ingredients) {
+        await placeIngredient(window, ingredient, gridSlot);
+        gridSlot += 1;
+      }
+    } else {
+      throw new Error('不认识的合成配方');
+    }
+    let output = null;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      output = window.slots[0];
+      if (output) break;
+      await sleep(100);
+    }
+    if (!output) throw new Error('合成格摆好后没有产物');
+    await bot.clickWindow(0, 0, 0);
+    await sleep(80);
+    const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
+    if (empty === null) throw new Error('背包满了，无法取走产物');
+    await bot.clickWindow(empty, 0, 0);
+    await sleep(80);
+    log('合成产出', `${output.name}x${output.count}`);
+  }
+  await syncInventory();
 }
 
 async function placeInventoryBlock(name, label) {
@@ -644,8 +788,14 @@ async function placeInventoryBlock(name, label) {
       const above2 = bot.blockAt(ground.position.offset(0, 2, 0));
       if (above?.boundingBox === 'empty' && above2?.boundingBox === 'empty') {
         const target = above.position;
-        await placeBlock({ block: name, x: target.x, y: target.y, z: target.z });
-        return bot.blockAt(target);
+        try {
+          await placeBlock({ block: name, x: target.x, y: target.y, z: target.z });
+          const placed = bot.blockAt(target);
+          if (placed?.name === name) return placed;
+          log('放置后没看到方块', `${label} (${target.x}, ${target.y}, ${target.z})`);
+        } catch (error) {
+          log('这个位置放不下', `${label} (${target.x}, ${target.y}, ${target.z}): ${error.message}`);
+        }
       }
     }
   }
@@ -656,6 +806,19 @@ async function placeCraftingTable() {
   return placeInventoryBlock('crafting_table', '工作台');
 }
 
+async function recoverPlacedTable(table) {
+  try {
+    await bot.dig(table);
+  } catch (error) {
+    log('回收工作台失败', error.message);
+    return;
+  }
+  for (let attempt = 0; attempt < 10 && countItem('crafting_table') === 0; attempt += 1) {
+    await sleep(400);
+    await collectDrops(4);
+  }
+}
+
 async function craftItem(args) {
   const name = String(args.item || '');
   const count = Math.max(1, Math.min(Number(args.count) || 1, 64));
@@ -663,30 +826,63 @@ async function craftItem(args) {
   if (!item) throw new Error(`未知物品 ${name}`);
   let table = null;
   let placed = false;
-  let recipes = bot.recipesFor(item.id, null, count, null);
+  let recipes = bot.recipesFor(item.id, null, 1, null);
   if (recipes.length === 0) {
-    table = nearbyBlock('crafting_table', 4);
+    // 先找已经放下的工作台；空闲闲逛会把 bot 带离上一轮放下的工作台。
+    table = nearbyBlock('crafting_table', 32);
     if (!table) {
+      if (countItem('crafting_table') === 0) {
+        throw new Error('附近 32 格内没有工作台，背包里也没有');
+      }
       table = await placeCraftingTable();
       placed = true;
     }
-    recipes = bot.recipesFor(item.id, null, count, table);
+    recipes = bot.recipesFor(item.id, null, 1, table);
   }
   if (recipes.length === 0) {
     throw new Error(`没有 ${blockLabel(name)} 的配方或材料不够`);
   }
+  if (table && bot.entity.position.distanceTo(table.position) > 3) {
+    await travelTo(table.position.x, table.position.y, table.position.z, 2);
+  }
   const before = countItem(name);
   const yieldCount = Math.max(1, Number(recipes[0].result?.count) || 1);
   const operations = Math.max(1, Math.ceil(count / yieldCount));
-  await bot.craft(recipes[0], operations, table);
-  const after = countItem(name);
-  if (placed && table) {
+  log(
+    '合成参数',
+    `${name} 已有 ${before}，工作台 ${table ? `(${table.position.x}, ${table.position.y}, ${table.position.z})` : '无'}，` +
+      `现放 ${placed}，距离 ${table ? bot.entity.position.distanceTo(table.position).toFixed(1) : '-'}，` +
+      `配方 id=${recipes[0].result?.id} x${yieldCount}，需台 ${recipes[0].requiresTable}，操作 ${operations}`
+  );
+  if (table) {
+    const window = await bot.openBlock(table);
     try {
-      await bot.dig(table);
-      await sleep(300);
-    } catch (error) {
-      log('回收工作台失败', error.message);
+      await craftWithWindow(recipes[0], window, 3, 3, operations);
+    } finally {
+      try {
+        await bot.closeWindow(window);
+      } catch {
+        // 关窗失败不影响已取走的产物
+      }
+      await sleep(200);
     }
+  } else {
+    await craftWithWindow(recipes[0], bot.inventory, 2, 2, operations);
+  }
+  const after = countItem(name);
+  log(
+    '合成结果',
+    `${name} 背包 ${after}，手持 ${bot.heldItem?.name || '空'}，` +
+      `物品 ${bot.inventory
+        .items()
+        .map((entry) => `${entry.name}x${entry.count}`)
+        .join(',')}`
+  );
+  if (after <= before) {
+    throw new Error(`合成 ${blockLabel(name)} 没有产出`);
+  }
+  if (placed && table) {
+    await recoverPlacedTable(table);
   }
   return `合成 ${after - before} 个 ${blockLabel(name)}`;
 }
