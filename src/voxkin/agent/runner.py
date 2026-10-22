@@ -27,6 +27,19 @@ class StepSpec:
 class Verifier:
     """只读世界状态做机器判定，不调用模型。"""
 
+    @staticmethod
+    def _inventory_count(inventory: dict[str, Any], item: str) -> int:
+        if item == "bed":
+            suffix = "bed"
+            return sum(
+                int(count)
+                for name, count in inventory.items()
+                if name == suffix or name.endswith(f"_{suffix}")
+            )
+        if item == "wool":
+            return max((int(count) for name, count in inventory.items() if name.endswith("_wool")), default=0)
+        return int(inventory.get(item, 0))
+
     def check(self, rule: dict[str, Any], state: dict[str, Any]) -> tuple[bool, str]:
         kind = rule.get("type")
         if kind == "always":
@@ -34,9 +47,9 @@ class Verifier:
         if kind == "inventory":
             inventory = state.get("inventory") or {}
             missing = {
-                item: count - int(inventory.get(item, 0))
+                item: count - self._inventory_count(inventory, item)
                 for item, count in (rule.get("items") or {}).items()
-                if int(inventory.get(item, 0)) < count
+                if self._inventory_count(inventory, item) < count
             }
             return (not missing, "背包满足" if not missing else f"缺少 {missing}")
         if kind == "position":
@@ -69,7 +82,7 @@ class Verifier:
         if rule.get("type") == "inventory":
             inventory = state.get("inventory") or {}
             wanted = rule.get("items") or {}
-            progress = any(int(inventory.get(item, 0)) > 0 for item in wanted)
+            progress = any(self._inventory_count(inventory, item) > 0 for item in wanted)
             return "partial" if progress else "blocked"
         return "blocked"
 

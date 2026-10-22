@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 
 from voxkin.agent.runlog import RunLogger
-from voxkin.agent.runner import StepSpec, TaskRunner
+from voxkin.agent.runner import StepSpec, TaskRunner, Verifier
 from voxkin.agent.tasks import TaskStore
 
 
@@ -12,6 +12,32 @@ def make_store(tmp_path: Path) -> TaskStore:
     store = TaskStore(tmp_path / "tasks.db")
     store.initialize()
     return store
+
+
+def test_inventory_verifier_counts_colored_wool_and_beds() -> None:
+    verifier = Verifier()
+
+    assert verifier.check(
+        {"type": "inventory", "items": {"wool": 3}},
+        {"inventory": {"red_wool": 1, "blue_wool": 2}},
+    ) == (False, "缺少 {'wool': 1}")
+    assert verifier.check(
+        {"type": "inventory", "items": {"wool": 3}},
+        {"inventory": {"red_wool": 1, "blue_wool": 3}},
+    ) == (True, "背包满足")
+    assert verifier.check(
+        {"type": "inventory", "items": {"bed": 1}},
+        {"inventory": {"white_bed": 1}},
+    ) == (True, "背包满足")
+
+
+def test_inventory_verifier_reports_colored_item_progress() -> None:
+    verifier = Verifier()
+
+    assert verifier.classify(
+        {"type": "inventory", "items": {"wool": 3}},
+        {"inventory": {"red_wool": 1}},
+    ) == "partial"
 
 
 def test_runner_completes_steps(tmp_path: Path) -> None:

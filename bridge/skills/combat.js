@@ -60,6 +60,10 @@ const MOB_LABELS = {
   blaze: '烈焰人',
   enderman: '末影人',
 };
+const SHEEP_COLORS = [
+  'white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink', 'gray',
+  'light_gray', 'cyan', 'purple', 'blue', 'brown', 'green', 'red', 'black',
+];
 // 远程怪：它们不用靠近就能打到 bot，威胁权重更高。
 const RANGED_THREATS = new Set([
   'blaze',
@@ -213,6 +217,135 @@ function findHuntable(ctx, speciesList, radius) {
   }
   const picked = pickHuntTarget(candidates, origin);
   return picked ? picked.entity : null;
+}
+
+function sheepWoolState(ctx, sheep) {
+  const keys = ctx.registry?.entitiesByName?.sheep?.metadataKeys;
+  if (!Array.isArray(keys)) return null;
+  const woolIndex = keys.indexOf('wool');
+  const babyIndex = keys.indexOf('baby');
+  const metadata = sheep?.metadata;
+  if (woolIndex < 0 || !metadata || typeof metadata !== 'object') return null;
+  const wool = Number(metadata[woolIndex]);
+  if (!Number.isInteger(wool)) return null;
+  return {
+    color: SHEEP_COLORS[wool & 0x0f],
+    sheared: (wool & 0x10) !== 0,
+    baby: babyIndex >= 0 && metadata[babyIndex] === true,
+  };
+}
+
+function sheepCandidates(ctx, radius, color, processed) {
+  const origin = ctx.bot.entity.position;
+  const candidates = [];
+  for (const sheep of Object.values(ctx.bot.entities || {})) {
+    if (!sheep || sheep.name !== 'sheep' || !sheep.position || sheep.isValid === false) continue;
+    if (processed.has(sheep.id)) continue;
+    const state = sheepWoolState(ctx, sheep);
+    if (!state || state.sheared || state.baby || !state.color || (color && state.color !== color)) {
+      continue;
+    }
+    const distance = origin.distanceTo(sheep.position);
+    if (distance > radius) continue;
+    candidates.push({ sheep, color: state.color, distance });
+  }
+  return candidates.sort((left, right) => left.distance - right.distance);
+}
+
+function pickSheepColor(ctx, candidates, requestedColor, count) {
+  if (requestedColor !== 'auto') return requestedColor;
+  const available = SHEEP_COLORS
+    .map((color) => ({
+      color,
+      held: ctx.countItem(`${color}_wool`),
+      sheep: candidates.filter((item) => item.color === color).length,
+    }))
+    .filter((item) => item.held > 0 || item.sheep > 0)
+    .sort((left, right) =>
+      Number(right.held >= count) - Number(left.held >= count) ||
+      Number(right.held + right.sheep >= count) - Number(left.held + left.sheep >= count) ||
+      right.held - left.held ||
+      right.sheep - left.sheep,
+    );
+  return available[0]?.color || '';
+}
+
+async function shearSheep(args, ctx) {
+  const bot = ctx.bot;
+  if (!bot || !bot.entity) throw new Error('bot 还没进入世界，没有办法剪羊毛');
+  const count = Math.max(1, Math.min(Math.floor(Number(args.count) || 3), 16));
+  const radius = Math.max(4, Math.min(Number(args.radius) || 48, 64));
+  const requestedColor = String(args.color || 'auto').trim().toLowerCase();
+  if (requestedColor !== 'auto' && !SHEEP_COLORS.includes(requestedColor)) {
+    throw new Error(`不知道羊毛颜色 ${requestedColor}`);
+  }
+
+  const initialCandidates = sheepCandidates(
+    ctx,
+    radius,
+    requestedColor === 'auto' ? '' : requestedColor,
+    new Set(),
+  );
+  const color = pickSheepColor(ctx, initialCandidates, requestedColor, count);
+  if (!color) throw new Error(`附近 ${radius} 格内没有可剪的羊，或羊的颜色状态不可读`);
+  const itemName = `${color}_wool`;
+  const initial = ctx.countItem(itemName);
+  if (initial >= count) {
+    return {
+      detail: `背包里已经有 ${initial} 个${ctx.itemLabel(itemName)}，够 ${count} 个`,
+      status: 'succeeded',
+    };
+  }
+  const shears = bot.inventory.items().find((item) => item.name === 'shears');
+  if (!shears) throw new Error('背包里没有剪刀，先合成剪刀再剪羊毛');
+  if (typeof bot.activateEntity !== 'function') throw new Error('mineflayer 没有提供实体交互接口');
+
+  const processed = new Set();
+  const deadline = Date.now() + 180000;
+  let shorn = 0;
+  while (ctx.countItem(itemName) < count && Date.now() < deadline) {
+    if (ctx.interrupted) throw new Error('被新的指令打断');
+    if (Number(bot.health ?? 20) <= 8) throw new Error(`血量不足（血量 ${bot.health}），已中止剪羊毛`);
+    const candidates = sheepCandidates(ctx, radius, color, processed);
+    const target = candidates[0]?.sheep;
+    if (!target) {
+      if (shorn === 0) throw new Error(`附近 ${radius} 格内没有可剪的${color}羊`);
+      throw new Error(`羊毛不够，还差 ${count - ctx.countItem(itemName)} 个${ctx.itemLabel(itemName)}，附近已没有可剪的${color}羊`);
+    }
+    await ctx.approach(target);
+    if (ctx.interrupted) throw new Error('被新的指令打断');
+    if (Number(bot.health ?? 20) <= 8) throw new Error(`血量不足（血量 ${bot.health}），已中止剪羊毛`);
+    if (target.isValid === false) continue;
+    if (bot.entity.position.distanceTo(target.position) > 3.5) {
+      processed.add(target.id);
+      continue;
+    }
+    const before = ctx.countItem(itemName);
+    const stateBefore = sheepWoolState(ctx, target);
+    processed.add(target.id);
+    await bot.equip(shears, 'hand');
+    await bot.activateEntity(target);
+    await ctx.sleep(600);
+    if (typeof ctx.collectDrops === 'function') await ctx.collectDrops(6, itemName);
+    if (ctx.interrupted) throw new Error('被新的指令打断');
+    if (typeof ctx.syncInventory === 'function') await ctx.syncInventory();
+    const gained = ctx.countItem(itemName) - before;
+    if (gained <= 0) {
+      const stateAfter = sheepWoolState(ctx, target);
+      const result = stateBefore && stateAfter?.sheared
+        ? '羊已经剪过，但背包没有增加羊毛'
+        : '剪刀交互后羊毛数量没有增加';
+      throw new Error(`${result}（检查剪刀耐久、背包空间和服务端状态）`);
+    }
+    shorn += 1;
+  }
+
+  const total = ctx.countItem(itemName);
+  if (total < count) throw new Error(`剪羊毛超时，还差 ${count - total} 个${ctx.itemLabel(itemName)}`);
+  return {
+    detail: `剪了 ${shorn} 只羊，获得 ${total - initial} 个${ctx.itemLabel(itemName)}，背包共 ${total} 个`,
+    status: 'succeeded',
+  };
 }
 
 // 末地水晶实体在不同版本里名字可能带前缀。
@@ -1060,6 +1193,16 @@ async function equipShieldSkill(args, ctx) {
 }
 
 export const skills = {
+  shear_sheep: {
+    description:
+      '用剪刀从成年且未剪过的羊身上剪取同色羊毛；逐只验证背包增量，按需靠近并跳过幼羊和已剪过的羊。',
+    parameters: [
+      { name: 'count', type: 'number', required: false, default: 3, description: '目标颜色羊毛总数，范围 1-16。' },
+      { name: 'radius', type: 'number', required: false, default: 48, description: '搜索羊的半径，范围 4-64 格。' },
+      { name: 'color', type: 'string', required: false, default: 'auto', description: '羊毛颜色；auto 会优先补齐背包已有颜色，否则选择附近数量最多的颜色。' },
+    ],
+    handler: shearSheep,
+  },
   hunt_animal: {
     description:
       '狩猎牛、猪、羊等被动生物拿生肉：追到近战距离挥剑，等它掉落肉再走过去捡；血量太低会撤退，天快黑会先提醒回去。',

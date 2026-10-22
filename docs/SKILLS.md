@@ -2,7 +2,7 @@
 
 本文是技能清单的事实来源。技能名、分类、类型、参数、失败条件、可否取消、验收描述以 `bridge/skills/manifest.json` 为准；真实行为以 `bridge/minecraft_bridge.js` 为准；模型看到的工具定义以 `src/voxkin/agent/tools.py` 为准。
 
-> 续作状态（2026-10-22 21:50）：`bridge/skills/` 现有 36 条模块技能，清单总数 57；`src/voxkin/agent/plans.py` 已补 S0–S6 共 53 步；新增 `bridge/skills/end.js` 的 `throw_eye`、`activate_end_portal`、`fight_dragon`、`return_home`。`pytest tests -q` 为 245 passed。S1 已在同一世界接 S0 跑通 1 次 5/5（78.9 秒），证据见 `docs/evidence/S1_NORMAL_20261022.md`；S2–S6 与其余模块技能尚无真实服务器证据，下面 21 条基线明细保留为拆分前快照。
+> 历史审计基线（2026-10-22 21:50）：当时记录 36 条模块技能、57 条清单技能与 245 个 Python 测试；下方 21 条基线明细保留为拆分前快照。当前状态（2026-10-23）：清单已有 58 条（21 个内建 + 37 个模块技能），Python 测试 270 passed，剪羊技能另有 8 个桥接模拟测试。S2 剪羊与铁矿采集路线仍无真实服务器证据；S1 实机证据见 `docs/evidence/S1_NORMAL_20261022.md`。
 
 ## 0. 基线与口径
 
@@ -71,7 +71,7 @@ B 级观察：`runs/<stage>-<时间戳>.json` 里的 `passed`、`detail`；同�
 
 | 项 | 数量 | 依据 |
 | --- | --- | --- |
-| 清单技能总数 | 57 | `bridge/skills/manifest.json`，21 个内建 + 36 个模块技能 |
+| 清单技能总数 | 58 | `bridge/skills/manifest.json`，21 个内建 + 37 个模块技能（2026-10-23） |
 | 桥接动作分支数 | 21 | `bridge/minecraft_bridge.js` 的内建 `case`，模块技能走注册表 default 分支 |
 | Core 侧工具定义数 | 54 | `src/voxkin/agent/tools.py` 的 `build_tools()`，`chat` 不在其中 |
 | 阶段计划条数 | 53 | `src/voxkin/agent/plans.py`，S0–S6 |
@@ -83,14 +83,14 @@ B 级观察：`runs/<stage>-<时间戳>.json` 里的 `passed`、`detail`；同�
 | --- | --- | --- |
 | 基础类 | 13 | observe、inventory、locate_block、locate_entity、look_at_player、goto、goto_block、follow_player、come_to_player、stop、eat、sleep、chat |
 | 实用类 | 8 | attack_nearest、attack_target、collect_blocks、break_block、place_block、pickup_items、craft、smelt |
-| 专精类 | 34 | 采集、合成、生存、战斗、移动、箱子、下界、末地模块；逐条见 `bridge/skills/manifest.json` |
+| 专精类 | 37 | 采集、合成、生存、战斗、移动、箱子、下界、末地模块；逐条见 `bridge/skills/manifest.json` |
 
 ### 1.3 按类型
 
 | 类型 | 数量 | 技能 |
 | --- | --- | --- |
 | sense | 6 | observe、inventory、locate_block、locate_entity、find_diamond、list_chest |
-| act | 40 | 基础动作与模块技能，逐条见 `bridge/skills/manifest.json` |
+| act | 43 | 基础动作与模块技能，逐条见 `bridge/skills/manifest.json` |
 | path | 6 | goto、goto_block、follow_player、come_to_player、collect_blocks、pickup_items |
 | wait | 2 | sleep、smelt |
 | voice | 1 | chat |
@@ -630,15 +630,15 @@ flowchart TD
 | 真实服务器 | `docs/evidence/S0_NORMAL_20261022.md`：同一套环境，Normal 难度，怪物生成开启，`.\.venv\Scripts\python.exe scripts\run_stage.py --stage S0 --runs 10 --difficulty normal` 连续 10 次全部 5/5 通过，用时 34.3 到 38.5 秒，P50 36.4 秒。阶段计划是固定规则，没有调用 LLM。这两条证据覆盖 `collect_blocks` 与 `craft`。 |
 | 真实服务器 | `docs/evidence/S1_NORMAL_20261022.md`：同一评测世界接在 S0 后跑 S1，Paper 1.21.1-133、Normal、seed 20261022，5/5 步、78.9 秒；`mine_collect` 与 3 次 `craft` 均一次成功。阶段计划是固定规则，没有调用 LLM。 |
 | 真实模型 | `docs/BENCHMARK_RESULTS.md:93`：真实模型在游戏内聊天里返回 `collect_blocks` 调用，桥接执行并回报「挖到 3 个 泥土」。 |
-| 未验证 | 除 S0 的 `collect_blocks`/`craft` 与 S1 的 `mine_collect`/`craft` 外，其余内建技能与 36 个模块技能没有真实服务器运行记录；S2–S6 的 41 步计划也没有实跑。`docs/STATUS.md` 记录客户端 Mod 只完成编译与协议实现，没有在真实 Minecraft 客户端验证。 |
+| 未验证 | 除 S0 的 `collect_blocks`/`craft` 与 S1 的 `mine_collect`/`craft` 外，其余内建技能与 37 个模块技能没有真实服务器运行记录；S2–S6 的阶段计划也没有实跑。`shear_sheep` 只有模拟 bot 测试，尚无真实服务器证据。`docs/STATUS.md` 记录客户端 Mod 只完成编译与协议实现，没有在真实 Minecraft 客户端验证。 |
 
 ### 7.3 文档与代码的偏差
 
 | 项 | 现状 | 证据 |
 | --- | --- | --- |
-| 技能清单来源 | 模块文件已落地：`combat.js`、`craft.js`、`gather.js`、`movement.js`、`nether.js`、`storage.js`、`survival.js`、`end.js` 与 `manifest.js`、`registry.js`；清单 55 条。`README.md` 的 53 条仍是设计稿，实际以 `manifest.json` 为准 | `bridge/skills/` 目录 |
+| 技能清单来源 | 模块文件已落地：`combat.js`、`craft.js`、`gather.js`、`movement.js`、`nether.js`、`storage.js`、`survival.js`、`end.js` 与 `manifest.js`、`registry.js`；当前清单 58 条（21 个内建 + 37 个模块技能）。以 `manifest.json` 为准 | `bridge/skills/` 目录 |
 | 清单驱动的 dispatch | `bridge/skills/registry.js` 已存在，`runAction` 的 default 分支查注册表；仍有 21 个内建 `case` 分支 | `bridge/minecraft_bridge.js` |
 | 工具定义来源 | `src/voxkin/agent/tools.py` 已改为 `build_tools()`，从清单生成；`src/voxkin/pipeline.py` 使用 `MINECRAFT_TOOLS` | `src/voxkin/pipeline.py` |
-| 测试数量 | 本次实跑 245 passed；`docs/MILESTONE.md` 与 `docs/plans/EVALUATION.md` 已同步为 245 | 本次实跑输出 |
+| 测试数量 | 2026-10-23 本次实跑 270 个 Python 测试通过；剪羊技能另有 8 个 Node 模拟测试 | 本次实跑输出 |
 | 阶段模板 | `PLANS` 已有 S0–S6 共 53 步；S1–S6 未实跑 | `src/voxkin/agent/plans.py` |
 | 阶段产出 | S2 产出 `bed` 与 `cooked_beef`，S3 产出 `shield`，S4 产出 `diamond_pickaxe`，计划已按这些产出写死；S6 仍靠 `ender_dragon_killed` 事件判定，事件上报未实现，当前只有 `fight_dragon` 的动作层成功 | `src/voxkin/agent/progress.py` |

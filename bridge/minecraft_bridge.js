@@ -486,6 +486,9 @@ function buildSkillContext() {
     swimToShore,
     describeEntity,
     INDEPENDENT,
+    get interrupted() {
+      return interrupted;
+    },
     get registry() {
       return bot.registry;
     },

@@ -92,7 +92,7 @@ TOOL_SYSTEM_HINT = (
     "要知道周围情况用 observe；找方块用 locate_block；找玩家或生物用 locate_entity；饿了用 eat；晚上用 sleep 睡觉。"
     "要走远路用 safe_travel；要下矿道用 deep_mine 或 strip_mine；找钻石用 find_diamond；"
     "要过夜用 sleep_safe；在被封住的庇护所里等天亮用 wait_for_day，天亮后用 leave_shelter 挖开出口；血量太低用 flee_low_health；带盾用 equip_shield；缺庇护所用 make_shelter。"
-    "要打猎用 hunt_animal；要打末影人用 hunt_enderman；要打烈焰人用 fight_blaze；打末影龙水晶用 break_crystal。要找要塞用 throw_eye；要激活末地门用 activate_end_portal；要打末影龙用 fight_dragon；龙死后用 return_home 回主世界。"
+    "要打猎用 hunt_animal；要剪羊毛用 shear_sheep（需要剪刀）；要打末影人用 hunt_enderman；要打烈焰人用 fight_blaze；打末影龙水晶用 break_crystal。要找要塞用 throw_eye；要激活末地门用 activate_end_portal；要打末影龙用 fight_dragon；龙死后用 return_home 回主世界。"
     "要存物资用 store_items 或 checkpoint_stock；要取物资用 withdraw_items；要找箱子用 list_chest。"
     "箱子满了或者材料不够时，动作结果会说明还差多少，按结果调整数量再来一次。"
     "玩家问你是谁、在哪、在做什么、为什么，先用一句话直接回答，不要调用工具。"

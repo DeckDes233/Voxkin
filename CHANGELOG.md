@@ -2,6 +2,12 @@
 
 ## Unreleased — 2026-10-22
 
+### S2 羊毛采集
+
+- 新增 `shear_sheep`，结合 Mineflayer 的 `metadataKeys` 解码羊的颜色、是否剪过和幼年状态；逐只剪羊、收集掉落并检查背包增量，支持取消与低血量中止。
+- `S2_STEPS` 改为先备煤烤肉、挖铁并补充熔炼燃料、制作剪刀、剪取同色羊毛后合成床；Verifier 检查单色羊毛数量与床库存。
+- 新增 8 个 Node 模拟测试；完整 Python 测试为 270 passed。剪羊与 S2 路线尚未在真实 Minecraft 服务器验证。
+
 ### 技能层
 
 - 新增 `bridge/skills/manifest.js` 与 `bridge/skills/manifest.json`：57 个技能（21 个桥接内建 + 36 个模块技能）的单一事实来源，记录参数、前置条件、观察项、执行步骤、后置条件、失败条件、恢复策略、超时、可打断性与判定依据，由 `scripts/dump_manifest.js` 导出。

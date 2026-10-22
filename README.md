@@ -37,12 +37,12 @@ English documentation: [README.en.md](README.en.md)。英文版这一轮没有�
 
 | 指标 | 现状 | 出处 |
 | --- | --- | --- |
-| 自动化测试 | 265 个通过 | [docs/STATUS.md](docs/STATUS.md) |
+| 自动化测试 | 270 个 Python 测试通过；剪羊桥接另有 8 个模拟测试 | [docs/STATUS.md](docs/STATUS.md) |
 | 自主阶段 S0 | Normal 难度连续 10 次 5/5 步，P50 36.4 秒 | [docs/evidence/S0_NORMAL_20261022.md](docs/evidence/S0_NORMAL_20261022.md) |
-| 桥接技能 | 57 个（21 个内建 + 36 个模块），参数与失败条件登记在清单里 | [bridge/skills/manifest.json](bridge/skills/manifest.json) |
+| 桥接技能 | 58 个（21 个内建 + 37 个模块），参数与失败条件登记在清单里 | [bridge/skills/manifest.json](bridge/skills/manifest.json) |
 | 首次可听延迟 | 本地测试模型 964 毫秒，真实模型 3871 毫秒 | [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) |
 | 语音识别 | faster-whisper small，CPU int8，9.88 秒音频约 2.6 秒 | [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) |
-| 游戏内动作 | 57 个技能，结果由桥接回报，失败如实上报 | [docs/SKILLS.md](docs/SKILLS.md) |
+| 游戏内动作 | 58 个已登记技能，结果由桥接回报；S2 剪羊新路线尚未实机验证 | [docs/SKILLS.md](docs/SKILLS.md) |
 | 客户端音频 Mod | 构建通过，未在真实客户端验证 | [docs/STATUS.md](docs/STATUS.md) |
 
 这些数字的事实来源是 [docs/STATUS.md](docs/STATUS.md) 与 [docs/evidence/](docs/evidence/)，本文只做摘录。
@@ -704,7 +704,7 @@ Studio 控制台改配置需要重启 Core 才生效。
 | [docs/ENTER_MINECRAFT_CN.md](docs/ENTER_MINECRAFT_CN.md) | 从开服务器到语音、动作、客户端 Mod 的完整步骤，含 YSM 换外观 |
 | [docs/STATUS.md](docs/STATUS.md) | 已完成、已知问题、阻塞、下一步 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 组件划分、数据流、时序、故障恢复 |
-| [docs/SKILLS.md](docs/SKILLS.md) | 57 个技能的参数、失败条件、可否取消、验收分级与缺口清单 |
+| [docs/SKILLS.md](docs/SKILLS.md) | 技能的参数、失败条件、可否取消、验收分级与缺口清单（清单现有 58 项） |
 | [docs/MILESTONE.md](docs/MILESTONE.md) | 独立通关的完成定义与当前状态 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 后续优先级 |
 | [docs/plans/INDEPENDENT_RUN_ROADMAP.md](docs/plans/INDEPENDENT_RUN_ROADMAP.md) | S0 到 S6 的阶段计划 |

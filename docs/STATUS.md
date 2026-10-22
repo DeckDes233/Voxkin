@@ -1,6 +1,6 @@
 # 当前状态
 
-更新时间：2026-10-22 23:40（Asia/Shanghai）。
+更新时间：2026-10-23（Asia/Shanghai）。
 
 ## 已完成
 
@@ -13,7 +13,7 @@
 | 端点检测 | 能量 VAD，合成音频测试 | 5 个测试用例 |
 | 桥接 | WebSocket 协议、动作派发、mineflayer 客户端 | 真实 WebSocket 集成测试；Paper 1.21.1 上完成聊天到动作的端到端验证 |
 | 自主任务 | TaskRunner、checkpoint、`/api/run/*`；S0 空背包到木镐在 Normal 难度下连续 10 次 5/5；S1 石镐/石剑/熔炉在同一世界接 S0 跑通 1 次 5/5（78.9 秒） | 固定 seed 重置世界，JSONL 逐步判定；证据见 `docs/evidence/S0_NORMAL_20261022.md` 与 `docs/evidence/S1_NORMAL_20261022.md` |
-| 技能清单 | `bridge/skills/manifest.js` 与导出的 `manifest.json`：57 个技能（21 个桥接内建 + 36 个模块技能）的参数、前置条件、后置条件、失败条件、恢复策略、超时与判定依据 | `scripts/merge_module_skills.js` 合并、`scripts/dump_manifest.js` 导出；`tests/test_skill_manifest.py` 校验清单、桥接分支与 Core 工具定义一致 |
+| 技能清单 | `bridge/skills/manifest.js` 与导出的 `manifest.json`：58 个技能（21 个桥接内建 + 37 个模块技能）；新增 `shear_sheep`，S2 计划改用剪羊毛获取羊毛 | `scripts/dump_manifest.js` 导出；Python 清单一致性测试通过，`node --test bridge/tests/*.test.js` 8 项通过 |
 | 动作状态 | accepted/running/succeeded/partial/failed/cancelled/disconnected/blocked 八档状态贯穿协议、派发、桥接与运行记录 | 每步记录 `status`、`skill_id`、`action_id`；`tests/test_action_status.py` 覆盖 |
 | Studio | 状态、试听、事件流、延迟表、配置、受管服务、日志、麦克风启停 | HTTP 接口实测；服务管理用真实子进程测试 |
 | 基准 | `voxkin bench` 输出 JSON 与分位数；真实模型与 Minecraft 端到端计时 | `docs/BENCHMARK_RESULTS.md` |
@@ -30,7 +30,7 @@
 ## 测试结果
 
 ```
-265 passed
+270 passed, 48 warnings
 ```
 
 覆盖：文本分句与过滤、时间线与指标、配置加载与保存、端点检测、对话管线（含打断、语音快路、缓存确认语、重复调用去重）、动作派发、桥接 WebSocket 协议、聊天触发回合、动作与语音并行完成、外部服务启停与健康检查、技能清单一致性、结构化动作状态（含部分完成与 Runner 终态判定）、方块词表与技能清单的一致性。
@@ -49,8 +49,9 @@
 8. 记忆压缩依赖模型调用，离线时只保留原始对话，不生成摘要。
 9. mineflayer 的 `clickWindow` 在 1.21.1 上点完合成格会等服务端重发结果槽位，凑不齐配方时必然等满 20 秒；桥接已改为自己发 `window_click` 包并推演本地窗口状态，10 次回归均通过。
 10. S0 在 Normal 难度下已连续 10 次 5/5、P50 36.4 秒；S1 已在 Node 24 上完成 3/3 轮 S0→S1 白天链式回归（S1 为 95.0、78.9、78.8 秒），但 3 夜生存、换种子与夜间怪物场景尚未回归。
-11. 技能清单已扩展到 57 条（36 条模块技能），真实服务器证据只覆盖 S0 的 `collect_blocks`/`craft` 与 S1 的 `mine_collect`/`craft`；S2–S6 计划与其余模块技能都没有实跑，不能据清单存在就判定可用。
+11. 真实服务器证据只覆盖 S0 的 `collect_blocks`/`craft` 与 S1 的 `mine_collect`/`craft`；S2–S6 计划与其余模块技能都没有实跑，不能据清单存在就判定可用。
 12. 断桥已从 `cancelled` 拆成 `disconnected`，任务保留 checkpoint；Node 22.23.2 在采集阶段出现过 V8 原生崩溃，当前评测改用 Node 24.19.0，连续 3 轮没有复现。
+13. 新增的 `shear_sheep` 已通过模拟 bot 的成功、无产出、缺剪刀、幼羊跳过、颜色选择、取消和羊不足测试；S2 已改为制作剪刀并剪羊，羊毛与床的计划内判定读取背包。此技能和新版 S2 尚无真实服务器运行证据；铁矿采集仍依赖 `mine_collect` 在 64 格内找到可达矿石。
 
 ## 阻塞与前置条件
 
@@ -64,4 +65,4 @@
 
 1. S1 已完成 3/3 轮白天链式回归；下一步做真实夜间场景，先修可容纳床的封闭庇护所与 `sleep_safe`，再跑 3 夜。
 2. 做死亡重生与掉落物回收，把 `/kill` 后的继续跑通到 S1 checkpoint；当前 `TaskRunner` 的恢复只覆盖进程级，不覆盖死亡掉落。
-3. 用真实服务器逐段验收 S2–S6，优先补 S2 的羊毛采集与 S5 的燧石/黑曜石获取缺口；不要直接跳到末地。
+3. 用真实服务器逐段验收 S2–S6，首先验证 S2 铁矿采集、剪羊、床与庇护所链路；再补 S5 的燧石/黑曜石获取缺口，不要直接跳到末地。

@@ -107,3 +107,83 @@ def test_s2_does_not_depend_on_trees_after_s1() -> None:
 def test_s2_hunts_inside_the_supported_radius() -> None:
     hunt = next(step for step in PLANS["S2"] if step.tool == "hunt_animal")
     assert hunt.arguments["radius"] == 64
+
+
+def test_s2_resource_steps_verify_wool_and_bed_inventory() -> None:
+    shears = next(
+        step
+        for step in PLANS["S2"]
+        if step.tool == "craft" and step.arguments.get("item") == "shears"
+    )
+    wool = next(step for step in PLANS["S2"] if step.tool == "shear_sheep")
+    bed = next(step for step in PLANS["S2"] if step.tool == "craft_bed")
+
+    assert shears.arguments["item"] == "shears"
+    assert wool.arguments["count"] == 3
+    assert wool.timeout_s == 180
+    assert wool.verify["items"] == {"wool": 3}
+    assert bed.verify["items"] == {"bed": 1}
+
+
+def test_s2_shears_sheep_instead_of_hunting_them_for_wool() -> None:
+    sheep_steps = [
+        step
+        for step in PLANS["S2"]
+        if step.tool == "hunt_animal" and step.arguments.get("species") == "sheep"
+    ]
+    steps = PLANS["S2"]
+
+    assert sheep_steps == []
+    iron = next(
+        step
+        for step in PLANS["S2"]
+        if step.tool == "mine_collect" and step.arguments.get("block") == "iron_ore"
+    )
+    coal_steps = [
+        step
+        for step in PLANS["S2"]
+        if step.tool == "mine_collect" and step.arguments.get("block") == "coal_ore"
+    ]
+    fuel = next(
+        step
+        for step in PLANS["S2"]
+        if step.tool == "smelt_batch" and step.arguments.get("item") == "raw_iron"
+    )
+    shears = next(
+        step
+        for step in PLANS["S2"]
+        if step.tool == "craft" and step.arguments.get("item") == "shears"
+    )
+    wool = next(step for step in PLANS["S2"] if step.tool == "shear_sheep")
+
+    assert iron.arguments["count"] == 2
+    assert [step.arguments["count"] for step in coal_steps] == [2, 2]
+    assert fuel.arguments["item"] == "raw_iron"
+    assert shears.arguments["item"] == "shears"
+    assert steps.index(fuel) < steps.index(shears) < steps.index(wool)
+
+
+def test_s2_preserves_enough_coal_to_cook_food_and_smelt_iron() -> None:
+    steps = PLANS["S2"]
+    coal_indices = [
+        index
+        for index, step in enumerate(steps)
+        if step.tool == "mine_collect" and step.arguments.get("block") == "coal_ore"
+    ]
+    food_smelt = next(
+        index for index, step in enumerate(steps)
+        if step.tool == "smelt_batch" and step.arguments.get("item") == "beef"
+    )
+    iron_mine = next(
+        index for index, step in enumerate(steps)
+        if step.tool == "mine_collect" and step.arguments.get("block") == "iron_ore"
+    )
+    iron_smelt = next(
+        index for index, step in enumerate(steps)
+        if step.tool == "smelt_batch" and step.arguments.get("item") == "raw_iron"
+    )
+
+    assert len(coal_indices) == 2
+    assert steps[coal_indices[0]].arguments["count"] == 2
+    assert steps[coal_indices[1]].arguments["count"] == 2
+    assert coal_indices[0] < food_smelt < iron_mine < coal_indices[1] < iron_smelt
