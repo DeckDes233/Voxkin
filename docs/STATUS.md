@@ -12,9 +12,12 @@
 | 识别 | faster-whisper small，中文识别；模板幻觉、重复循环与低置信片段过滤 | 本机实测；17 个过滤测试；5 秒静音返回空文本 |
 | 端点检测 | 能量 VAD，合成音频测试 | 5 个测试用例 |
 | 桥接 | WebSocket 协议、动作派发、mineflayer 客户端 | 真实 WebSocket 集成测试；Paper 1.21.1 上完成聊天到动作的端到端验证 |
-| 自主任务 | TaskRunner、checkpoint、`/api/run/*`；S0 空背包到木镐在 Normal 难度下连续 10 次 5/5；S1 石镐/石剑/熔炉在同一世界接 S0 跑通 1 次 5/5（78.9 秒） | 固定 seed 重置世界，JSONL 逐步判定；证据见 `docs/evidence/S0_NORMAL_20261022.md` 与 `docs/evidence/S1_NORMAL_20261022.md` |
-| 技能清单 | `bridge/skills/manifest.js` 与导出的 `manifest.json`：58 个技能（21 个桥接内建 + 37 个模块技能）；新增 `shear_sheep`，S2 计划改用剪羊毛获取羊毛 | `scripts/dump_manifest.js` 导出；Python 清单一致性测试通过，`node --test bridge/tests/*.test.js` 8 项通过 |
-| 动作状态 | accepted/running/succeeded/partial/failed/cancelled/disconnected/blocked 八档状态贯穿协议、派发、桥接与运行记录 | 每步记录 `status`、`skill_id`、`action_id`；`tests/test_action_status.py` 覆盖 |
+| 自主任务 | TaskRunner、checkpoint、`/api/run/*`；新增显式续跑、恢复时按世界状态对账、死亡中断落盘、重生后的安全恢复 | Python 全量测试；续跑端点拒绝断桥/过期状态/死亡状态；仲裁器在重连新鲜状态抵达前阻止世界写入；死亡恢复自动化测试通过，尚未做 Minecraft 实机死亡恢复验收 |
+| 死亡恢复 | Bridge 本地封锁动作、清空队列并中断当前动作；death/respawn 事件带生命周期 ID，经 Core ACK 后移出待发队列，断线重连会重放；Core 取消仲裁动作并清空断桥世界状态；Minecraft bot 掉线会单独让世界状态失效；重生后仅当新鲜世界状态能证明检查点步骤完成才自动续跑 | WebSocket、Bridge 生命周期 helper、RunManager 与恢复 API 自动化测试；不可验证步骤 fail-closed；未做真实服务器死亡恢复与掉落物回收验收 |
+| 生存技能 | 庇护所搭建验收地板/墙顶结构并响应打断；离开庇护所确认已走到墙外；`sleep_safe` 等待 Mineflayer 入睡后再等醒来并核验时间推进，支持取消唤醒 | Node 模拟世界测试 19 项；没有 Minecraft 夜间实机验证 |
+| S0/S1 实机证据 | S0 空背包到木镐在 Normal 难度下连续 10 次 5/5；S1 接 S0 跑通 1 次 5/5（78.9 秒） | 固定 seed 重置世界，JSONL 逐步判定；证据见 `docs/evidence/S0_NORMAL_20261022.md` 与 `docs/evidence/S1_NORMAL_20261022.md` |
+| 技能清单 | `bridge/skills/manifest.js` 与导出的 `manifest.json`：58 个技能（21 个桥接内建 + 37 个模块技能）；新增 `shear_sheep`，S2 计划改用剪羊毛获取羊毛 | `scripts/dump_manifest.js` 导出；Python 清单一致性测试通过，`node --test bridge/tests/*.test.js` 19 项通过 |
+| 动作状态 | accepted/running/succeeded/partial/failed/cancelled/disconnected/blocked/dead 九档状态贯穿协议、派发、桥接与运行记录 | 每步记录 `status`、`skill_id`、`action_id`；`tests/test_action_status.py` 覆盖 |
 | Studio | 状态、试听、事件流、延迟表、配置、受管服务、日志、麦克风启停 | HTTP 接口实测；服务管理用真实子进程测试 |
 | 基准 | `voxkin bench` 输出 JSON 与分位数；真实模型与 Minecraft 端到端计时 | `docs/BENCHMARK_RESULTS.md` |
 | 真实模型 | OpenCode Go（`deepseek-v4.1-flash`）流式对话、工具调用与延迟测量 | 3 轮基准首次可听 3134.9–4434.9 ms；游戏内触发 `collect_blocks` 成功 |
@@ -30,7 +33,7 @@
 ## 测试结果
 
 ```
-270 passed, 48 warnings
+297 passed, 54 warnings
 ```
 
 覆盖：文本分句与过滤、时间线与指标、配置加载与保存、端点检测、对话管线（含打断、语音快路、缓存确认语、重复调用去重）、动作派发、桥接 WebSocket 协议、聊天触发回合、动作与语音并行完成、外部服务启停与健康检查、技能清单一致性、结构化动作状态（含部分完成与 Runner 终态判定）、方块词表与技能清单的一致性。
@@ -63,6 +66,6 @@
 
 ## 下一步三件事
 
-1. S1 已完成 3/3 轮白天链式回归；下一步做真实夜间场景，先修可容纳床的封闭庇护所与 `sleep_safe`，再跑 3 夜。
-2. 做死亡重生与掉落物回收，把 `/kill` 后的继续跑通到 S1 checkpoint；当前 `TaskRunner` 的恢复只覆盖进程级，不覆盖死亡掉落。
+1. S1 已完成 3/3 轮白天链式回归；庇护所与 `sleep_safe` 的代码侧模拟测试已补齐，下一步在专用世界验证真实夜间睡眠与 3 夜生存。
+2. 在专用世界实测 `/kill` 后的动作中断、重生与检查点续跑；当前代码不会自动找回死亡掉落物，需先验证安全的掉落点观测与回收策略。
 3. 用真实服务器逐段验收 S2–S6，首先验证 S2 铁矿采集、剪羊、床与庇护所链路；再补 S5 的燧石/黑曜石获取缺口，不要直接跳到末地。

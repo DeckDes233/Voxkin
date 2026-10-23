@@ -1,7 +1,9 @@
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import numpy as np
 import pytest
@@ -13,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from dev_llm_server import build_app as build_llm_app
 
 from support import ToneTTS
-from voxkin.agent.actions import ActionDispatcher
+from voxkin.agent.actions import ActionDispatcher, ActionError
 from voxkin.audio.sinks import WavDirSink
 from voxkin.config import VoxkinConfig
 from voxkin.events import EventHub, MetricsStore
@@ -124,6 +126,110 @@ async def test_bridge_websocket_dispatch(stack):
     status = await client.get("/api/status")
     payload = await status.json()
     assert payload["bridge"]["connected"] is True
+    await ws.send_json({"type": "death", "lifecycle_id": "ack-1", "data": {"health": 0}})
+    assert await ws.receive_json() == {
+        "type": "lifecycle_ack",
+        "event_type": "death",
+        "lifecycle_id": "ack-1",
+    }
+    await ws.close()
+
+
+async def test_bridge_disconnect_cancels_arbiter_and_invalidates_state(stack):
+    harness, client = stack
+    harness.arbiter = SimpleNamespace(cancel_all=AsyncMock())
+    harness.dispatcher.update_state({"alive": True, "health": 20, "position": {"x": 1, "y": 2, "z": 3}})
+    ws = await client.ws_connect("/ws/bridge?name=disconnect-test")
+    await ws.receive_json()
+
+    await ws.close()
+
+    assert await wait_until(lambda: harness.arbiter.cancel_all.await_count == 1)
+    assert harness.dispatcher.state_snapshot() == {}
+
+
+async def test_minecraft_disconnect_event_invalidates_state_without_closing_bridge(stack):
+    harness, client = stack
+    harness.arbiter = SimpleNamespace(cancel_all=AsyncMock())
+    ws = await client.ws_connect("/ws/bridge?name=world-disconnect-test")
+    await ws.receive_json()
+    await ws.send_json({"type": "state", "data": {"alive": True, "health": 20, "position": {"x": 4, "y": 64, "z": 8}}})
+    await asyncio.sleep(0.01)
+
+    await ws.send_json({"type": "world_unavailable", "reason": "minecraft_disconnected"})
+    await asyncio.sleep(0.02)
+
+    assert harness.dispatcher.state_snapshot() == {}
+    harness.arbiter.cancel_all.assert_awaited_once()
+    assert not ws.closed
+    await ws.close()
+
+
+async def test_death_event_fails_pending_action_and_respawn_refreshes_state(stack):
+    harness, client = stack
+
+    class RunEvents:
+        def __init__(self) -> None:
+            self.deaths: list[dict] = []
+            self.respawns: list[dict] = []
+
+        def on_death(self, payload: dict) -> None:
+            self.deaths.append(payload)
+
+        def on_respawn(self, payload: dict) -> None:
+            self.respawns.append(payload)
+
+    manager = RunEvents()
+    harness.run_manager = manager
+    harness.arbiter = None
+    harness.dispatcher.update_state(
+        {
+            "alive": True,
+            "health": 20,
+            "position": {"x": 4, "y": 64, "z": 8},
+            "inventory": {"oak_log": 3},
+        }
+    )
+    ws = await client.ws_connect("/ws/bridge?name=death-test")
+    await ws.receive_json()
+    event_queue = harness.hub.subscribe()
+    action = asyncio.create_task(
+        harness.dispatcher.dispatch_result("collect_blocks", {"block": "oak_log"})
+    )
+    request = await ws.receive_json()
+
+    await ws.send_json(
+        {
+            "type": "death",
+            "lifecycle_id": "death-1",
+            "data": {"health": 0, "position": {"x": 4, "y": 64, "z": 8}},
+        }
+    )
+    with pytest.raises(ActionError) as error:
+        await action
+    death_event = await asyncio.wait_for(event_queue.get(), timeout=1)
+    assert error.value.status == "dead"
+    assert death_event["type"] == "player_death"
+    assert manager.deaths[0]["interrupted_actions"] == [request["action_id"]]
+    assert harness.dispatcher.state_snapshot()["inventory"] == {"oak_log": 3}
+
+    await ws.send_json(
+        {
+            "type": "respawn",
+            "lifecycle_id": "death-1",
+            "data": {
+                "health": 20,
+                "position": {"x": 0, "y": 64, "z": 0},
+                "inventory": {"oak_log": 1},
+            },
+        }
+    )
+    respawn_event = await asyncio.wait_for(event_queue.get(), timeout=1)
+    assert respawn_event["type"] == "player_respawn"
+    assert manager.respawns[0]["alive"] is True
+    assert harness.dispatcher.state_snapshot()["position"]["x"] == 0
+    assert harness.dispatcher.state_snapshot()["inventory"] == {"oak_log": 1}
+    harness.hub.unsubscribe(event_queue)
     await ws.close()
 
 

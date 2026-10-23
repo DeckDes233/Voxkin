@@ -157,6 +157,39 @@ def test_runner_resumes_from_checkpoint(tmp_path: Path) -> None:
     assert store.resume_cursor(task.id) == 2
 
 
+def test_runner_skips_verified_step_after_interrupted_checkpoint(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    task = store.create_task("S2")
+    store.save_checkpoint(task.id, 0, {"reason": "action outcome was uncertain"})
+    calls: list[str] = []
+    state = {"inventory": {"iron_ingot": 2}}
+
+    async def executor(tool: str, arguments: dict) -> str:
+        calls.append(tool)
+        return "ok"
+
+    steps = [
+        StepSpec(
+            "熔炼铁锭",
+            "smelt_batch",
+            {"item": "raw_iron", "count": 2, "output": "iron_ingot"},
+            {"type": "inventory", "items": {"iron_ingot": 2}},
+        ),
+        StepSpec("做剪刀", "craft", {"item": "shears"}, {"type": "always"}),
+    ]
+    runner = TaskRunner(executor, lambda: state, store)
+
+    result = asyncio.run(runner.run("S2", steps, task_id=task.id))
+
+    assert result.ok
+    assert calls == ["craft"]
+    assert result.steps_done == 2
+    assert [event["kind"] for event in store.events(task.id)] == [
+        "step_recovered",
+        "step_done",
+    ]
+
+
 def test_run_logger_tail(tmp_path: Path) -> None:
     logger = RunLogger(tmp_path / "events.jsonl")
     logger.log("state", {"health": 20})

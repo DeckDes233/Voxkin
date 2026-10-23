@@ -13,6 +13,7 @@ ACTION_STATUSES = (
     "cancelled",
     "disconnected",
     "blocked",
+    "dead",
 )
 
 SUCCESS_STATUSES = ("succeeded", "partial")

@@ -9,6 +9,12 @@ import armorManager from 'mineflayer-armor-manager';
 import toolModule from 'mineflayer-tool';
 import { loadSkills } from './skills/registry.js';
 import { BLOCK_NAMES } from './skills/labels.js';
+import {
+  acknowledgeLifecycleEvent as removeLifecycleEvent,
+  drainActions,
+  queueLifecycleEvent as storeLifecycleEvent,
+  rejectBlockedAction,
+} from './action_lifecycle.js';
 
 const { pathfinder, Movements, goals } = pathfinderPkg;
 
@@ -209,6 +215,13 @@ const ACTION_LABELS = {
 let socket = null;
 let bot = null;
 let reconnectTimer = null;
+let botReconnectTimer = null;
+let deathPending = false;
+let respawnReady = false;
+let actionBlockStatus = '';
+const pendingLifecycleEvents = [];
+let botReady = false;
+let deathLifecycleId = '';
 const actionQueue = [];
 let actionRunning = false;
 let currentTool = '';
@@ -217,6 +230,7 @@ let currentActionPriority = 3;
 let currentCancellable = false;
 let interrupted = false;
 let cancelReason = '';
+let currentInterruptStatus = '';
 let followTimer = null;
 let followSession = null;
 let actionBusy = false;
@@ -263,8 +277,16 @@ function connectCore() {
       enqueueAction(message);
     } else if (message.type === 'action_cancel') {
       handleActionCancel(message);
+    } else if (message.type === 'lifecycle_ack') {
+      acknowledgeLifecycleEvent(message);
     } else if (message.type === 'welcome') {
       log('Core 握手完成', message.name);
+      flushLifecycleEvents();
+      finishRespawnIfIdle();
+      if (botReady && !deathPending && pendingLifecycleEvents.length === 0) {
+        actionBlockStatus = '';
+      }
+      sendState();
     } else if (message.type === 'error') {
       log('Core 返回错误', message.error);
     }
@@ -272,6 +294,9 @@ function connectCore() {
 
   socket.on('close', () => {
     log('与 Core 的连接断开，3 秒后重连');
+    actionBlockStatus = 'disconnected';
+    drainActions(actionQueue, reply, 'Core connection lost', 'disconnected');
+    interruptAction('Core connection lost', '', 'disconnected');
     socket = null;
     clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connectCore, 3000);
@@ -331,7 +356,7 @@ function sendProgress(message, phase, detail, progress) {
 
 // 打断动作。actionId 为空表示无条件打断；给了 id 且与当前动作不一致时不动手，
 // 避免过期的取消请求误伤新动作。
-function interruptAction(reason, actionId) {
+function interruptAction(reason, actionId, status = 'cancelled') {
   if (!currentTool) return false;
   const target = String(actionId || '');
   if (target && target !== currentActionId) {
@@ -341,6 +366,7 @@ function interruptAction(reason, actionId) {
   log('打断当前动作', currentTool, target || '无条件', reason);
   interrupted = true;
   cancelReason = reason;
+  currentInterruptStatus = status;
   if (bot) {
     bot.pathfinder.stop();
     bot.stopDigging();
@@ -393,6 +419,7 @@ function sortQueue() {
 }
 
 function enqueueAction(message) {
+  if (rejectBlockedAction(actionBlockStatus, message, reply)) return;
   if (message.tool === 'stop') {
     const dropped = actionQueue.splice(0, actionQueue.length);
     for (const item of dropped) {
@@ -400,7 +427,7 @@ function enqueueAction(message) {
     }
     interruptAction('收到停止指令', '');
   } else if (shouldPreempt(message)) {
-    interruptAction('被更高优先级的动作抢占', currentActionId);
+    interruptAction('被更高优先级的动作抢占', currentActionId, 'cancelled');
   }
   actionQueue.push(message);
   sortQueue();
@@ -503,6 +530,7 @@ async function runAction(message) {
   const args = message.arguments || {};
   interrupted = false;
   cancelReason = '';
+  currentInterruptStatus = '';
   currentTool = message.tool;
   currentActionId = message.action_id || '';
   currentActionPriority = actionPriority(message);
@@ -515,6 +543,7 @@ async function runAction(message) {
     log('动作超时', message.tool, `${Math.round(timeoutMs / 1000)}s`);
     timedOut = true;
     interrupted = true;
+    currentInterruptStatus = 'failed';
     if (bot) {
       bot.pathfinder.stop();
       bot.stopDigging();
@@ -667,7 +696,9 @@ async function runAction(message) {
         break;
       }
     }
-    if (cancelReason) {
+    if (currentInterruptStatus) {
+      reply(message, false, cancelReason || 'Action interrupted', currentInterruptStatus);
+    } else if (cancelReason) {
       reply(message, false, `已取消：${cancelReason}`, 'cancelled');
     } else if (timedOut) {
       reply(message, false, `动作超时（${Math.round(timeoutMs / 1000)}s）`, 'failed');
@@ -680,7 +711,9 @@ async function runAction(message) {
       );
     }
   } catch (error) {
-    if (cancelReason) {
+    if (currentInterruptStatus) {
+      reply(message, false, cancelReason || error.message, currentInterruptStatus);
+    } else if (cancelReason) {
       reply(message, false, `已取消：${cancelReason}`, 'cancelled');
     } else if (timedOut) {
       reply(message, false, `动作超时（${Math.round(timeoutMs / 1000)}s）`, 'failed');
@@ -694,8 +727,17 @@ async function runAction(message) {
     currentActionId = '';
     interrupted = false;
     cancelReason = '';
+    currentInterruptStatus = '';
     lastActivity = Date.now();
+    finishRespawnIfIdle();
   }
+}
+
+function finishRespawnIfIdle() {
+  if (!deathPending || !respawnReady || actionBusy || !bot?.entity) return;
+  if (!queueLifecycleEvent('respawn')) return;
+  deathPending = false;
+  respawnReady = false;
 }
 
 // 把异常映射成结构化状态：取消、部分完成、被环境阻塞、失败。
@@ -3084,6 +3126,8 @@ function createBot() {
 
   bot.once('spawn', () => {
     log('已进入世界');
+    botReady = true;
+    if (!deathPending) actionBlockStatus = '';
     const movements = new Movements(bot);
     const originalStop = bot.pathfinder.stop.bind(bot.pathfinder);
     bot.pathfinder.stop = (...args) => {
@@ -3175,9 +3219,17 @@ function createBot() {
   bot.on('death', () => {
     log('死亡，准备请求重生');
     lastHealth = 20;
+    deathPending = true;
+    deathLifecycleId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    respawnReady = false;
+    actionBlockStatus = 'dead';
+    botReady = false;
+    drainActions(actionQueue, reply, 'Player died', 'dead');
     stopFollow();
     wanderToken += 1;
     wanderActive = false;
+    interruptAction('玩家角色死亡', '', 'dead');
+    queueLifecycleEvent('death');
     requestRespawn();
   });
 
@@ -3197,16 +3249,73 @@ function createBot() {
   bot._client.on('respawn', () => {
     log('已重生');
     lastHealth = 20;
-    sendState();
+    botReady = true;
+    respawnReady = true;
+    finishRespawnIfIdle();
   });
 
   bot.on('error', (error) => log('mineflayer 错误', error.message));
   bot.on('kicked', (reason) => log('被服务器踢出', reason));
   bot.on('end', () => {
     log('与 Minecraft 的连接结束，5 秒后重连');
+    botReady = false;
+    actionBlockStatus = 'disconnected';
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'world_unavailable', reason: 'minecraft_disconnected' }));
+    }
+    drainActions(actionQueue, reply, 'Minecraft connection lost', 'disconnected');
+    interruptAction('Minecraft connection lost', '', 'disconnected');
     stopFollow();
-    setTimeout(createBot, 5000);
+    clearTimeout(botReconnectTimer);
+    botReconnectTimer = setTimeout(reconnectBotWhenIdle, 5000);
   });
+}
+
+function reconnectBotWhenIdle() {
+  if (actionBusy) {
+    botReconnectTimer = setTimeout(reconnectBotWhenIdle, 1000);
+    return;
+  }
+  bot = null;
+  createBot();
+}
+
+function sendLifecycleEvent(event) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  socket.send(JSON.stringify(event));
+  return true;
+}
+
+function queueLifecycleEvent(type) {
+  const position = bot.entity?.position;
+  storeLifecycleEvent(pendingLifecycleEvents, type, deathLifecycleId, {
+        health: bot.health,
+        inventory: Object.fromEntries(
+          (bot.inventory?.items?.() || []).map((item) => [item.name, item.count])
+        ),
+        position: position ? { x: position.x, y: position.y, z: position.z } : null,
+        dimension: bot.game?.dimension || '',
+        time: Number(bot.time?.timeOfDay ?? -1),
+        day: Number(bot.time?.day ?? -1),
+  });
+  return flushLifecycleEvents();
+}
+
+function flushLifecycleEvents() {
+  for (const event of pendingLifecycleEvents) {
+    if (!sendLifecycleEvent(event)) return false;
+  }
+  return true;
+}
+
+function acknowledgeLifecycleEvent(message) {
+  const lifecycleId = String(message.lifecycle_id || '');
+  const type = String(message.event_type || '');
+  if (!lifecycleId || !type) return;
+  removeLifecycleEvent(pendingLifecycleEvents, type, lifecycleId);
+  if (type === 'respawn' && lifecycleId === deathLifecycleId && botReady && !deathPending) {
+    actionBlockStatus = '';
+  }
 }
 
 function sendState() {
@@ -3235,6 +3344,7 @@ function sendState() {
     JSON.stringify({
       type: 'state',
       data: {
+        alive: bot.health > 0,
         position: { x: position.x, y: position.y, z: position.z },
         yaw: bot.entity.yaw,
         pitch: bot.entity.pitch,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import math
 import time
 import uuid
 from pathlib import Path
@@ -51,6 +52,7 @@ class StudioServer:
         app.router.add_post("/api/mic/stop", self.mic_stop)
         app.router.add_get("/api/run/status", self.run_status)
         app.router.add_post("/api/run/start", self.run_start)
+        app.router.add_post("/api/run/resume", self.run_resume)
         app.router.add_post("/api/run/stop", self.run_stop)
         app.router.add_post("/api/config", self.update_config)
         app.router.add_post("/api/llm/test", self.llm_test)
@@ -193,6 +195,47 @@ class StudioServer:
             raise web.HTTPBadRequest(text=str(error)) from error
         return web.json_response(manager.status())
 
+    async def run_resume(self, request: web.Request) -> web.Response:
+        manager = self.runtime.run_manager
+        if manager is None:
+            raise web.HTTPServiceUnavailable(text="没有可用的任务执行器")
+        dispatcher = self.runtime.dispatcher
+        state = dispatcher.state_snapshot()
+        age = dispatcher.state_age_s()
+        position = state.get("position") or {}
+        valid_position = all(
+            isinstance(position.get(axis), (int, float))
+            and math.isfinite(float(position[axis]))
+            for axis in "xyz"
+        )
+        try:
+            health = float(state.get("health"))
+        except (TypeError, ValueError):
+            health = 0.0
+        if (
+            not dispatcher.connected
+            or not valid_position
+            or state.get("alive") is not True
+            or not math.isfinite(health)
+            or health <= 0
+            or age is None
+            or age > 15
+        ):
+            raise web.HTTPConflict(text="Minecraft 桥接未就绪或状态帧已过期，暂时不能恢复任务")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        raw_task_id = body.get("task_id")
+        try:
+            task_id = int(raw_task_id) if raw_task_id is not None else None
+            status = await manager.resume(task_id)
+        except (KeyError, ValueError) as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+        return web.json_response(status)
+
     async def run_stop(self, request: web.Request) -> web.Response:
         manager = self.runtime.run_manager
         if manager is None:
@@ -321,6 +364,56 @@ class StudioServer:
                     asyncio.create_task(self.runtime.pipeline.respond(chat["text"]))
                 elif kind == "action_result":
                     self.runtime.dispatcher.resolve(ActionResult.from_message(data))
+                elif kind == "death":
+                    lifecycle_id = str(data.get("lifecycle_id") or "")
+                    state = {
+                        **self.runtime.dispatcher.state_snapshot(),
+                        **dict(data.get("data") or {}),
+                    }
+                    state["lifecycle_id"] = str(data.get("lifecycle_id") or state.get("lifecycle_id") or "")
+                    state["alive"] = False
+                    self.runtime.dispatcher.update_state(state)
+                    action_ids = self.runtime.dispatcher.fail_pending(
+                        "dead", "Minecraft 角色死亡，动作中止"
+                    )
+                    manager = getattr(self.runtime, "run_manager", None)
+                    if manager is not None:
+                        manager.on_death({**state, "interrupted_actions": action_ids})
+                    arbiter = getattr(self.runtime, "arbiter", None)
+                    if arbiter is not None:
+                        await arbiter.cancel_all("玩家角色死亡")
+                    await self.runtime.hub.publish(
+                        {"type": "player_death", **state, "interrupted_actions": action_ids}
+                    )
+                    if lifecycle_id:
+                        await send({"type": "lifecycle_ack", "event_type": "death", "lifecycle_id": lifecycle_id})
+                elif kind == "respawn":
+                    lifecycle_id = str(data.get("lifecycle_id") or "")
+                    state = dict(data.get("data") or {})
+                    state["lifecycle_id"] = str(data.get("lifecycle_id") or state.get("lifecycle_id") or "")
+                    state["alive"] = True
+                    current_state = self.runtime.dispatcher.state_snapshot()
+                    if current_state:
+                        state = {**current_state, **state}
+                        state.setdefault("inventory", current_state.get("inventory", {}))
+                    self.runtime.dispatcher.update_state(state)
+                    manager = getattr(self.runtime, "run_manager", None)
+                    if manager is not None:
+                        manager.on_respawn(state)
+                    await self.runtime.hub.publish({"type": "player_respawn", **state})
+                    if lifecycle_id:
+                        await send({"type": "lifecycle_ack", "event_type": "respawn", "lifecycle_id": lifecycle_id})
+                elif kind == "world_unavailable":
+                    self.runtime.dispatcher.update_state({})
+                    self.runtime.dispatcher.fail_pending(
+                        "disconnected", "Minecraft world connection lost"
+                    )
+                    arbiter = getattr(self.runtime, "arbiter", None)
+                    if arbiter is not None:
+                        await arbiter.cancel_all("Minecraft world connection lost")
+                    await self.runtime.hub.publish(
+                        {"type": "bridge_world_unavailable", "reason": data.get("reason", "")}
+                    )
                 elif kind == "action_progress":
                     progress = ActionProgress.from_message(data)
                     self.runtime.dispatcher.on_progress(progress)
@@ -343,6 +436,9 @@ class StudioServer:
                         {"type": "bridge_state", "data": data.get("data", {})}
                     )
         finally:
+            arbiter = getattr(self.runtime, "arbiter", None)
+            if arbiter is not None:
+                await arbiter.cancel_all("Minecraft bridge disconnected")
             self.runtime.dispatcher.detach(send)
         return ws
 

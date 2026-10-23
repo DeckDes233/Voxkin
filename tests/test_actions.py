@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from voxkin.agent.actions import ActionDispatcher, ActionError, status_for_detail
+from voxkin.agent.arbiter import ActionArbiter, ActionTicket
 from voxkin.bridge.protocol import ActionProgress, ActionResult, parse_chat
 
 
@@ -69,6 +70,61 @@ async def test_timeout_raises():
     dispatcher.attach(sender)
     with pytest.raises(ActionError, match="超时"):
         await dispatcher.dispatch("attack_nearest", {}, timeout_s=0.05)
+
+
+async def test_timeout_requests_bridge_cancellation_and_clears_pending_action():
+    dispatcher = ActionDispatcher()
+    sent: list[dict] = []
+
+    async def sender(message: dict) -> None:
+        sent.append(message)
+
+    dispatcher.attach(sender)
+    with pytest.raises(ActionError, match="超时"):
+        await dispatcher.dispatch("attack_nearest", {}, timeout_s=0.05)
+
+    assert [message["type"] for message in sent] == ["action", "action_cancel"]
+    assert sent[0]["action_id"] == sent[1]["action_id"]
+    assert dispatcher.pending_count == 0
+
+
+async def test_cancelled_wait_requests_bridge_cancellation_and_cleans_pending_action():
+    dispatcher = ActionDispatcher()
+    sent: list[dict] = []
+
+    async def sender(message: dict) -> None:
+        sent.append(message)
+
+    dispatcher.attach(sender)
+    task = asyncio.create_task(dispatcher.dispatch("attack_nearest", {}))
+    await asyncio.sleep(0.01)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [message["type"] for message in sent] == ["action", "action_cancel"]
+    assert sent[0]["action_id"] == sent[1]["action_id"]
+    assert dispatcher.pending_count == 0
+
+
+async def test_fail_pending_marks_in_flight_action_with_death_status():
+    dispatcher = ActionDispatcher()
+
+    async def sender(message: dict) -> None:
+        return None
+
+    dispatcher.attach(sender)
+    task = asyncio.create_task(dispatcher.dispatch_result("collect_blocks", {"block": "oak_log"}))
+    await asyncio.sleep(0.01)
+
+    action_ids = dispatcher.fail_pending("dead", "角色死亡")
+
+    with pytest.raises(ActionError) as error:
+        await task
+    assert error.value.status == "dead"
+    assert len(action_ids) == 1
+    assert dispatcher.pending_count == 0
 
 
 async def test_dispatch_without_bridge_raises():
@@ -337,6 +393,36 @@ async def test_detach_marks_pending_as_disconnected():
     with pytest.raises(ActionError) as error:
         await task
     assert error.value.status == "disconnected"
+
+
+async def test_detach_invalidates_cached_world_state():
+    dispatcher = ActionDispatcher()
+
+    async def sender(message: dict) -> None:
+        return None
+
+    dispatcher.attach(sender)
+    dispatcher.update_state({"alive": True, "health": 20, "position": {"x": 1, "y": 2, "z": 3}})
+    dispatcher.detach(sender)
+
+    assert dispatcher.state_snapshot() == {}
+    assert dispatcher.state_age_s() == float("inf")
+
+
+async def test_arbiter_rejects_actions_while_player_is_dead():
+    dispatcher = ActionDispatcher()
+    async def sender(message: dict) -> None:
+        return None
+
+    dispatcher.attach(sender)
+    dispatcher.update_state({"alive": False, "health": 0})
+    arbiter = ActionArbiter(dispatcher)
+
+    with pytest.raises(ActionError) as error:
+        await arbiter.submit(ActionTicket(tool="collect_blocks", arguments={"block": "oak_log"}))
+
+    assert error.value.status == "dead"
+    assert arbiter.status()["tracked"] == 0
 
 
 async def test_cancel_sends_action_cancel_with_the_action_id():

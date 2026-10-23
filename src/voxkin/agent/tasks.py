@@ -115,6 +115,22 @@ class TaskStore:
             updated_at=row["updated_at"],
         )
 
+    def latest_resumable(self) -> Task | None:
+        row = self._connection.execute(
+            "select * from tasks where status in ('active', 'cancelled', 'blocked', 'failed', 'dead') "
+            "order by case status when 'active' then 0 else 1 end, updated_at desc, id desc limit 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return Task(
+            id=row["id"],
+            objective=row["objective"],
+            stage=row["stage"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
     def set_status(self, task_id: int, status: str, stage: str | None = None) -> None:
         if stage is None:
             self._connection.execute(

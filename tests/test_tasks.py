@@ -16,6 +16,8 @@ def test_task_lifecycle(tmp_path: Path) -> None:
     assert store.latest_active() is None
     store.set_status(task.id, "active")
     assert store.latest_active() is not None
+    store.set_status(task.id, "cancelled")
+    assert store.latest_resumable() == store.get_task(task.id)
     store.close()
 
 

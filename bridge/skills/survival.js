@@ -383,6 +383,10 @@ function waitMs(ctx, ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function assertNotInterrupted(ctx, action) {
+  if (ctx.interrupted) throw new Error(`${action}被新的指令打断`);
+}
+
 function inventoryItems(ctx) {
   const items = ctx.bot?.inventory?.items?.();
   return Array.isArray(items) ? items : [];
@@ -627,7 +631,17 @@ function assertShelterSealed(ctx, plan, center) {
   const missing = [];
   for (const cell of plan.blocks) {
     const block = blockAt(bot, center.x + cell.x, center.y + cell.y, center.z + cell.z);
-    if (!isSolidBlock(block)) missing.push(`${center.x + cell.x},${center.y + cell.y},${center.z + cell.z}`);
+    if (!isSolidBlock(block) || DANGER_BLOCKS.has(block.name)) {
+      missing.push(`${center.x + cell.x},${center.y + cell.y},${center.z + cell.z}`);
+    }
+  }
+  for (const cell of plan.footprintCells) {
+    const block = blockAt(bot, center.x + cell.x, center.y, center.z + cell.z);
+    if (!isSolidBlock(block) || DANGER_BLOCKS.has(block.name)) {
+      throw new Error(
+        `庇护所地面 (${center.x + cell.x}, ${center.y}, ${center.z + cell.z}) 不安全或不完整`
+      );
+    }
   }
   if (missing.length) {
     throw new Error(`庇护所没有封闭，还缺 ${missing.length} 格：${missing.slice(0, 6).join('；')}`);
@@ -807,6 +821,10 @@ async function waitLeaveBed(ctx, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!bot.isSleeping) return true;
+    if (ctx.interrupted) {
+      if (typeof bot.wake === 'function') await bot.wake().catch(() => {});
+      throw new Error('睡觉被新的指令打断');
+    }
     await waitMs(ctx, 250);
   }
   return !bot.isSleeping;
@@ -925,6 +943,7 @@ export const skills = {
       if (!center) {
         throw new Error(`附近没有 ${size}×${size} 的平地，缺少可以搭庇护所的地面`);
       }
+      assertNotInterrupted(ctx, '搭建庇护所');
       const requestedBlock = String(args.block || '').trim();
       const materials = resolveShelterMaterials(ctx, plan, requestedBlock);
       const queue = materialQueue(materials);
@@ -936,11 +955,13 @@ export const skills = {
         } catch (error) {
           throw new Error(`走不到庇护所中心 (${center.x}, ${center.y + 1}, ${center.z})：${error.message}`);
         }
+        assertNotInterrupted(ctx, '搭建庇护所');
       }
       let placed = 0;
       let reused = 0;
       const used = new Map();
       for (const cell of plan.blocks) {
+        assertNotInterrupted(ctx, '搭建庇护所');
         const x = center.x + cell.x;
         const y = center.y + cell.y;
         const z = center.z + cell.z;
@@ -963,6 +984,7 @@ export const skills = {
             `在 (${x}, ${y}, ${z}) 放置${blockLabelOf(ctx, material)}失败：${error.message}`
           );
         }
+        assertNotInterrupted(ctx, '搭建庇护所');
         const confirmed = blockAt(bot, x, y, z);
         if (!confirmed || confirmed.name !== material) {
           throw new Error(
@@ -972,6 +994,7 @@ export const skills = {
         placed += 1;
         used.set(material, (used.get(material) || 0) + 1);
       }
+      assertNotInterrupted(ctx, '搭建庇护所');
       assertShelterSealed(ctx, plan, center);
       const usedMaterials = [...used.entries()].map(([name, count]) => ({ name, count }));
       const usedText = usedMaterials.length ? materialSummary(ctx, usedMaterials) : '已有方块';
@@ -1002,22 +1025,36 @@ export const skills = {
       if (dimension.includes('nether')) throw new Error('这里是下界，不能正常睡觉，床会爆炸');
       if (dimension.includes('end')) throw new Error('这里是末地，不能正常睡觉');
       const range = clampNumber(args.range, 16, 4, 48);
-      const nightOk =
-        typeof ctx.isSleepTime === 'function' ? Boolean(ctx.isSleepTime()) : isNight(bot);
-      const stormOk =
-        typeof ctx.isThunderstorm === 'function' ? Boolean(ctx.isThunderstorm()) : isThunderstorm(bot);
-      if (!nightOk && !stormOk) {
-        throw new Error(
-          `现在是 ${clockText(ctx)}，不是夜晚也没有雷暴，不能睡觉`
-        );
-      }
+      const canSleepNow = () => {
+        const nightOk =
+          typeof ctx.isSleepTime === 'function' ? Boolean(ctx.isSleepTime()) : isNight(bot);
+        const stormOk =
+          typeof ctx.isThunderstorm === 'function'
+            ? Boolean(ctx.isThunderstorm())
+            : isThunderstorm(bot);
+        return nightOk || stormOk;
+      };
       if (bot.isSleeping) {
+        const beforeTime = Number(bot.time?.timeOfDay ?? 0);
+        const beforeDay = Number(bot.time?.day ?? 0);
         const left = await waitLeaveBed(ctx, 15000);
         if (!left) throw new Error('已经在睡觉，但一直没有离开床');
+        const advanced =
+          typeof ctx.sleepAdvancedTime === 'function'
+            ? Boolean(ctx.sleepAdvancedTime(beforeTime, beforeDay))
+            : timeAdvanced(beforeTime, beforeDay, bot);
+        if (!advanced && canSleepNow()) {
+          throw new Error('已经离开床，但游戏时间没有推进到白天');
+        }
         return {
           detail: `本来就在睡，现在已经醒在第 ${bot.time?.day ?? 0} 天 ${clockText(ctx)}`,
           status: 'succeeded',
         };
+      }
+      if (!canSleepNow()) {
+        throw new Error(
+          `现在是 ${clockText(ctx)}，不是夜晚也没有雷暴，不能睡觉`
+        );
       }
       let bed = findBed(ctx, range);
       if (!bed) {
@@ -1032,15 +1069,15 @@ export const skills = {
         const beforeDay = Number(bot.time?.day ?? 0);
         try {
           const text = await ctx.sleepInBed();
+          const left = await waitLeaveBed(ctx, 15000);
+          if (!left) throw new Error('躺下后一直没有离开床');
           const advanced =
             typeof ctx.sleepAdvancedTime === 'function'
               ? Boolean(ctx.sleepAdvancedTime(beforeTime, beforeDay))
               : timeAdvanced(beforeTime, beforeDay, bot);
           if (!advanced) {
-            throw new Error('躺下后游戏时间没有推进，没有跳过这一夜');
+            throw new Error('离开床后游戏时间没有推进，没有跳过这一夜');
           }
-          const left = await waitLeaveBed(ctx);
-          if (!left) throw new Error('天亮了，但没有离开床，还在床上');
           return {
             detail: `睡过去了：${text}。床在 ${bedText}，现在是第 ${bot.time?.day ?? 0} 天 ${clockText(ctx)}，已经离开床`,
             status: 'succeeded',
@@ -1154,7 +1191,7 @@ export const skills = {
           const outsideFoot = blockAt(bot, outsideX, base.y, outsideZ);
           const outsideHead = blockAt(bot, outsideX, base.y + 1, outsideZ);
           if (!isOpenSpace(outsideFoot) || !isOpenSpace(outsideHead)) continue;
-          exit = { distance, wallX, wallZ, outsideX, outsideZ, wallFoot, wallHead };
+          exit = { distance, dir, wallX, wallZ, outsideX, outsideZ, wallFoot, wallHead };
           break;
         }
       }
@@ -1162,11 +1199,14 @@ export const skills = {
         throw new Error(`附近 ${maxDistance} 格内没有找到外侧为空地的墙，可能不在庇护所里`);
       }
       if (typeof ctx.breakBlock !== 'function') throw new Error('桥接没有提供挖掘接口');
+      assertNotInterrupted(ctx, '离开庇护所');
       for (const y of [base.y, base.y + 1]) {
         await ctx.breakBlock({ x: exit.wallX, y, z: exit.wallZ });
+        assertNotInterrupted(ctx, '离开庇护所');
         for (let attempt = 0; attempt < 10; attempt += 1) {
           if (isOpenSpace(blockAt(bot, exit.wallX, y, exit.wallZ))) break;
           await waitMs(ctx, 100);
+          assertNotInterrupted(ctx, '离开庇护所');
         }
         if (!isOpenSpace(blockAt(bot, exit.wallX, y, exit.wallZ))) {
           throw new Error(`挖开了 (${exit.wallX}, ${y}, ${exit.wallZ})，但方块还在`);
@@ -1176,6 +1216,23 @@ export const skills = {
         await ctx.travelTo(exit.outsideX, base.y, exit.outsideZ, 1);
       } catch (error) {
         throw new Error(`出口已经挖开，但从庇护所走到墙外失败：${error.message}`);
+      }
+      assertNotInterrupted(ctx, '离开庇护所');
+      const finalPosition = botPosition(ctx);
+      const outsideProgress = finalPosition
+        ? (finalPosition.x - exit.wallX) * exit.dir.x + (finalPosition.z - exit.wallZ) * exit.dir.z
+        : 0;
+      const targetDistance = finalPosition
+        ? Math.hypot(finalPosition.x - exit.outsideX, finalPosition.z - exit.outsideZ)
+        : Infinity;
+      if (outsideProgress < 1 || targetDistance > 2) {
+        throw new Error('出口已经挖开，但没有验证到 bot 已经走到庇护所墙外');
+      }
+      if (
+        !isOpenSpace(blockAt(bot, finalPosition.x, finalPosition.y, finalPosition.z)) ||
+        !isOpenSpace(blockAt(bot, finalPosition.x, finalPosition.y + 1, finalPosition.z))
+      ) {
+        throw new Error('出口已经挖开，但 bot 墙外的位置没有通过两格净空检查');
       }
       return {
         detail: `在 (${exit.wallX}, ${base.y}, ${exit.wallZ}) 挖开两格高的出口，已走到墙外 (${exit.outsideX}, ${base.y}, ${exit.outsideZ})，位置 ${positionText(ctx)}`,

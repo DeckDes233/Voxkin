@@ -126,6 +126,8 @@ class ActionDispatcher:
             return
         self._sender = None
         self.bridge_name = ""
+        self.latest_state = {}
+        self._state_at = 0.0
         for future in self._pending.values():
             if not future.done():
                 # 断桥是基础设施故障，不是用户取消；保留独立状态供上层决定重连与续跑。
@@ -140,6 +142,14 @@ class ActionDispatcher:
             return
         if not future.done():
             future.set_result(result)
+
+    def fail_pending(self, status: str, detail: str) -> list[str]:
+        action_ids = list(self._pending)
+        for future in self._pending.values():
+            if not future.done():
+                future.set_exception(ActionError(detail, status=status))
+        self._pending.clear()
+        return action_ids
 
     def on_progress(self, progress: ActionProgress) -> None:
         """记录桥接报上来的动作进度。桥接没报就是没有进度，不许自己编。"""
@@ -171,6 +181,14 @@ class ActionDispatcher:
         except Exception:
             return False
         return True
+
+    async def _cancel_interrupted_action(self, action_id: str, reason: str) -> None:
+        try:
+            await asyncio.wait_for(
+                self.cancel(action_id, reason), timeout=CANCEL_GRACE_S
+            )
+        except asyncio.TimeoutError:
+            return
 
     async def cancel_all(self, reason: str = "cancelled", turn_id: str = "") -> list[str]:
         """取消所有在途动作并清空队列，返回被取消的 action_id 列表。"""
@@ -249,12 +267,21 @@ class ActionDispatcher:
         try:
             await sender(request.to_message())
             result = await self._await_result(request.action_id, future, cancel_event, limit)
+        except asyncio.CancelledError:
+            await self._cancel_interrupted_action(
+                request.action_id, "Core 动作等待被取消"
+            )
+            raise
         except asyncio.TimeoutError as error:
-            future.cancel()
+            await self._cancel_interrupted_action(
+                request.action_id, "Core 等待动作结果超时"
+            )
             raise ActionError(
                 f"动作 {tool} 超时未返回结果（清单预算 {limit:.0f} 秒）", status="failed"
             ) from error
         finally:
+            if not future.done():
+                future.cancel()
             self._pending.pop(request.action_id, None)
             self._cancel_events.pop(request.action_id, None)
         result = self._refine_status(result)
@@ -305,6 +332,6 @@ class ActionDispatcher:
         """桥接没给明确状态时，用结果文本补出状态，结论与桥接一致。"""
         if result.ok:
             return result
-        if result.status in ("partial", "cancelled", "disconnected", "blocked"):
+        if result.status in ("partial", "cancelled", "disconnected", "blocked", "dead"):
             return result
         return replace(result, status=status_for_detail(result.detail))

@@ -71,6 +71,15 @@ def test_result_accepts_disconnected_status():
         }
     )
     assert result.status == "disconnected"
+
+
+def test_result_accepts_dead_status():
+    result = ActionResult.from_message(
+        {"type": "action_result", "action_id": "death-1", "ok": False, "status": "dead"}
+    )
+
+    assert result.status == "dead"
+    assert result.ok is False
     assert result.ok is False
 
 

@@ -27,6 +27,15 @@ class FakeDispatcher:
         self.sent: list[dict] = []
         self.cancelled: list[str] = []
         self._pending: dict[str, asyncio.Future] = {}
+        self.state: dict = {
+            "alive": True,
+            "health": 20,
+            "position": {"x": 0, "y": 64, "z": 0},
+        }
+        self.connected = True
+
+    def state_snapshot(self) -> dict:
+        return self.state
 
     async def dispatch_result(
         self,
@@ -73,6 +82,58 @@ class FakeDispatcher:
             future.set_result(
                 ActionResult(action_id=action_id, ok=True, detail=detail, status=status)
             )
+
+
+@pytest.mark.asyncio
+async def test_arbiter_rejects_world_actions_while_dead():
+    dispatcher = FakeDispatcher()
+    dispatcher.state = {"alive": False, "health": 0}
+    arbiter = ActionArbiter(dispatcher)
+
+    with pytest.raises(ActionError) as error:
+        await arbiter.submit(ActionTicket(tool="collect_blocks", arguments={"block": "oak_log"}))
+
+    assert error.value.status == "dead"
+    assert dispatcher.sent == []
+
+
+@pytest.mark.asyncio
+async def test_arbiter_blocks_world_actions_until_fresh_state_is_available():
+    dispatcher = FakeDispatcher()
+    dispatcher.state = {}
+    arbiter = ActionArbiter(dispatcher)
+
+    with pytest.raises(ActionError) as error:
+        await arbiter.submit(ActionTicket(tool="collect_blocks", arguments={"block": "oak_log"}))
+
+    assert error.value.status == "blocked"
+    assert dispatcher.sent == []
+
+
+@pytest.mark.asyncio
+async def test_arbiter_blocks_world_actions_when_position_is_incomplete():
+    dispatcher = FakeDispatcher()
+    dispatcher.state["position"] = {"x": 0, "y": 64}
+    arbiter = ActionArbiter(dispatcher)
+
+    with pytest.raises(ActionError) as error:
+        await arbiter.submit(ActionTicket(tool="collect_blocks", arguments={"block": "oak_log"}))
+
+    assert error.value.status == "blocked"
+    assert dispatcher.sent == []
+
+
+@pytest.mark.asyncio
+async def test_arbiter_reports_bridge_disconnect_before_dispatch():
+    dispatcher = FakeDispatcher()
+    dispatcher.connected = False
+    arbiter = ActionArbiter(dispatcher)
+
+    with pytest.raises(ActionError) as error:
+        await arbiter.submit(ActionTicket(tool="collect_blocks", arguments={"block": "oak_log"}))
+
+    assert error.value.status == "disconnected"
+    assert dispatcher.sent == []
 
 
 async def wait_for_sent(dispatcher: FakeDispatcher, count: int, timeout: float = 2.0) -> None:

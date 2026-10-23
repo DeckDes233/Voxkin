@@ -172,6 +172,14 @@ function handleEvent(payload) {
     case "action_finished":
       pushEvent("行动完成", payload.tool);
       break;
+    case "player_death":
+      pushEvent("死亡恢复", `角色死亡，已暂停当前步骤${payload.interrupted_actions?.length ? `，中断动作 ${payload.interrupted_actions.join("、")}` : ""}`, "error");
+      loadRunStatus();
+      break;
+    case "player_respawn":
+      pushEvent("死亡恢复", "角色已重生，正在核对检查点");
+      loadRunStatus();
+      break;
     case "announce":
       pushEvent("沃心", payload.text, "sentence");
       break;
@@ -260,6 +268,34 @@ async function loadMic() {
   $("micState").textContent = `${state}${data.last_stt_ms ? " · 上次识别 " + data.last_stt_ms + " ms" : ""}`;
 }
 
+async function loadRunStatus() {
+  const response = await fetch("/api/run/status");
+  const data = await response.json();
+  const result = data.result;
+  const lines = [
+    `状态：${data.running ? "运行中" : result?.status || "空闲"}`,
+    `阶段：${data.stage || "-"} · 任务：${data.task_id ?? "-"}`,
+    `步骤游标：${data.cursor ?? 0}`,
+  ];
+  if (result) lines.push(`结果：${result.detail || (result.ok ? "成功" : "未完成")}`);
+  $("runStatus").textContent = lines.join("\n");
+}
+
+async function runAction(action, body = {}) {
+  const response = await fetch(`/api/run/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    pushEvent("自主任务", `${action} 失败：${await response.text()}`, "error");
+  } else {
+    const data = await response.json();
+    pushEvent("自主任务", `${action} 已提交（${data.stage || "最近任务"}）`);
+  }
+  await loadRunStatus();
+}
+
 async function micAction(action) {
   const response = await fetch(`/api/mic/${action}`, { method: "POST" });
   if (!response.ok) {
@@ -337,6 +373,11 @@ $("saveConfig").addEventListener("click", saveConfig);
 $("testLlm").addEventListener("click", testLlm);
 $("micStart").addEventListener("click", () => micAction("start"));
 $("micStop").addEventListener("click", () => micAction("stop"));
+$("runStart").addEventListener("click", () =>
+  runAction("start", { stage: $("runStage").value }),
+);
+$("runResume").addEventListener("click", () => runAction("resume"));
+$("runStop").addEventListener("click", () => runAction("stop"));
 
 connect();
 loadStatus();
@@ -344,7 +385,9 @@ loadMetrics();
 loadLogs();
 loadServices();
 loadMic();
+loadRunStatus();
 setInterval(loadStatus, 3000);
 setInterval(loadServices, 4000);
 setInterval(loadMic, 2500);
+setInterval(loadRunStatus, 1500);
 setInterval(loadLogs, 5000);

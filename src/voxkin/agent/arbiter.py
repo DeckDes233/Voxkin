@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 import uuid
 from collections import deque
@@ -152,6 +153,31 @@ class ActionArbiter:
     async def submit(self, ticket: ActionTicket) -> ActionResult:
         """提交一个动作并等结果。被取消时抛 ActionError(status='cancelled')。"""
         self._prepare(ticket)
+        state_provider = getattr(self.dispatcher, "state_snapshot", None)
+        state = state_provider() if state_provider is not None else {}
+        if is_world_action(ticket.tool):
+            if hasattr(self.dispatcher, "connected") and not self.dispatcher.connected:
+                raise ActionError("Minecraft bridge is disconnected", status="disconnected")
+            if state_provider is not None and not state:
+                raise ActionError("Minecraft world state is unavailable or stale", status="blocked")
+        if is_world_action(ticket.tool) and state.get("alive") is False:
+            raise ActionError("Minecraft 角色已死亡，动作未派发", status="dead")
+        if is_world_action(ticket.tool):
+            position = state.get("position") or {}
+            if state.get("alive") is not True or not all(
+                isinstance(position.get(axis), (int, float))
+                and math.isfinite(float(position[axis]))
+                for axis in "xyz"
+            ):
+                raise ActionError("Minecraft world state is incomplete", status="blocked")
+            try:
+                health = float(state.get("health"))
+                if not math.isfinite(health):
+                    raise ValueError("non-finite health")
+                if health <= 0:
+                    raise ActionError("Minecraft 角色已死亡，动作未派发", status="dead")
+            except (TypeError, ValueError):
+                raise ActionError("Minecraft 生命值状态无效，动作未派发", status="blocked")
         preempt: ActionTicket | None = None
         async with self._cond:
             self._tickets[ticket.action_id] = ticket

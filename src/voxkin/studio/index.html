@@ -27,6 +27,27 @@
     <div id="events" class="events"></div>
   </section>
 
+  <section class="panel wide">
+    <h2>自主任务</h2>
+    <div class="row">
+      <label>阶段
+        <select id="runStage">
+          <option value="S0">S0 · 木镐</option>
+          <option value="S1">S1 · 石器与熔炉</option>
+          <option value="S2">S2 · 食物与床</option>
+          <option value="S3">S3 · 铁器</option>
+          <option value="S4">S4 · 钻石镐</option>
+          <option value="S5">S5 · 下界材料</option>
+          <option value="S6">S6 · 末影龙</option>
+        </select>
+      </label>
+      <button id="runStart" class="primary">启动阶段</button>
+      <button id="runResume">续跑最近任务</button>
+      <button id="runStop">停止任务</button>
+    </div>
+    <pre id="runStatus" class="aggregate">正在读取任务状态…</pre>
+  </section>
+
   <section class="panel">
     <h2>延迟分解</h2>
     <table id="latencyTable">
