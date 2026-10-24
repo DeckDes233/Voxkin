@@ -63,12 +63,15 @@ export const skills = {
 | `findHostile` / `findAttackTarget` / `resolvePlayer` | 目标选择 | |
 | `isNearDanger` / `escapeEnvironment` / `blockIsWater` / `findShore` / `swimToShore` | 环境避险 | |
 | `describeEntity` | `(entity) => string` | 实体中文描述 |
+| `runSkill` | `(skillId, args={}) => Promise<{detail, status}>` | 调用已注册技能；复用当前动作上下文，不创建新动作或并行队列 |
 | `INDEPENDENT` | boolean | 独立模式开关 |
 | `registry` | object | `bot.registry` 的快捷访问 |
 
 约定：
 
 - 只用上表的字段。需要新能力时，先自己在模块内实现，或把缺口写进模块头部的「待接入」注释，由集成阶段补 `ctx`。
+- 跨模块复用现有技能时用 `ctx.runSkill(skillId, args)`；只允许调用启动时注册的技能。运行时检测循环调用与最大嵌套深度，并在进入子技能前检查当前动作是否已取消。
+- 嵌套技能与父技能共享同一个动作超时、取消状态、bot 与游戏状态，不会获得独立权限或生命周期；不得把 `runSkill` 当作隔离或热插拔接口。
 - 调用 `ctx` 上可能不存在的可选能力时，用 `typeof ctx.xxx === 'function'` 判断后再调用。
 - 不要在模块里直接 `require` / `import` mineflayer 或其它运行时依赖；`bot` 从 `ctx` 取。
 

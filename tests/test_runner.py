@@ -6,6 +6,7 @@ from pathlib import Path
 from voxkin.agent.runlog import RunLogger
 from voxkin.agent.runner import StepSpec, TaskRunner, Verifier
 from voxkin.agent.tasks import TaskStore
+from voxkin.bridge.protocol import ActionResult
 
 
 def make_store(tmp_path: Path) -> TaskStore:
@@ -29,6 +30,121 @@ def test_inventory_verifier_counts_colored_wool_and_beds() -> None:
         {"type": "inventory", "items": {"bed": 1}},
         {"inventory": {"white_bed": 1}},
     ) == (True, "背包满足")
+
+
+def test_daylight_verifier_confirms_day_and_survival():
+    verifier = Verifier()
+    rule = {"type": "daylight", "min_health": 1}
+
+    assert verifier.check(rule, {"is_day": True, "health": 20}) == (True, "白天 True，血量 20")
+    assert verifier.check(rule, {"is_day": False, "health": 20}) == (False, "白天 False，血量 20")
+    assert verifier.check(rule, {"is_day": True, "health": 0}) == (False, "白天 True，血量 0")
+
+
+def test_result_event_verifier_requires_structured_event_data() -> None:
+    verifier = Verifier()
+    rule = {"type": "result_event", "event": "ender_dragon_killed"}
+
+    assert verifier.check(rule, {}, {"events": ["ender_dragon_killed"]}) == (
+        True,
+        "结果事件包含 ender_dragon_killed",
+    )
+    assert verifier.check(rule, {}, {"detail": "末影龙已击败"}) == (
+        False,
+        "结果事件缺少 ender_dragon_killed",
+    )
+
+
+def test_runner_requires_dragon_kill_event_even_when_action_succeeds(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+
+    async def executor(tool: str, arguments: dict) -> ActionResult:
+        return ActionResult(
+            action_id="dragon-1",
+            ok=True,
+            detail="动作已完成",
+            status="succeeded",
+            data={"events": ["ender_dragon_killed"]},
+        )
+
+    steps = [
+        StepSpec(
+            "击败末影龙",
+            "fight_dragon",
+            {},
+            {"type": "result_event", "event": "ender_dragon_killed"},
+            retries=0,
+        )
+    ]
+    result = asyncio.run(TaskRunner(executor, lambda: {}, store).run("S6", steps))
+
+    assert result.ok
+    assert store.has_event(result.task_id, "goal_event", "ender_dragon_killed")
+    goal_event = next(
+        event
+        for event in store.events(result.task_id)
+        if event["kind"] == "goal_event"
+    )
+    assert goal_event["payload"]["evidence"] is None
+
+
+def test_runner_recovers_verified_result_event_from_task_history(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    task = store.create_task("S6", stage="S6")
+    store.save_checkpoint(task.id, 0, {"reason": "runner restarted"})
+    store.log_event(
+        task.id,
+        "goal_event",
+        {"event": "ender_dragon_killed", "evidence": "dragon_health_zero"},
+    )
+    calls: list[str] = []
+
+    async def executor(tool: str, arguments: dict) -> str:
+        calls.append(tool)
+        return "unexpected"
+
+    steps = [
+        StepSpec(
+            "击败末影龙",
+            "fight_dragon",
+            {},
+            {"type": "result_event", "event": "ender_dragon_killed"},
+        )
+    ]
+    result = asyncio.run(
+        TaskRunner(executor, lambda: {}, store).run("S6", steps, task_id=task.id)
+    )
+
+    assert result.ok
+    assert calls == []
+    assert result.steps_done == 1
+
+
+def test_runner_rejects_success_status_without_dragon_kill_event(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+
+    async def executor(tool: str, arguments: dict) -> ActionResult:
+        return ActionResult(
+            action_id="dragon-1",
+            ok=True,
+            detail="末影龙已击败",
+            status="succeeded",
+            data={},
+        )
+
+    steps = [
+        StepSpec(
+            "击败末影龙",
+            "fight_dragon",
+            {},
+            {"type": "result_event", "event": "ender_dragon_killed"},
+            retries=0,
+        )
+    ]
+    result = asyncio.run(TaskRunner(executor, lambda: {}, store).run("S6", steps))
+
+    assert not result.ok
+    assert result.status == "blocked"
 
 
 def test_inventory_verifier_reports_colored_item_progress() -> None:

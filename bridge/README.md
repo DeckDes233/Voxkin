@@ -34,7 +34,7 @@ Core 必须先启动（`python -m voxkin serve`）。桥接进程会自行处理
 | `hello` | `bridge`, `protocol` | 连接后立即发送 |
 | `chat` | `player`, `text` | 游戏内聊天 |
 | `state` | `data.position`、`health`、`food`、`dimension` | 每 5 秒一次 |
-| `action_result` | `action_id`, `ok`, `detail` | 动作结果，必须与 `action_id` 对应 |
+| `action_result` | `action_id`, `ok`, `status`, `skill_id`, `detail`, 可选 `data` | 动作结果，必须与 `action_id` 对应；`data` 可携带机器可读的结果事件与证据 |
 
 Core → 桥接：
 

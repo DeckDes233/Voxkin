@@ -7,14 +7,14 @@
 | --- | --- | --- | --- |
 | 阶段推进 | `src/voxkin/agent/progress.py` 只有 S0-S6 背包判定；`agent/tasks.py` 有 TaskStore 三张表 | 阶段与任务持久化 | 无 TaskRunner、无 `/api/run/*` |
 | 动作取消 | `actions.py` 只有 `dispatch`；桥接的 `attack_nearest`/`stop` 可打断当前动作 | 抢占、超时后清场、step 级取消 | 无 Core 侧 `cancel`，无 step 进度 |
-| 技能覆盖 | `bridge/minecraft_bridge.js` 12 个动作；顶层直接连 Core 与建 bot；弓射击已具备 | craft/smelt/chest/sleep/trade/portal/bow_craft | 弓与箭矢合成缺失；技能函数不可单测 |
+| 技能覆盖 | 本表为早期快照：弓射击已有；当前 S6 计划新增弓箭材料采集/合成与库存验收 | craft/smelt/chest/sleep/trade/portal/bow_craft | 新版 S6 弓箭路线尚无真实 Minecraft 验收；单测覆盖不等于游戏内可用 |
 | 死亡恢复 | `death` 事件停跟随与闲逛（`bridge:1071`）；重生依赖 mineflayer 默认行为 | 5 秒重生、续做、回收掉落 | 无显式 `respawn`、无任务恢复 |
 | 状态帧 | 5 秒一帧（`bridge:1027`），无背包与耐久 | 每步可追溯 | 无 `runlog`、无 `state_age` |
 | 轨迹 | `MetricsStore` 环形 200 条 | JSONL 全量、checkpoint | 无 `runlog`、无世界快照 |
 | 测试世界 | `work/mc/server` 为 easy、`allow-nether=false`、种子为空 | 固定种子与模板 | 无 `world_template`、无重置脚本 |
 | 审计 | 无 | 人工干预必须为 0 | 无检测器 |
 
-2026-10-23 当前 Python 测试为 270 passed；新增剪羊技能另有 8 个 Node 模拟测试。自动化测试覆盖语音、协议、技能清单、结构化动作状态与阶段表，但没有一条能证明零干预通关。S0 在 Normal 难度下连续 10 次 5/5，S1 在同一世界接 S0 跑通 1 次 5/5；证据见 `docs/evidence/S0_NORMAL_20261022.md` 与 `docs/evidence/S1_NORMAL_20261022.md`。本文件的里程碑测试数是评审门槛，不代表最新实跑计数。
+2026-10-24 本轮 Bridge 全量测试为 89 passed；计划、技能清单与 Core 工具定向 Python 测试为 57 passed，Python 全量套件本轮未执行。技能模拟测试不证明零干预通关。S0 在 Normal 难度下连续 10 次 5/5，S1 在同一世界接 S0 跑通 1 次 5/5；证据见 `docs/evidence/S0_NORMAL_20261022.md` 与 `docs/evidence/S1_NORMAL_20261022.md`。本文件的里程碑测试数是评审门槛，不代表最新实跑计数。
 
 ## 1. 测试分层
 
@@ -167,7 +167,7 @@ Remove-Item $target -Recurse -Force; Copy-Item work\mc\world_template $target -R
 | M2 木镐 | S0 | 空背包 ≤10 分钟做出木镐与工作台；10 次 ≥8 次；无人工给料 | 10 分钟/次 |
 | M3 石器与第一夜 | S1 | ≤15 分钟石镐、石剑、熔炉；连续 3 夜不死 | 15 分钟/阶段 |
 | M4 食物与床 | S2 | 跨 3 游戏日 food ≥8；睡眠 3/3；死亡 ≤1，死后 5 分钟恢复 | 3 游戏日 |
-| M5 铁装 | S3 | ≤20 分钟铁镐、铁剑、盾；铁锭 ≥6；死亡 ≤1；3 次 ≥3 | 20 分钟/次 |
+| M5 铁装 | S3 | ≤20 分钟铁镐、铁剑、盾和空桶；铁锭 ≥9；死亡 ≤1；3 次 ≥3 | 20 分钟/次 |
 | M6 钻石 | S4 | ≤25 分钟 ≥3 钻石并成镐；5 次 ≥4；岩浆死 0 | 25 分钟/次 |
 | M7 下界 | S5 | 7 烈焰棒 ≤40 分钟；16 珍珠 ≤90 分钟；死亡 ≤2；能回主世界；5 次 ≥3 | 2 小时/次 |
 | M8 末地 | S6 | 从主世界 checkpoint 60 分钟内击杀末影龙；3 次 ≥2 | 60 分钟/次 |

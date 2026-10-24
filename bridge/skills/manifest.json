@@ -1349,6 +1349,50 @@
       "verifies": "返回文本里带出实际数量、坐标或状态，且与背包或世界状态一致。"
     },
     {
+      "skill_id": "prepare_bow_arrows",
+      "group": "专精类",
+      "type": "act",
+      "description": "准备末影龙战斗用弓和箭：核对线、羽毛、燧石，按库存选择可用木种，必要时采集原木或制作工作台，最终验证背包数量。",
+      "intent_examples": [
+        "准备末影龙战斗弓和箭",
+        "用现有材料制作弓和箭",
+        "检查并补齐弓箭战斗物资"
+      ],
+      "parameters": [
+        {
+          "name": "count",
+          "type": "number",
+          "required": false,
+          "default": 64,
+          "description": "目标箭数量，范围 1-64。"
+        },
+        {
+          "name": "range",
+          "type": "number",
+          "required": false,
+          "default": 48,
+          "description": "缺木材时搜索原木的范围，8-64 格。"
+        }
+      ],
+      "preconditions": "桥接已连接且 bot 已进入世界；制作弓时有 3 根线，制作箭时每 4 支需要 1 根羽毛、1 个燧石。需要工作台的配方会自动寻找或制作工作台。",
+      "observations": "读取各树种木板、原木及木棍库存，检查附近已加载的原木、工作台、弓箭材料、合成结果和取消状态。",
+      "execution_steps": [
+        "按实际库存选择可用的同种木板或原木；不足时调用 mine_collect 采集该树种原木。",
+        "必要时用所选木板制作工作台，再补齐木棍并制作缺少的弓与箭。",
+        "按背包中的弓和箭数量验证目标；材料不足或采集、合成失败时返回失败。"
+      ],
+      "postconditions": "背包至少有 1 把弓和 count 支箭。",
+      "failure_conditions": [
+        "弓所需线、箭所需羽毛或燧石不足。",
+        "没有足够的同种木材，或目标树种的原木在有限范围内不可达。",
+        "嵌套采集或合成失败、状态被打断，或最终库存未达到目标。"
+      ],
+      "recovery_strategy": "按错误报告补齐缺失材料后重试；已有库存会纳入缺口计算，达到目标的弓箭不会重复制作。",
+      "timeout_s": 300,
+      "cancellable": true,
+      "verifies": "逐项读取背包，确认至少 1 把弓和目标数量的箭；子技能返回成功本身不作为最终验收。"
+    },
+    {
       "skill_id": "craft_torch",
       "group": "专精类",
       "type": "act",
@@ -1502,6 +1546,33 @@
       "observations": "读取背包、位置、朝向、附近方块与实体状态。",
       "execution_steps": [
         "按熟肉 > 生肉 > 面包 > 其它有 food 值物品的优先级挑食物，吃完核对饥饿值真的上升。"
+      ],
+      "postconditions": "动作完成，返回中文结果描述。",
+      "failure_conditions": [
+        "前置材料、装备或位置不满足时中止，并在错误里说明缺什么。",
+        "目标在当前维度找不到时中止，并报告搜索范围。"
+      ],
+      "recovery_strategy": "补齐材料或换位置后重试，也可以拆成更小的步骤分别调用。",
+      "timeout_s": 120,
+      "cancellable": true,
+      "verifies": "返回文本里带出实际数量、坐标或状态，且与背包或世界状态一致。"
+    },
+    {
+      "skill_id": "equip_armor",
+      "group": "专精类",
+      "type": "act",
+      "description": "检查背包并自动穿上更好的护甲；完成后读取头盔、胸甲、护腿和靴子槽验证实际装备，没有确认到任何已穿护甲时返回失败。",
+      "intent_examples": [
+        "执行equip_armor",
+        "需要equip_armor时调用",
+        "用equip_armor推进当前任务"
+      ],
+      "parameters": [],
+      "preconditions": "桥接已连接且 bot 已进入世界。",
+      "observations": "读取背包、位置、朝向、附近方块与实体状态。",
+      "execution_steps": [
+        "检查背包并自动穿上更好的护甲",
+        "完成后读取头盔、胸甲、护腿和靴子槽验证实际装备，没有确认到任何已穿护甲时返回失败。"
       ],
       "postconditions": "动作完成，返回中文结果描述。",
       "failure_conditions": [
@@ -1726,6 +1797,81 @@
       "timeout_s": 120,
       "cancellable": true,
       "verifies": "返回文本里带出实际数量、坐标或状态，且与背包或世界状态一致。"
+    },
+    {
+      "skill_id": "hunt_material",
+      "group": "专精类",
+      "type": "act",
+      "description": "有限猎取鸡或蜘蛛来收集羽毛或线；会逐次拾取并核对背包数量，血量不足时停止。",
+      "intent_examples": [
+        "猎蜘蛛收集线",
+        "猎鸡收集羽毛",
+        "为弓和箭准备材料"
+      ],
+      "parameters": [
+        {
+          "name": "item",
+          "type": "string",
+          "required": true,
+          "default": null,
+          "enum": [
+            "feather",
+            "string"
+          ],
+          "description": "目标材料：feather 对应鸡，string 对应蜘蛛。"
+        },
+        {
+          "name": "count",
+          "type": "number",
+          "required": false,
+          "default": 1,
+          "range": {
+            "min": 1,
+            "max": 32
+          },
+          "description": "目标材料数量，按背包实际数量验收。"
+        },
+        {
+          "name": "radius",
+          "type": "number",
+          "required": false,
+          "default": 48,
+          "range": {
+            "min": 4,
+            "max": 64
+          },
+          "description": "目标生物搜索半径。"
+        },
+        {
+          "name": "min_health",
+          "type": "number",
+          "required": false,
+          "default": 10,
+          "range": {
+            "min": 4,
+            "max": 20
+          },
+          "description": "血量不高于此值时停止猎取。"
+        }
+      ],
+      "preconditions": "桥接已连接且 bot 已进入世界；目标生物在搜索范围内。",
+      "observations": "读取鸡或蜘蛛实体、血量、距离、取消状态及羽毛/线的背包数量。",
+      "execution_steps": [
+        "有限搜索指定生物并安全接近。",
+        "攻击后收集掉落物并同步背包。",
+        "只有背包目标材料达到 count 才报告成功。"
+      ],
+      "postconditions": "背包 feather 或 string 数量达到 count。",
+      "failure_conditions": [
+        "目标生物在有限搜索后不可用。",
+        "血量不足或追击失败。",
+        "击杀后掉落物没有进入背包。",
+        "动作被取消。"
+      ],
+      "recovery_strategy": "按返回的实际材料数量续做；血量不足时先恢复，在安全且目标可用时再重试。",
+      "timeout_s": 180,
+      "cancellable": true,
+      "verifies": "读取背包 feather/string 数量；击杀实体不等于材料任务成功。"
     },
     {
       "skill_id": "hunt_animal",
@@ -1989,6 +2135,152 @@
       "timeout_s": 180,
       "cancellable": true,
       "verifies": "返回文本里带出实际数量、坐标或状态，且与背包或世界状态一致。"
+    },
+    {
+      "skill_id": "collect_flint",
+      "group": "专精类",
+      "type": "act",
+      "description": "有限挖掘砂砾并实际收集燧石；按背包燧石数量停下，不把砂砾数量当成燧石产出。",
+      "intent_examples": [
+        "收集燧石",
+        "找一个燧石制作打火石",
+        "挖砂砾直到获得燧石"
+      ],
+      "parameters": [
+        {
+          "name": "count",
+          "type": "number",
+          "required": false,
+          "default": 1,
+          "range": {
+            "min": 1,
+            "max": 16
+          },
+          "description": "目标燧石数量，按背包里的实际数量验收。"
+        },
+        {
+          "name": "range",
+          "type": "number",
+          "required": false,
+          "default": 32,
+          "range": {
+            "min": 8,
+            "max": 64
+          },
+          "description": "搜索砂砾的半径。"
+        }
+      ],
+      "preconditions": "桥接已连接且 bot 已进入世界；背包里有能挖掘砂砾的工具。",
+      "observations": "读取砂砾坐标、实时方块、血量、取消状态及背包燧石数量。",
+      "execution_steps": [
+        "最多检查 256 个附近砂砾坐标。",
+        "安全靠近并挖掘砂砾，尝试拾取燧石。",
+        "只有当背包燧石达到目标数量时才报告成功。"
+      ],
+      "postconditions": "背包中燧石数量达到目标。",
+      "failure_conditions": [
+        "附近找不到砂砾。",
+        "目标范围内砂砾耗尽后仍没有足够燧石。",
+        "血量不足、无法到达或动作被取消。"
+      ],
+      "recovery_strategy": "保留任务检查点；恢复健康或移动到新的砂砾区域后重试，不重复把砂砾数量当作燧石数量。",
+      "timeout_s": 240,
+      "cancellable": true,
+      "verifies": "背包 flint 数量达到 count；只挖掉砂砾本身不算成功。"
+    },
+    {
+      "skill_id": "fill_water_bucket",
+      "group": "实用类",
+      "type": "act",
+      "description": "用空桶装取附近静止水源；只有背包水桶实际增加时才报告成功。",
+      "intent_examples": [
+        "用空桶装水",
+        "装一桶水",
+        "找水源给桶装水"
+      ],
+      "parameters": [
+        {
+          "name": "range",
+          "type": "number",
+          "required": false,
+          "default": 32,
+          "range": {
+            "min": 4,
+            "max": 64
+          },
+          "description": "静止水源搜索范围。"
+        }
+      ],
+      "preconditions": "桥接已连接且 bot 已进入世界；背包有空桶；附近有已加载的静止水源。",
+      "observations": "读取水源方块状态、距离、血量、取消状态与背包桶数量。",
+      "execution_steps": [
+        "只选择 level=0 的静止水源。",
+        "安全靠近后用空桶交互。",
+        "确认背包水桶数量增加后才报告成功。"
+      ],
+      "postconditions": "背包水桶数量增加至少 1。",
+      "failure_conditions": [
+        "缺少空桶。",
+        "搜索范围内没有已加载的静止水源。",
+        "无法安全靠近、交互未改变背包或动作被取消。"
+      ],
+      "recovery_strategy": "移动到可达的静止水源后重试；不得把流动水或未确认的交互计为成功。",
+      "timeout_s": 60,
+      "cancellable": true,
+      "verifies": "背包 water_bucket 数量实际增加。"
+    },
+    {
+      "skill_id": "collect_obsidian",
+      "group": "专精类",
+      "type": "act",
+      "description": "优先采集现有黑曜石；不足时在主世界将可安全接近的静止岩浆源逐个浇成黑曜石，回收水源后用钻石镐采集并按背包验收。",
+      "intent_examples": [
+        "采集黑曜石",
+        "用水桶浇铸并挖黑曜石",
+        "准备下界门所需黑曜石"
+      ],
+      "parameters": [
+        {
+          "name": "count",
+          "type": "number",
+          "required": false,
+          "default": 10,
+          "range": {
+            "min": 1,
+            "max": 10
+          },
+          "description": "目标黑曜石数量，最多 10 个。"
+        },
+        {
+          "name": "range",
+          "type": "number",
+          "required": false,
+          "default": 32,
+          "range": {
+            "min": 8,
+            "max": 64
+          },
+          "description": "搜索静止岩浆源和已有黑曜石的范围。"
+        }
+      ],
+      "preconditions": "桥接已连接且 bot 位于主世界；背包有钻石镐或下界合金镐和水桶；血量高于 10；目标静止岩浆源可安全接近。",
+      "observations": "读取维度、位置、血量、敌对生物、静止流体状态、方块变化及背包物品增量。",
+      "execution_steps": [
+        "优先挖掘范围内已有黑曜石。",
+        "不足时仅处理可达、上方有实心支撑且无遮挡的静止岩浆源。",
+        "从岩浆源上方放水，确认目标变为黑曜石并形成可回收静水源。",
+        "收回水源后用钻石镐挖掘，并按背包黑曜石数量验收。"
+      ],
+      "postconditions": "背包 obsidian 数量达到 count；失败或中断时保留已采集的实际进度。",
+      "failure_conditions": [
+        "缺少钻石镐或水桶。",
+        "不在主世界、血量不足或附近有敌对生物。",
+        "没有可安全接近的静止岩浆源，或世界/背包状态未确认。"
+      ],
+      "recovery_strategy": "先从安全静水源补水；只在主世界、远离敌对生物且血量充足时处理单个静止岩浆源；部分采集后按背包现状续做。",
+      "timeout_s": 300,
+      "cancellable": true,
+      "verifies": "背包黑曜石数量达到 count；矿石方块变化及水桶物品变化均须与交互相符。"
     },
     {
       "skill_id": "mine_collect",
@@ -2360,7 +2652,7 @@
       "skill_id": "shear_sheep",
       "group": "专精类",
       "type": "act",
-      "description": "用剪刀从成年且未剪过的羊身上剪取同色羊毛；逐只验证背包增量，按需靠近并跳过幼羊和已剪过的羊。",
+      "description": "用剪刀从成年且未剪过的羊身上剪取同色羊毛；逐只验证背包增量，附近没有羊时仅在白天、血量和饥饿足够且周边无敌对生物时做有限搜索。",
       "intent_examples": [
         "执行剪羊毛",
         "需要剪羊毛时调用",
@@ -2392,15 +2684,16 @@
       "preconditions": "桥接已连接且 bot 已进入世界。",
       "observations": "读取背包、位置、朝向、附近方块与实体状态。",
       "execution_steps": [
-        "用剪刀从成年且未剪过的羊身上剪取同色羊毛",
-        "逐只验证背包增量，按需靠近并跳过幼羊和已剪过的羊。"
+        "优先检查当前已加载的成年、未剪羊",
+        "附近没有羊时仅在白天、安全状态下沿有限路点搜索",
+        "逐只验证背包增量并跳过幼羊和已剪过的羊。"
       ],
       "postconditions": "动作完成，返回中文结果描述。",
       "failure_conditions": [
         "前置材料、装备或位置不满足时中止，并在错误里说明缺什么。",
         "目标在当前维度找不到时中止，并报告搜索范围。"
       ],
-      "recovery_strategy": "补齐材料或换位置后重试，也可以拆成更小的步骤分别调用。",
+      "recovery_strategy": "若安全搜索仍找不到羊，停止并保留任务检查点；不要在夜间、低血或有敌对生物时继续探索。",
       "timeout_s": 180,
       "cancellable": true,
       "verifies": "返回文本里带出实际数量、坐标或状态，且与背包或世界状态一致。"
@@ -2719,7 +3012,7 @@
       "skill_id": "throw_eye",
       "group": "专精类",
       "type": "act",
-      "description": "在主世界投掷末影之眼找要塞：朝当前朝向抛眼，跟踪飞行方向，按需朝该方向前进一段；多次投掷会用射线求交估算要塞坐标，靠近框架后自动停下。",
+      "description": "在主世界投掷末影之眼找要塞：跟踪投掷方向，多次投掷后用射线求交估算坐标并尝试靠近，在到达位置重新搜索末地门框架；只有实际发现框架才报告成功。",
       "intent_examples": [
         "执行投掷末影之眼",
         "需要投掷末影之眼时调用",
@@ -2758,18 +3051,18 @@
       "preconditions": "桥接已连接且 bot 已进入世界。",
       "observations": "读取背包、位置、朝向、附近方块与实体状态。",
       "execution_steps": [
-        "朝当前朝向抛眼，跟踪飞行方向，按需朝该方向前进一段",
-        "多次投掷会用射线求交估算要塞坐标，靠近框架后自动停下。"
+        "朝当前朝向抛眼并记录飞行方向，按需朝该方向移动",
+        "多次投掷后通过射线求交估算要塞坐标，尝试到达估算点并重新搜索末地门框架。"
       ],
-      "postconditions": "动作完成，返回中文结果描述。",
+      "postconditions": "只有观察到末地门框架才报告找到要塞；只有得到估算而未观察到框架时返回 partial，不声称已经定位。",
       "failure_conditions": [
         "前置材料、装备或位置不满足时中止，并在错误里说明缺什么。",
         "目标在当前维度找不到时中止，并报告搜索范围。"
       ],
-      "recovery_strategy": "补齐材料或换位置后重试，也可以拆成更小的步骤分别调用。",
+      "recovery_strategy": "方向数据不足时从不同位置重新投掷；已估算但未发现框架时依据返回坐标继续搜索，不要把估算视为已找到要塞。",
       "timeout_s": 180,
       "cancellable": true,
-      "verifies": "返回文本里带出实际数量、坐标或状态，且与背包或世界状态一致。"
+      "verifies": "找到要塞必须观测到指定半径内的末地门框架；估算坐标单独不算成功。"
     },
     {
       "skill_id": "wait_for_day",

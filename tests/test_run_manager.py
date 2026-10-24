@@ -166,6 +166,57 @@ def test_run_manager_rejects_unknown_stage(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_run_manager_status_reads_stage_event_from_current_task(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path / "tasks.db")
+    store.initialize()
+    task = store.create_task("S6", stage="S6")
+    manager = RunManager(
+        dispatch=lambda tool, arguments: asyncio.sleep(0, result="ok"),
+        state_provider=lambda: {"inventory": {}},
+        announce=lambda text: asyncio.sleep(0),
+        store=store,
+    )
+    manager._stage = "S6"
+    manager._task_id = task.id
+
+    assert manager.status()["stage_complete"] is False
+
+    store.log_event(task.id, "goal_event", {"event": "ender_dragon_killed"})
+
+    assert manager.status()["stage_complete"] is True
+
+
+def test_run_manager_restores_completed_stage_status_after_restart(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path / "tasks.db")
+    store.initialize()
+    task = store.create_task("S6", stage="S6")
+    store.log_event(
+        task.id,
+        "goal_event",
+        {"event": "ender_dragon_killed", "evidence": "dragon_health_zero"},
+    )
+    store.save_checkpoint(task.id, 6, {"detail": "阶段完成"})
+    store.set_status(task.id, "done")
+    manager = RunManager(
+        dispatch=lambda tool, arguments: asyncio.sleep(0, result="ok"),
+        state_provider=lambda: {"inventory": {}},
+        announce=lambda text: asyncio.sleep(0),
+        store=store,
+    )
+
+    status = manager.status()
+
+    assert status["task_id"] == task.id
+    assert status["stage"] == "S6"
+    assert status["stage_complete"] is True
+    assert status["result"] == {
+        "ok": True,
+        "status": "done",
+        "cursor": 6,
+        "detail": "阶段完成",
+    }
+
+
 def test_run_manager_resumes_latest_checkpointed_task(tmp_path: Path) -> None:
     store = TaskStore(tmp_path / "tasks.db")
     store.initialize()

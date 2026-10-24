@@ -37,10 +37,10 @@ STAGES: tuple[Stage, ...] = (
     ),
     Stage(
         id="S3",
-        title="铁装与盾",
-        goals=("挖铁", "熔炼铁锭", "合成铁镐、铁剑与盾"),
+        title="铁装、盾与空桶",
+        goals=("挖铁", "熔炼铁锭", "合成铁镐、铁剑、盾与空桶"),
         requires={"stone_pickaxe": 1, "furnace": 1},
-        produces={"iron_pickaxe": 1, "iron_sword": 1, "shield": 1},
+        produces={"iron_pickaxe": 1, "iron_sword": 1, "shield": 1, "bucket": 1},
     ),
     Stage(
         id="S4",
@@ -54,13 +54,13 @@ STAGES: tuple[Stage, ...] = (
         title="下界与末影珍珠",
         goals=("造下界门", "获取烈焰棒", "获取末影珍珠"),
         requires={"diamond_pickaxe": 1},
-        produces={"blaze_rod": 7, "ender_pearl": 16},
+        produces={"blaze_rod": 12, "ender_pearl": 24},
     ),
     Stage(
         id="S6",
         title="要塞与末地",
         goals=("找到要塞", "激活末地门", "击败末影龙"),
-        requires={"blaze_rod": 7, "ender_pearl": 16},
+        requires={"blaze_rod": 12, "ender_pearl": 24},
         produces={},
         event="ender_dragon_killed",
     ),
@@ -81,9 +81,13 @@ def next_stage(stage_id: str) -> Stage | None:
     return None
 
 
-def is_complete(stage: Stage, inventory: dict[str, int]) -> bool:
+def is_complete(
+    stage: Stage,
+    inventory: dict[str, int],
+    completed_events: set[str] | frozenset[str] = frozenset(),
+) -> bool:
     if stage.event:
-        return False
+        return stage.event in completed_events
     return all(_count_item(inventory, item) >= count for item, count in stage.produces.items())
 
 
@@ -95,19 +99,28 @@ def _count_item(inventory: dict[str, int], item: str) -> int:
             for name, count in inventory.items()
             if name == "bed" or name.endswith("_bed")
         )
+    if item == "bucket":
+        return sum(
+            count
+            for name, count in inventory.items()
+            if name in {"bucket", "water_bucket", "lava_bucket"}
+        )
     return inventory.get(item, 0)
 
 
 def missing_items(stage: Stage, inventory: dict[str, int]) -> dict[str, int]:
     return {
-        item: count - inventory.get(item, 0)
+        item: count - _count_item(inventory, item)
         for item, count in stage.produces.items()
         if _count_item(inventory, item) < count
     }
 
 
-def current_stage(inventory: dict[str, int]) -> Stage:
+def current_stage(
+    inventory: dict[str, int],
+    completed_events: set[str] | frozenset[str] = frozenset(),
+) -> Stage:
     for stage in STAGES:
-        if not is_complete(stage, inventory):
+        if not is_complete(stage, inventory, completed_events):
             return stage
     return STAGES[-1]

@@ -8,12 +8,17 @@ import { Vec3 } from 'vec3';
 import armorManager from 'mineflayer-armor-manager';
 import toolModule from 'mineflayer-tool';
 import { loadSkills } from './skills/registry.js';
+import { createSkillInvoker } from './skill_invoker.js';
 import { BLOCK_NAMES } from './skills/labels.js';
+import { placementHeightOffsets, placementOffsets } from './placement.js';
 import {
   acknowledgeLifecycleEvent as removeLifecycleEvent,
+  closeWindowAndSyncInventory,
   drainActions,
+  inventoryItemType,
   queueLifecycleEvent as storeLifecycleEvent,
   rejectBlockedAction,
+  worldHealthSnapshot,
 } from './action_lifecycle.js';
 
 const { pathfinder, Movements, goals } = pathfinderPkg;
@@ -449,7 +454,7 @@ async function pumpActions() {
 
 // 技能模块上下文：把桥接内部已有的能力按稳定接口暴露出去。
 // 每次动作都重新构造，保证 bot 重连后拿到的是最新实例。
-function buildSkillContext() {
+function buildSkillContext(runSkill) {
   return {
     bot,
     log,
@@ -460,6 +465,7 @@ function buildSkillContext() {
     travelToBlock,
     walkOnce,
     collectDrops,
+    nearbyHostiles,
     countItem,
     syncInventory,
     nearbyBlock,
@@ -512,6 +518,7 @@ function buildSkillContext() {
     findShore,
     swimToShore,
     describeEntity,
+    runSkill,
     INDEPENDENT,
     get interrupted() {
       return interrupted;
@@ -554,6 +561,7 @@ async function runAction(message) {
     sendProgress(message, 'running', `开始执行 ${actionLabel(message.tool)}`, 0);
   }
   let outcomeStatus = 'succeeded';
+  let outcomeData = {};
   try {
     if (
       ['goto', 'come_to_player', 'collect_blocks', 'attack_nearest', 'attack_target', 'stop', 'break_block', 'place_block', 'goto_block', 'pickup_items', 'craft', 'smelt', 'eat', 'sleep'].includes(
@@ -687,9 +695,17 @@ async function runAction(message) {
       default: {
         const skill = skillRegistry[message.tool];
         if (!skill) throw new Error(`未知动作 ${message.tool}`);
-        const outcome = await skill.handler(args, buildSkillContext());
+        const skillInvoker = createSkillInvoker(
+          skillRegistry,
+          (runSkill) => buildSkillContext(runSkill),
+          [message.tool],
+        );
+        const outcome = await skill.handler(args, skillInvoker.context);
         detail = outcome && outcome.detail ? outcome.detail : '已完成';
         const reportedStatus = outcome && outcome.status ? outcome.status : 'succeeded';
+        outcomeData = outcome && outcome.data && typeof outcome.data === 'object'
+          ? outcome.data
+          : {};
         outcomeStatus = FINAL_ACTION_STATUSES.has(reportedStatus)
           ? reportedStatus
           : 'failed';
@@ -707,7 +723,8 @@ async function runAction(message) {
         message,
         outcomeStatus === 'succeeded',
         detail,
-        outcomeStatus
+        outcomeStatus,
+        outcomeData
       );
     }
   } catch (error) {
@@ -750,7 +767,7 @@ function statusForError(error) {
   return 'failed';
 }
 
-function reply(message, ok, detail, status) {
+function reply(message, ok, detail, status, data = {}) {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   // 先把动作后的世界状态推给 Core，再回结果；否则 TaskRunner 可能拿到 5 秒前的旧背包。
   sendState();
@@ -763,6 +780,7 @@ function reply(message, ok, detail, status) {
       ok,
       status: finalStatus,
       detail: String(detail).slice(0, 500),
+      data,
     })
   );
   log(ok ? '动作完成' : '动作失败', message.tool, `${finalStatus} ${detail}`);
@@ -1351,12 +1369,12 @@ function countItem(name) {
     .reduce((total, item) => total + item.count, 0);
 }
 
-async function syncInventory() {
+async function syncInventory(window = bot?.currentWindow || bot?.inventory) {
   // mineflayer 在合成/快速拾取后偶尔会漏掉 set_slot，主动要一次完整背包。
   if (!bot || typeof bot._syncWindow !== 'function') return;
   // 服务器不回应时不能卡 20 秒；正常时 1 秒内就能拿到完整背包。
   await Promise.race([
-    bot._syncWindow(bot.inventory).catch(() => {}),
+    bot._syncWindow(window).catch(() => {}),
     sleep(1000),
   ]);
 }
@@ -1628,39 +1646,40 @@ async function craftWithWindow(recipe, window, width, height, times) {
   await refreshWindowState(window);
 }
 
-async function placeInventoryBlock(name, label) {
+async function placeInventoryBlock(name, label, searchRadius = 1) {
   const base = bot.entity.position;
-  const offsets = [
-    [1, 0],
-    [-1, 0],
-    [0, 1],
-    [0, -1],
-    [1, 1],
-    [-1, -1],
-    [1, -1],
-    [-1, 1],
-  ];
+  const offsets = placementOffsets(searchRadius);
+  const heights = placementHeightOffsets();
+  let supported = 0;
+  let openSpots = 0;
   for (const [dx, dz] of offsets) {
     const x = Math.floor(base.x) + dx;
     const z = Math.floor(base.z) + dz;
-    for (let dy = 1; dy >= -2; dy -= 1) {
+    for (const dy of heights) {
       const ground = bot.blockAt(vec(x, Math.floor(base.y) + dy, z));
       if (!ground || ground.boundingBox !== 'block') continue;
       const above = bot.blockAt(ground.position.offset(0, 1, 0));
       const above2 = bot.blockAt(ground.position.offset(0, 2, 0));
       if (above?.boundingBox === 'empty' && above2?.boundingBox === 'empty') {
+        supported += 1;
         const target = above.position;
         try {
+          const distance = bot.entity.position.distanceTo(target);
+          if (distance > 4) await travelTo(target.x, target.y, target.z, 2);
+          if (interrupted) throw new Error('被新的指令打断');
+          openSpots += 1;
           await placeBlock({ block: name, x: target.x, y: target.y, z: target.z });
           const placed = bot.blockAt(target);
           if (placed?.name === name) return placed;
           log('放置后没看到方块', `${label} (${target.x}, ${target.y}, ${target.z})`);
         } catch (error) {
+          if (interrupted) throw error;
           log('这个位置放不下', `${label} (${target.x}, ${target.y}, ${target.z}): ${error.message}`);
         }
       }
     }
   }
+  log('放置点搜索失败', label, `半径 ${searchRadius}，有支撑且上方空 ${supported} 个，尝试放置 ${openSpots} 个`);
   throw new Error(`附近没有地方放${label}`);
 }
 
@@ -1885,7 +1904,7 @@ async function smeltItem(args) {
     if (!bot.inventory.items().some((entry) => entry.name === 'furnace')) {
       throw new Error('附近没有熔炉，背包里也没有熔炉');
     }
-    furnaceBlock = await placeInventoryBlock('furnace', '熔炉');
+    furnaceBlock = await placeInventoryBlock('furnace', '熔炉', 4);
     placed = true;
   }
   if (bot.entity.position.distanceTo(furnaceBlock.position) > 3) {
@@ -1894,15 +1913,18 @@ async function smeltItem(args) {
   const outputName = SMELT_OUTPUTS[name] || name;
   const before = countItem(outputName);
   const furnace = await bot.openFurnace(furnaceBlock);
+  let furnaceClosed = false;
   try {
     await furnace.putInput(item.id, null, count);
     const fuel = findFuelItem();
     if (!fuel) throw new Error('没有燃料（煤、木炭或木板）');
+    const fuelType = inventoryItemType(fuel);
+    if (fuelType === null) throw new Error('燃料物品 ID 无效，无法放入熔炉');
     const fuelCount =
       fuel.name === 'coal' || fuel.name === 'charcoal'
         ? Math.max(1, Math.ceil(count / 8))
         : Math.max(1, Math.ceil(count / 1.5));
-    await furnace.putFuel(fuel.id, null, Math.min(fuelCount, fuel.count));
+    await furnace.putFuel(fuelType, null, Math.min(fuelCount, fuel.count));
     let waited = 0;
     while (waited < 90 && (furnace.outputItem()?.count || 0) < count) {
       if (interrupted) throw new Error('被新的指令打断');
@@ -1910,15 +1932,33 @@ async function smeltItem(args) {
       waited += 1;
     }
     const output = furnace.outputItem();
+    log('熔炉产物待取', JSON.stringify({
+      input: furnace.inputItem()?.name || '',
+      inputCount: furnace.inputItem()?.count || 0,
+      output: output?.name || '',
+      outputCount: output?.count || 0,
+      inventoryBefore: countItem(outputName),
+      waited,
+    }));
     if (output) await furnace.takeOutput();
+    await closeWindowAndSyncInventory(furnace, () => syncInventory(bot.inventory));
+    furnaceClosed = true;
     const gained = countItem(outputName) - before;
+    log('熔炉取出后状态', JSON.stringify({
+      output: furnace.outputItem()?.name || '',
+      outputCount: furnace.outputItem()?.count || 0,
+      inventoryAfter: countItem(outputName),
+      gained,
+    }));
     if (gained <= 0) throw new Error(`熔炼了 ${name}，但没有取到 ${outputName}`);
     return `熔炼出 ${gained} 个 ${blockLabel(outputName)}，背包共 ${countItem(outputName)} 个`;
   } finally {
-    try {
-      await furnace.close();
-    } catch (error) {
-      log('关闭熔炉失败', error.message);
+    if (!furnaceClosed) {
+      try {
+        await furnace.close();
+      } catch (error) {
+        log('关闭熔炉失败', error.message);
+      }
     }
     if (placed) {
       try {
@@ -2936,6 +2976,7 @@ async function startWander() {
 }
 
 function idleTick() {
+  if (INDEPENDENT) return;
   if (!bot || !bot.entity || bot.isSleeping || followSession || actionBusy || wanderActive || combatBusy) return;
   if (Date.now() - lastActivity < IDLE_WANDER_MS) return;
   if (bot.health < 10) return;
@@ -3200,20 +3241,24 @@ function createBot() {
   });
 
   bot.on('health', () => {
-    if (bot.health <= 0) {
+    const snapshot = worldHealthSnapshot(bot.health);
+    if (!snapshot) return;
+    if (!snapshot.alive) {
       lastHealth = 0;
       return;
     }
     if (lastHealth === null) {
-      lastHealth = bot.health;
+      lastHealth = snapshot.health;
+      sendState();
       return;
     }
-    if (bot.health < lastHealth - 0.5) {
+    if (snapshot.health < lastHealth - 0.5) {
       setTimeout(() => {
         if (Date.now() - lastHurtAt > 500) onDamaged(null);
       }, 300);
     }
-    lastHealth = bot.health;
+    lastHealth = snapshot.health;
+    sendState();
   });
 
   bot.on('death', () => {
@@ -3320,6 +3365,8 @@ function acknowledgeLifecycleEvent(message) {
 
 function sendState() {
   if (!bot || !bot.entity) return;
+  const healthSnapshot = worldHealthSnapshot(bot.health);
+  if (!healthSnapshot) return;
   if (!INDEPENDENT) checkPlayerDistance();
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   const inventory = {};
@@ -3344,7 +3391,7 @@ function sendState() {
     JSON.stringify({
       type: 'state',
       data: {
-        alive: bot.health > 0,
+        alive: healthSnapshot.alive,
         position: { x: position.x, y: position.y, z: position.z },
         yaw: bot.entity.yaw,
         pitch: bot.entity.pitch,

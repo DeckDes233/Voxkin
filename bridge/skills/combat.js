@@ -59,6 +59,11 @@ const MOB_LABELS = {
   rabbit: '兔子',
   blaze: '烈焰人',
   enderman: '末影人',
+  spider: '蜘蛛',
+};
+const COMBAT_MATERIAL_SOURCES = {
+  feather: 'chicken',
+  string: 'spider',
 };
 const SHEEP_COLORS = [
   'white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink', 'gray',
@@ -90,6 +95,10 @@ function clamp(value, min, max, fallback = min) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.min(Math.max(number, min), max);
+}
+
+function throwIfInterrupted(ctx, action) {
+  if (ctx.interrupted) throw new Error(`${action}被新的指令打断`);
 }
 
 // 三维距离，纯函数，方便单测。
@@ -191,6 +200,7 @@ function findEntity(ctx, name, radius) {
   let bestDistance = Infinity;
   for (const entity of Object.values(bot.entities || {})) {
     if (!entity || !entity.position) continue;
+    if (entity.isValid === false) continue;
     if (entity.name !== name) continue;
     const distance = origin.distanceTo(entity.position);
     if (distance > radius) continue;
@@ -252,6 +262,83 @@ function sheepCandidates(ctx, radius, color, processed) {
   return candidates.sort((left, right) => left.distance - right.distance);
 }
 
+function assertSafeSheepSearch(ctx) {
+  const bot = ctx.bot;
+  if (ctx.interrupted) throw new Error('寻找羊时被新的指令打断');
+  const health = Number(bot.health);
+  if (!Number.isFinite(health) || health <= 12) {
+    throw new Error(`血量未知或不足（血量 ${Number.isFinite(health) ? health : '未知'}），停止寻找羊`);
+  }
+  const food = Number(bot.food);
+  if (!Number.isFinite(food) || food < 8) {
+    throw new Error(`饥饿值未知或过低（${Number.isFinite(food) ? food : '未知'}），停止寻找羊`);
+  }
+  if (typeof ctx.isSleepTime !== 'function' || ctx.isSleepTime()) {
+    throw new Error('现在是夜晚或无法确认白天，停止外出寻找羊');
+  }
+  if (typeof ctx.isThunderstorm !== 'function' || ctx.isThunderstorm()) {
+    throw new Error('雷暴或天气状态未知，停止外出寻找羊');
+  }
+  const timeOfDay = Number(bot.time?.timeOfDay);
+  if (!Number.isFinite(timeOfDay) || timeOfDay < 0 || timeOfDay >= 12000) {
+    throw new Error('无法确认当前处于白天，停止外出寻找羊');
+  }
+  const hostiles = typeof ctx.nearbyHostiles === 'function' ? ctx.nearbyHostiles(12) : null;
+  if (!hostiles || hostiles.length > 0) {
+    throw new Error('附近有敌对生物或无法确认安全，停止外出寻找羊');
+  }
+}
+
+async function searchForSheep(ctx, radius, color, count) {
+  if (typeof ctx.walkOnce !== 'function') return [];
+  const origin = ctx.bot.entity.position;
+  const originX = origin.x;
+  const originY = Math.max(1, Math.floor(origin.y));
+  const originZ = origin.z;
+  const searchRadius = Math.min(radius, 48);
+  const radii = [];
+  for (let distance = 12; distance < searchRadius; distance += 12) radii.push(distance);
+  radii.push(searchRadius);
+  const headings = [
+    [0, -1],
+    [1, -1],
+    [1, 0],
+    [1, 1],
+    [0, 1],
+    [-1, 1],
+    [-1, 0],
+    [-1, -1],
+  ];
+  const waypoints = radii.flatMap((distance) =>
+    headings.map(([x, z]) => [Math.round(x * distance), Math.round(z * distance)])
+  );
+  const discovered = new Map();
+  for (const [dx, dz] of waypoints) {
+    assertSafeSheepSearch(ctx);
+    const outcome = await ctx.walkOnce(
+      originX + dx,
+      originY,
+      originZ + dz,
+      3,
+      4000,
+    );
+    if (outcome !== 'reached') {
+      if (outcome === 'unreachable' || outcome === 'stopped') continue;
+      throw new Error(`寻找羊时移动未完成（${outcome || '未知状态'}），停止探索`);
+    }
+    assertSafeSheepSearch(ctx);
+    const candidates = sheepCandidates(ctx, radius, color, new Set());
+    for (const candidate of candidates) discovered.set(candidate.sheep.id, candidate);
+    const current = [...discovered.values()];
+    const selectedColor = pickSheepColor(ctx, current, color || 'auto', count);
+    if (selectedColor &&
+        ctx.countItem(`${selectedColor}_wool`) + current.filter((item) => item.color === selectedColor).length >= count) {
+      return current;
+    }
+  }
+  return [...discovered.values()].sort((left, right) => left.distance - right.distance);
+}
+
 function pickSheepColor(ctx, candidates, requestedColor, count) {
   if (requestedColor !== 'auto') return requestedColor;
   const available = SHEEP_COLORS
@@ -280,14 +367,39 @@ async function shearSheep(args, ctx) {
     throw new Error(`不知道羊毛颜色 ${requestedColor}`);
   }
 
-  const initialCandidates = sheepCandidates(
+  let initialCandidates = sheepCandidates(
     ctx,
     radius,
     requestedColor === 'auto' ? '' : requestedColor,
     new Set(),
   );
-  const color = pickSheepColor(ctx, initialCandidates, requestedColor, count);
-  if (!color) throw new Error(`附近 ${radius} 格内没有可剪的羊，或羊的颜色状态不可读`);
+  let color = pickSheepColor(ctx, initialCandidates, requestedColor, count);
+  const heldWool = color ? ctx.countItem(`${color}_wool`) : 0;
+  const availableForColor = color
+    ? heldWool + initialCandidates.filter((candidate) => candidate.color === color).length
+    : 0;
+  if (color && heldWool >= count) {
+    const total = heldWool;
+    return {
+      detail: `背包里已经有 ${total} 个${ctx.itemLabel(`${color}_wool`)}，够 ${count} 个`,
+      status: 'succeeded',
+    };
+  }
+  if (availableForColor < count) {
+    const exploredCandidates = await searchForSheep(
+      ctx,
+      radius,
+      requestedColor === 'auto' ? '' : requestedColor,
+      count,
+    );
+    const combined = new Map(initialCandidates.map((candidate) => [candidate.sheep.id, candidate]));
+    for (const candidate of exploredCandidates) combined.set(candidate.sheep.id, candidate);
+    initialCandidates = [...combined.values()];
+  }
+  color = pickSheepColor(ctx, initialCandidates, requestedColor, count);
+  if (!color) {
+    throw new Error(`附近 ${radius} 格内没有可剪的羊；已尝试有限白天搜索，或羊的颜色状态不可读`);
+  }
   const itemName = `${color}_wool`;
   const initial = ctx.countItem(itemName);
   if (initial >= count) {
@@ -479,22 +591,29 @@ function isGrabbedByEnderman(ctx, enderman) {
 async function waitHealth(ctx, minHealth, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    throwIfInterrupted(ctx, '等待回血');
     if (Number(ctx.bot.health ?? 20) >= minHealth) return true;
     await ctx.sleep(500);
   }
+  throwIfInterrupted(ctx, '等待回血');
   return Number(ctx.bot.health ?? 20) >= minHealth;
 }
 
 // 血量低时先吃点东西再等恢复。
 async function recoverHealth(ctx, minHealth, timeoutMs) {
+  throwIfInterrupted(ctx, '恢复血量');
   if (typeof ctx.eatFood === 'function' && Number(ctx.bot.food ?? 20) < 20) {
     try {
       await ctx.eatFood({ count: 2 });
     } catch (error) {
+      throwIfInterrupted(ctx, '恢复血量');
       ctx.log('回血时吃东西失败', error.message);
     }
   }
-  return waitHealth(ctx, minHealth, timeoutMs);
+  throwIfInterrupted(ctx, '恢复血量');
+  const recovered = await waitHealth(ctx, minHealth, timeoutMs);
+  throwIfInterrupted(ctx, '恢复血量');
+  return recovered;
 }
 
 // 背包里的盾装到副手；没有盾返回 null。
@@ -665,6 +784,78 @@ async function collectItem(ctx, itemName, range = 6) {
   return picked;
 }
 
+async function huntMaterial(args, ctx) {
+  throwIfInterrupted(ctx, '收集战斗材料');
+  const itemName = String(args.item || '').trim().toLowerCase();
+  const species = COMBAT_MATERIAL_SOURCES[itemName];
+  if (!species) throw new Error(`不支持收集 ${itemName || '未知物品'}；可收集 string 或 feather`);
+
+  const wanted = Math.trunc(clamp(args.count, 1, 32, 1));
+  const radius = clamp(args.radius, 4, 64, 48);
+  const minHealth = clamp(args.min_health, 4, 20, 10);
+  const initial = ctx.countItem(itemName);
+  if (initial >= wanted) {
+    return { detail: `背包里已经有 ${initial} 个${ctx.itemLabel(itemName)}，够 ${wanted} 个`, status: 'succeeded' };
+  }
+
+  const deadline = Date.now() + HUNT_TIMEOUT_MS;
+  const maxKills = Math.max(6, Math.min(40, (wanted - initial) * 8));
+  let kills = 0;
+  let attempts = 0;
+  let searchedSince = Date.now();
+
+  while (Date.now() < deadline && kills < maxKills) {
+    throwIfInterrupted(ctx, '收集战斗材料');
+    const health = Number(ctx.bot.health);
+    if (!Number.isFinite(health) || health <= minHealth) {
+      throw new Error(`血量不足（${Number.isFinite(health) ? health : '未知'}），停止猎取${mobLabel(ctx, species)}`);
+    }
+
+    const target = findEntity(ctx, species, radius);
+    if (!target) {
+      if (Date.now() - searchedSince > SEARCH_WAIT_MS) break;
+      await ctx.sleep(1000);
+      continue;
+    }
+    searchedSince = Date.now();
+    attempts += 1;
+    const chased = await chaseTarget(ctx, target, MELEE_RANGE, deadline);
+    throwIfInterrupted(ctx, '收集战斗材料');
+    if (chased === 'gone') continue;
+    if (chased === 'failed') {
+      await ctx.sleep(500);
+      continue;
+    }
+
+    await ctx.attackEntity(target);
+    throwIfInterrupted(ctx, '收集战斗材料');
+    if (target.isValid === false) {
+      kills += 1;
+      await collectItem(ctx, itemName);
+      if (typeof ctx.syncInventory === 'function') await ctx.syncInventory();
+      throwIfInterrupted(ctx, '收集战斗材料');
+      if (ctx.countItem(itemName) >= wanted) break;
+    }
+
+    if (Number(ctx.bot.health) <= minHealth + 2) {
+      await ctx.retreatFrom(target);
+      const recovered = await recoverHealth(ctx, minHealth + 4, 20000);
+      if (!recovered) break;
+    }
+    if (attempts >= maxKills * 2) break;
+  }
+
+  throwIfInterrupted(ctx, '收集战斗材料');
+  const total = ctx.countItem(itemName);
+  if (total >= wanted) {
+    return {
+      detail: `猎到 ${kills} 只${mobLabel(ctx, species)}，${ctx.itemLabel(itemName)}共 ${total} 个，达到目标 ${wanted} 个`,
+      status: 'succeeded',
+    };
+  }
+  throw new Error(`还差 ${wanted - total} 个${ctx.itemLabel(itemName)}，目前 ${total} 个；猎到 ${kills} 只${mobLabel(ctx, species)}`);
+}
+
 // 这些生肉分别对应哪种熟肉，提示下一步要熔炼什么。
 function cookedNames(ctx, speciesList) {
   const names = [];
@@ -783,6 +974,7 @@ async function huntAnimal(args, ctx) {
 
 // 与烈焰人战斗：保持距离、躲火球、被烧到就后撤。
 async function fightBlaze(args, ctx) {
+  if (ctx.interrupted) throw new Error('被新的指令打断');
   const wanted = clamp(args.count, 1, 64, 1);
   const radius = clamp(args.radius, 4, 64, 32);
   const minHealth = clamp(args.min_health, 2, 20, 6);
@@ -801,6 +993,7 @@ async function fightBlaze(args, ctx) {
   let note = '';
 
   while (rods < wanted && Date.now() < deadline) {
+    if (ctx.interrupted) throw new Error('被新的指令打断');
     const blaze = findEntity(ctx, 'blaze', radius);
     if (!blaze) {
       if (Date.now() - searchedSince > SEARCH_WAIT_MS) {
@@ -814,9 +1007,16 @@ async function fightBlaze(args, ctx) {
     found += 1;
 
     const outcome = await engageBlaze(ctx, blaze, minHealth, deadline);
+    if (ctx.interrupted || outcome.interrupted) throw new Error('被新的指令打断');
     engagements += 1;
     if (outcome.burned) burned = true;
     if (outcome.killed) killed += 1;
+    if (outcome.killed && typeof ctx.collectDrops === 'function') {
+      await ctx.collectDrops(6, 'blaze_rod');
+      if (ctx.interrupted) throw new Error('收集烈焰棒时被新的指令打断');
+      if (typeof ctx.syncInventory === 'function') await ctx.syncInventory();
+      if (ctx.interrupted) throw new Error('同步烈焰棒背包时被新的指令打断');
+    }
     rods = ctx.countItem('blaze_rod');
     if (outcome.retreated) {
       note = `，血量只剩 ${ctx.bot.health}，先撤出来了`;
@@ -828,6 +1028,7 @@ async function fightBlaze(args, ctx) {
     }
   }
 
+  if (ctx.interrupted) throw new Error('被新的指令打断');
   rods = ctx.countItem('blaze_rod');
   if (rods >= wanted) {
     return {
@@ -850,6 +1051,10 @@ async function engageBlaze(ctx, blaze, minHealth, deadline) {
   let stuck = 0;
 
   while (Date.now() < deadline && blaze.isValid !== false) {
+    if (ctx.interrupted) {
+      outcome.interrupted = true;
+      break;
+    }
     const incoming = findIncomingProjectile(ctx);
     if (incoming) {
       if (!shieldRaised) {
@@ -888,6 +1093,10 @@ async function engageBlaze(ctx, blaze, minHealth, deadline) {
       }
       if (distance > BLAZE_RANGED_MAX) await ctx.approach(blaze);
       else if (distance < BLAZE_RANGED_MIN) await ctx.retreatFrom(blaze);
+      if (ctx.interrupted) {
+        outcome.interrupted = true;
+        break;
+      }
       if (await ctx.shootAt(blaze)) outcome.hits += 1;
       await ctx.sleep(700);
       continue;
@@ -899,9 +1108,17 @@ async function engageBlaze(ctx, blaze, minHealth, deadline) {
       shieldRaised = false;
     }
     if (distance > MELEE_RANGE) await ctx.approach(blaze);
+    if (ctx.interrupted) {
+      outcome.interrupted = true;
+      break;
+    }
     const reach = bot.entity.position.distanceTo(blaze.position);
     if (reach <= MELEE_REACH) {
       await bot.lookAt(blaze.position.offset(0, entityHeight(blaze) * 0.7, 0), true);
+      if (ctx.interrupted) {
+        outcome.interrupted = true;
+        break;
+      }
       bot.attack(blaze);
       outcome.hits += 1;
       stuck = 0;
@@ -1061,6 +1278,7 @@ async function releaseFromEnderman(ctx, enderman) {
 
 // 逐个打碎末地水晶：先退到安全距离，射完躲开爆炸，再留安全间隔。
 async function breakCrystal(args, ctx) {
+  throwIfInterrupted(ctx, '清除末地水晶');
   const rawCount = Number(args.count);
   const limit = Number.isFinite(rawCount) && rawCount > 0 ? Math.min(Math.trunc(rawCount), 64) : 0;
   const radius = clamp(args.radius, 8, 128, 64);
@@ -1083,6 +1301,7 @@ async function breakCrystal(args, ctx) {
   const notes = [];
 
   for (const crystal of list) {
+    throwIfInterrupted(ctx, '清除末地水晶');
     if (Date.now() > deadline) {
       notes.push('时间不够');
       failed += 1;
@@ -1096,13 +1315,16 @@ async function breakCrystal(args, ctx) {
     if (danger.distance < safeDistance) {
       await moveAwayFrom(ctx, crystal.position, safeDistance + 4);
     }
+    throwIfInterrupted(ctx, '清除末地水晶');
     const shot = await shootCrystal(ctx, crystal);
+    throwIfInterrupted(ctx, '清除末地水晶');
     if (!shot) {
       failed += 1;
       notes.push('弓射失败');
       continue;
     }
     const gone = await waitCrystalGone(ctx, crystal, 6000);
+    throwIfInterrupted(ctx, '清除末地水晶');
     if (gone) {
       broken += 1;
     } else {
@@ -1115,12 +1337,16 @@ async function breakCrystal(args, ctx) {
 
     // 躲开爆炸，再等一段安全间隔再打下一个。
     await moveAwayFrom(ctx, crystal.position, safeDistance + 4);
+    throwIfInterrupted(ctx, '清除末地水晶');
     if (Number(ctx.bot.health ?? 20) <= 8) {
       await recoverHealth(ctx, 12, 20000);
+      throwIfInterrupted(ctx, '清除末地水晶');
     }
     await ctx.sleep(interval);
+    throwIfInterrupted(ctx, '清除末地水晶');
   }
 
+  throwIfInterrupted(ctx, '清除末地水晶');
   if (broken <= 0) {
     throw new Error(
       `附近 ${radius} 格内有 ${list.length} 个末地水晶，一个都没打碎${notes.length ? `（${notes.join('、')}）` : ''}`
@@ -1140,18 +1366,26 @@ async function breakCrystal(args, ctx) {
 
 // 射水晶：瞄准点自己算，避免服务端没给 height 时算出 NaN 坐标。
 async function shootCrystal(ctx, crystal) {
+  throwIfInterrupted(ctx, '射击末地水晶');
   const bot = ctx.bot;
   const ranged = ctx.findRangedWeapon();
   if (!ranged) return false;
   try {
     await bot.equip(ranged.bow, 'hand');
+    throwIfInterrupted(ctx, '射击末地水晶');
     const aim = crystal.position.offset(0, entityHeight(crystal) * 0.5, 0);
     await bot.lookAt(aim, true);
+    throwIfInterrupted(ctx, '射击末地水晶');
     bot.activateItem();
-    await ctx.sleep(ranged.bow.name === 'crossbow' ? 1250 : 900);
-    bot.deactivateItem();
+    try {
+      await ctx.sleep(ranged.bow.name === 'crossbow' ? 1250 : 900);
+    } finally {
+      bot.deactivateItem();
+    }
+    throwIfInterrupted(ctx, '射击末地水晶');
     return true;
   } catch (error) {
+    throwIfInterrupted(ctx, '射击末地水晶');
     ctx.log('射水晶失败', error.message);
     return false;
   }
@@ -1161,9 +1395,11 @@ async function shootCrystal(ctx, crystal) {
 async function waitCrystalGone(ctx, crystal, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    throwIfInterrupted(ctx, '等待水晶爆炸');
     if (crystal.isValid === false) return true;
     await ctx.sleep(200);
   }
+  throwIfInterrupted(ctx, '等待水晶爆炸');
   return crystal.isValid === false;
 }
 
@@ -1214,6 +1450,17 @@ export const skills = {
       { name: 'min_health', type: 'number', required: false, default: 8, description: '血量低于这个值就撤退。' },
     ],
     handler: huntAnimal,
+  },
+  hunt_material: {
+    description:
+      '有限猎取鸡或蜘蛛来收集羽毛或线；会逐次拾取并核对背包数量，血量不足时停止。',
+    parameters: [
+      { name: 'item', type: 'string', required: true, description: '目标材料：feather（鸡）或 string（蜘蛛）。' },
+      { name: 'count', type: 'number', required: false, default: 1, description: '需要的材料数量，范围 1-32。' },
+      { name: 'radius', type: 'number', required: false, default: 48, description: '目标生物搜索半径，范围 4-64 格。' },
+      { name: 'min_health', type: 'number', required: false, default: 10, description: '血量不高于此值时停止猎取。' },
+    ],
+    handler: huntMaterial,
   },
   fight_blaze: {
     description:

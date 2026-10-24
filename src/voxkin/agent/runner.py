@@ -40,10 +40,20 @@ class Verifier:
             return max((int(count) for name, count in inventory.items() if name.endswith("_wool")), default=0)
         return int(inventory.get(item, 0))
 
-    def check(self, rule: dict[str, Any], state: dict[str, Any]) -> tuple[bool, str]:
+    def check(
+        self,
+        rule: dict[str, Any],
+        state: dict[str, Any],
+        result_data: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
         kind = rule.get("type")
         if kind == "always":
             return True, "无需判定"
+        if kind == "result_event":
+            event = str(rule.get("event") or "")
+            events = (result_data or {}).get("events") or []
+            matched = bool(event) and isinstance(events, list) and event in events
+            return matched, f"结果事件{'包含' if matched else '缺少'} {event}"
         if kind == "inventory":
             inventory = state.get("inventory") or {}
             missing = {
@@ -75,6 +85,13 @@ class Verifier:
         if kind == "food":
             food = float(state.get("food", 0))
             return (food >= float(rule.get("min", 1)), f"饥饿 {food:.0f}")
+        if kind == "daylight":
+            daylight = state.get("is_day") is True
+            health = float(state.get("health", 0))
+            return (
+                daylight and health >= float(rule.get("min_health", 1)),
+                f"白天 {daylight}，血量 {health:.0f}",
+            )
         return False, f"未知判定规则 {kind}"
 
     def classify(self, rule: dict[str, Any], state: dict[str, Any]) -> str:
@@ -218,8 +235,13 @@ class TaskRunner:
             if recovering:
                 already_done = False
                 if step.verify.get("type") != "always":
+                    result_data: dict[str, Any] = {}
+                    if step.verify.get("type") == "result_event":
+                        expected_event = str(step.verify.get("event") or "")
+                        if self._store.has_event(task.id, "goal_event", expected_event):
+                            result_data = {"events": [expected_event]}
                     already_done, verify_reason = self._verifier.check(
-                        step.verify, self._state_provider()
+                        step.verify, self._state_provider(), result_data
                     )
                 if already_done:
                     detail = f"恢复检查通过：{verify_reason}，跳过重复动作"
@@ -257,7 +279,9 @@ class TaskRunner:
             status = "failed"
             skill_id = step.tool
             action_id = ""
+            result_data: dict[str, Any] = {}
             for attempt in range(step.retries + 1):
+                result_data = {}
                 try:
                     outcome = await asyncio.wait_for(
                         self._execute(step), timeout=step.timeout_s
@@ -282,6 +306,7 @@ class TaskRunner:
                         status = outcome.status
                         skill_id = outcome.skill_id or step.tool
                         action_id = outcome.action_id
+                        result_data = outcome.data
                         if step.verify.get("type") == "always":
                             ok = outcome.ok and status == "succeeded"
                             reason = (
@@ -289,6 +314,13 @@ class TaskRunner:
                                 if ok
                                 else f"动作未报告成功：{status}"
                             )
+                        elif step.verify.get("type") == "result_event":
+                            event_ok, reason = self._verifier.check(
+                                step.verify, self._state_provider(), outcome.data
+                            )
+                            ok = outcome.ok and status == "succeeded" and event_ok
+                            if not ok and outcome.ok and status == "succeeded":
+                                status = "blocked"
                         else:
                             ok, reason, verify_status = await self._verify_with_wait(
                                 step.verify
@@ -298,9 +330,15 @@ class TaskRunner:
                     else:
                         detail = str(outcome)
                         status = "succeeded"
-                        ok, reason, verify_status = await self._verify_with_wait(
-                            step.verify
-                        )
+                        if step.verify.get("type") == "result_event":
+                            ok, reason = self._verifier.check(
+                                step.verify, self._state_provider()
+                            )
+                            verify_status = "blocked"
+                        else:
+                            ok, reason, verify_status = await self._verify_with_wait(
+                                step.verify
+                            )
                         if not ok:
                             status = verify_status
                 if self._logger is not None:
@@ -363,6 +401,18 @@ class TaskRunner:
                     await self._say(f"{step.description}没做成，先停一下。")
                 return RunResult(
                     False, task.id, index, detail or reason, done, total, status=status
+                )
+            if step.verify.get("type") == "result_event":
+                self._store.log_event(
+                    task.id,
+                    "goal_event",
+                    {
+                        "event": step.verify.get("event"),
+                        "evidence": result_data.get("evidence"),
+                        "step_index": index,
+                        "skill_id": skill_id,
+                        "action_id": action_id,
+                    },
                 )
             done += 1
             self.cursor = index + 1

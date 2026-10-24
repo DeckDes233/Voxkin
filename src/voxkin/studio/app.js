@@ -275,6 +275,9 @@ async function loadRunStatus() {
   const lines = [
     `状态：${data.running ? "运行中" : result?.status || "空闲"}`,
     `阶段：${data.stage || "-"} · 任务：${data.task_id ?? "-"}`,
+    ...(data.stage_complete === null || data.stage_complete === undefined
+      ? []
+      : [`阶段目标：${data.stage_complete ? "已完成" : "进行中"}`]),
     `步骤游标：${data.cursor ?? 0}`,
   ];
   if (result) lines.push(`结果：${result.detail || (result.ok ? "成功" : "未完成")}`);

@@ -14,6 +14,7 @@ const COLLECT_DROP_RANGE = 6;
 const MINE_REACH = 4.5;
 // 挖矿途中血量低于这个值就中止。
 const LOW_HEALTH = 8;
+const MINE_HOSTILE_RADIUS = 8;
 // 火把间隔：每挖多少格放一个。
 const TORCH_INTERVAL = 8;
 // 钻石矿的两种 id，普通钻石矿在深层是 deepslate_diamond_ore。
@@ -277,6 +278,11 @@ function clampInt(value, fallback, min, max) {
 function requireConnected(ctx) {
   const bot = ctx.bot;
   if (!bot || !bot.entity) throw new Error('与 Minecraft 的连接已断开，采集中止');
+  checkInterrupted(ctx);
+}
+
+function checkInterrupted(ctx) {
+  if (ctx.interrupted) throw new Error('挖矿被取消：收到新的指令或动作超时');
 }
 
 // 低血就停，不继续往危险里走。
@@ -284,6 +290,15 @@ function checkHealth(ctx, limit = LOW_HEALTH) {
   const health = Number(ctx.bot?.health);
   if (!Number.isFinite(health)) return;
   if (health <= limit) throw new Error(`血量不足（血量 ${health}），已中止采集`);
+}
+
+function checkNearbyHostiles(ctx) {
+  if (typeof ctx.nearbyHostiles !== 'function') return;
+  const hostiles = ctx.nearbyHostiles(MINE_HOSTILE_RADIUS);
+  if (hostiles.length > 0) {
+    const names = hostiles.map((hostile) => hostile.name).join('、');
+    throw new Error(`附近 ${MINE_HOSTILE_RADIUS} 格内有敌对生物（${names}），停止采矿`);
+  }
 }
 
 function blockLabelOf(ctx, name) {
@@ -306,6 +321,243 @@ function itemLabelOf(ctx, name, fallback) {
 
 function registryOf(ctx) {
   return ctx.registry || ctx.bot?.registry || null;
+}
+
+function blockProperties(block) {
+  if (typeof block?.getProperties === 'function') {
+    try {
+      return block.getProperties();
+    } catch {
+      return {};
+    }
+  }
+  return block?._properties || {};
+}
+
+function isSourceFluid(block) {
+  const level = Number(blockProperties(block).level ?? block?.metadata);
+  return Number.isFinite(level) && level === 0;
+}
+
+function findFluidSources(ctx, name, range, count = 64) {
+  const bot = ctx.bot;
+  const entry = registryOf(ctx)?.blocksByName?.[name];
+  if (!entry || typeof bot.findBlocks !== 'function') return [];
+  let positions = [];
+  try {
+    positions = bot.findBlocks({ matching: entry.id, maxDistance: range, count });
+  } catch {
+    return [];
+  }
+  return positions.filter((position) => {
+    const block = blockAtPos(bot, position);
+    return block?.name === name && isSourceFluid(block);
+  });
+}
+
+function findInventoryItem(ctx, name) {
+  return ctx.bot.inventory?.items?.().find((item) => item.name === name) || null;
+}
+
+async function waitForItemChange(ctx, itemName, previousCount, direction, timeoutMs = 1500) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    checkInterrupted(ctx);
+    const current = ctx.countItem(itemName);
+    if (direction === 'increase' ? current > previousCount : current < previousCount) return current;
+    await ctx.sleep(100);
+  }
+  return ctx.countItem(itemName);
+}
+
+async function useBucketOn(ctx, bucketName, block, face = null) {
+  const bot = ctx.bot;
+  const bucket = findInventoryItem(ctx, bucketName);
+  if (!bucket) throw new Error(`背包里没有${bucketName === 'bucket' ? '空桶' : '水桶'}`);
+  if (typeof bot.activateBlock !== 'function') throw new Error('桥接没有提供对准方块使用桶的接口');
+  await bot.equip(bucket, 'hand');
+  checkInterrupted(ctx);
+  await bot.activateBlock(block, face || undefined);
+  await ctx.sleep(250);
+  if (typeof ctx.syncInventory === 'function') await ctx.syncInventory();
+}
+
+async function moveNearBlock(ctx, position, action) {
+  const bot = ctx.bot;
+  if (distanceBetween(bot.entity.position, position) <= MINE_REACH) return;
+  if (typeof ctx.travelToBlock !== 'function') throw new Error(`没有靠近${action}的寻路能力`);
+  const outcome = await ctx.travelToBlock(position, 30000);
+  checkInterrupted(ctx);
+  if (outcome === 'cancelled') throw new Error(`${action}被取消`);
+  if (outcome === 'low_health') throw new Error(`血量不足，已停止${action}`);
+  if (outcome !== 'reached' || distanceBetween(bot.entity.position, position) > MINE_REACH) {
+    throw new Error(`无法安全靠近${action}位置 ${formatPosition(position)}`);
+  }
+}
+
+async function fillWaterBucket(args, ctx) {
+  requireConnected(ctx);
+  if (ctx.countItem('water_bucket') > 0) {
+    return { detail: `背包已有水桶 ${ctx.countItem('water_bucket')} 个`, status: 'succeeded' };
+  }
+  if (ctx.countItem('bucket') < 1) throw new Error('需要一个空桶才能装水');
+  const range = clampInt(args.range, 32, 4, 64);
+  const sources = findFluidSources(ctx, 'water', range);
+  if (!sources.length) throw new Error(`附近 ${range} 格内没有已加载的静止水源`);
+
+  const failures = [];
+  for (const position of sources) {
+    requireConnected(ctx);
+    checkHealth(ctx);
+    try {
+      await moveNearBlock(ctx, position, '取水');
+      const block = blockAtPos(ctx.bot, position);
+      if (block?.name !== 'water' || !isSourceFluid(block)) continue;
+      const before = ctx.countItem('water_bucket');
+      await useBucketOn(ctx, 'bucket', block);
+      const after = await waitForItemChange(ctx, 'water_bucket', before, 'increase');
+      if (after > before) {
+        return { detail: `从水源 ${formatPosition(position)} 装满水桶`, status: 'succeeded' };
+      }
+      failures.push(`${formatPosition(position)} 交互后背包没有水桶`);
+    } catch (error) {
+      checkInterrupted(ctx);
+      failures.push(`${formatPosition(position)} ${error.message}`);
+    }
+  }
+  throw new Error(`没有装到水${failures.length ? `：${failures.join('；')}` : ''}`);
+}
+
+async function castOneObsidian(ctx, range, visited) {
+  if (ctx.countItem('water_bucket') < 1) throw new Error('没有水桶，无法把静止岩浆浇成黑曜石');
+  const lavaPositions = findFluidSources(ctx, 'lava', range);
+  for (const position of lavaPositions) {
+    const key = `${position.x},${position.y},${position.z}`;
+    if (visited.has(key)) continue;
+    requireConnected(ctx);
+    checkHealth(ctx, LOW_HEALTH + 2);
+    const bot = ctx.bot;
+    if (typeof ctx.nearbyHostiles === 'function' && ctx.nearbyHostiles(8).length > 0) {
+      throw new Error('附近有敌对生物，停止靠近岩浆浇铸');
+    }
+    try {
+      await moveNearBlock(ctx, position, '岩浆源');
+    } catch (error) {
+      requireConnected(ctx);
+      checkHealth(ctx, LOW_HEALTH + 2);
+      if (typeof ctx.nearbyHostiles === 'function' && ctx.nearbyHostiles(8).length > 0) {
+        throw new Error('寻路后发现敌对生物，停止浇铸');
+      }
+      if (/被取消|取消|血量不足|低血|断开/.test(error.message)) throw error;
+      visited.add(key);
+      continue;
+    }
+    requireConnected(ctx);
+    checkHealth(ctx, LOW_HEALTH + 2);
+    if (typeof ctx.nearbyHostiles === 'function' && ctx.nearbyHostiles(8).length > 0) {
+      throw new Error('靠近岩浆后发现敌对生物，停止浇铸');
+    }
+    const lava = blockAtPos(bot, position);
+    if (lava?.name !== 'lava' || !isSourceFluid(lava)) {
+      visited.add(key);
+      continue;
+    }
+    const waterPosition = { x: position.x, y: position.y + 1, z: position.z };
+    const waterSpace = blockAtPos(bot, waterPosition);
+    const support = blockAtPos(bot, { x: position.x, y: position.y + 2, z: position.z });
+    if (!isAirBlock(waterSpace) || support?.boundingBox !== 'block') {
+      visited.add(key);
+      continue;
+    }
+
+    const beforeWaterBuckets = ctx.countItem('water_bucket');
+    const beforeBuckets = ctx.countItem('bucket');
+    const basePosition = bot.entity.position;
+    const vector = basePosition.constructor;
+    if (typeof vector !== 'function') throw new Error('无法构造水桶交互方向');
+    await useBucketOn(ctx, 'water_bucket', support, new vector(0, -1, 0));
+    const deadline = Date.now() + 2500;
+    let obsidian = null;
+    while (Date.now() < deadline) {
+      checkInterrupted(ctx);
+      obsidian = blockAtPos(bot, position);
+      const flowingWater = blockAtPos(bot, waterPosition);
+      if (obsidian?.name === 'obsidian' && flowingWater?.name === 'water' && isSourceFluid(flowingWater)) break;
+      await ctx.sleep(100);
+    }
+    const flowingWater = blockAtPos(bot, waterPosition);
+    if (obsidian?.name !== 'obsidian' || flowingWater?.name !== 'water' || !isSourceFluid(flowingWater)) {
+      throw new Error(`水流未能在 ${formatPosition(position)} 生成黑曜石并保留可回收水源`);
+    }
+    const emptyBuckets = await waitForItemChange(ctx, 'bucket', beforeBuckets, 'increase');
+    if (emptyBuckets <= beforeBuckets || ctx.countItem('water_bucket') >= beforeWaterBuckets) {
+      throw new Error(`已生成黑曜石 ${formatPosition(position)}，但背包水桶状态未确认`);
+    }
+
+    const beforeRecovered = ctx.countItem('water_bucket');
+    const waterBlock = blockAtPos(bot, waterPosition);
+    await useBucketOn(ctx, 'bucket', waterBlock);
+    const recovered = await waitForItemChange(ctx, 'water_bucket', beforeRecovered, 'increase');
+    if (recovered <= beforeRecovered) throw new Error('黑曜石已生成，但没有成功收回水源');
+    visited.add(key);
+    return position;
+  }
+  return null;
+}
+
+async function collectObsidian(args, ctx) {
+  requireConnected(ctx);
+  const bot = ctx.bot;
+  const dimension = String(bot.game?.dimension || '').toLowerCase();
+  if (dimension !== 'overworld' && !dimension.includes('overworld')) {
+    throw new Error('水桶浇铸黑曜石只在主世界执行');
+  }
+  const want = clampInt(args.count, 10, 1, 10);
+  const range = clampInt(args.range, 32, 8, 64);
+  if (ctx.countItem('obsidian') >= want) {
+    return { detail: `背包已有 ${ctx.countItem('obsidian')} 个黑曜石`, status: 'succeeded' };
+  }
+  if (ctx.countItem('diamond_pickaxe') < 1 && ctx.countItem('netherite_pickaxe') < 1) {
+    throw new Error('挖黑曜石需要钻石镐或下界合金镐');
+  }
+  const visited = new Set();
+  let existingMiningFailure = '';
+  try {
+    return await mineCollect({ block: 'obsidian', count: want, range }, ctx);
+  } catch (error) {
+    existingMiningFailure = error.message;
+    requireConnected(ctx);
+    if (ctx.countItem('obsidian') >= want) {
+      return { detail: `获得 ${ctx.countItem('obsidian')} 个黑曜石`, status: 'succeeded' };
+    }
+  }
+  if (ctx.countItem('water_bucket') < 1 && ctx.countItem('bucket') > 0) {
+    await fillWaterBucket({ range }, ctx);
+  }
+  if (ctx.countItem('water_bucket') < 1) throw new Error('需要一个空桶和附近的静水源才能浇铸黑曜石');
+  while (ctx.countItem('obsidian') < want) {
+    requireConnected(ctx);
+    checkHealth(ctx, LOW_HEALTH + 2);
+    const produced = await castOneObsidian(ctx, range, visited);
+    if (!produced) {
+      const missing = want - ctx.countItem('obsidian');
+      throw new Error(
+        `静止岩浆源耗尽或均不可安全到达，还差 ${missing} 个黑曜石` +
+          (existingMiningFailure ? `；直接采集结果：${existingMiningFailure}` : ''),
+      );
+    }
+    try {
+      const result = await mineCollect({ block: 'obsidian', count: want, range }, ctx);
+      return { detail: `${result.detail}；黑曜石由安全浇铸后采集`, status: 'succeeded' };
+    } catch (error) {
+      existingMiningFailure = error.message;
+      requireConnected(ctx);
+      if (ctx.countItem('obsidian') >= want) {
+        return { detail: `获得 ${ctx.countItem('obsidian')} 个黑曜石`, status: 'succeeded' };
+      }
+    }
+  }
+  return { detail: `获得 ${ctx.countItem('obsidian')} 个黑曜石`, status: 'succeeded' };
 }
 
 // bot.blockAt 需要 Vec3；普通 {x, y, z} 在区块已加载时会调用 pos.floored() 崩掉。
@@ -346,6 +598,7 @@ function toolIsBroken(bot) {
 async function findCandidateBlocks(ctx, ids, range, count) {
   const bot = ctx.bot;
   for (let attempt = 0; attempt < 4; attempt += 1) {
+    checkInterrupted(ctx);
     const positions = bot.findBlocks({ matching: ids, maxDistance: range, count });
     if (positions.length > 0) return positions;
     if (typeof bot.waitForChunksToLoad === 'function') {
@@ -354,7 +607,9 @@ async function findCandidateBlocks(ctx, ids, range, count) {
         ctx.sleep(3000),
       ]);
     }
+    checkInterrupted(ctx);
     await ctx.sleep(1200);
+    checkInterrupted(ctx);
   }
   return [];
 }
@@ -362,6 +617,7 @@ async function findCandidateBlocks(ctx, ids, range, count) {
 // 挖一个方块。先按方块换工具，再挖。
 // 返回 { ok, reason, message }，失败不抛错，由调用方决定算不算致命。
 async function digAt(ctx, position, options = {}) {
+  checkInterrupted(ctx);
   const bot = ctx.bot;
   const block = blockAtPos(bot, position);
   if (!block) {
@@ -381,16 +637,20 @@ async function digAt(ctx, position, options = {}) {
   try {
     await ctx.equipToolFor(block);
   } catch (error) {
+    checkInterrupted(ctx);
     return { ok: false, reason: 'tool', message: `换工具失败：${error.message}` };
   }
+  checkInterrupted(ctx);
   if (typeof bot.canDigBlock === 'function' && !bot.canDigBlock(block)) {
     return { ok: false, reason: 'tool', block, message: '工具不对或者离得太远，挖不动' };
   }
   try {
     await bot.dig(block);
   } catch (error) {
+    checkInterrupted(ctx);
     return { ok: false, reason: 'dig', block, message: `挖不动：${error.message}` };
   }
+  checkInterrupted(ctx);
   return { ok: true, block };
 }
 
@@ -460,8 +720,10 @@ function dropFailureState(ctx, position) {
 
 // 往前走一步。返回 'reached' | 'unreachable' | 'stopped' | 'cancelled'。
 async function stepForward(ctx, position) {
-  if (typeof ctx.walkOnce !== 'function') return 'reached';
+  checkInterrupted(ctx);
+  if (typeof ctx.walkOnce !== 'function') return 'unreachable';
   const outcome = await ctx.walkOnce(position.x, position.y, position.z, 1, 8000);
+  checkInterrupted(ctx);
   if (outcome === 'cancelled') throw new Error('挖矿被取消：收到新的指令或连接断开');
   return outcome;
 }
@@ -498,6 +760,7 @@ async function digForward(ctx, position, heading, state, options = {}) {
         };
       }
       const dug = await digAt(ctx, at);
+      checkInterrupted(ctx);
       if (!dug.ok) {
         return { ok: false, reason: dug.reason, position: at, message: `头顶挖不开：${dug.message}` };
       }
@@ -505,12 +768,14 @@ async function digForward(ctx, position, heading, state, options = {}) {
     }
   }
   const dug = await digAt(ctx, front);
+  checkInterrupted(ctx);
   if (!dug.ok) {
     return { ok: false, reason: dug.reason, position: front, message: dug.message };
   }
   state.mined += 1;
   // 等方块更新同步到客户端再寻路。
   await ctx.sleep(250);
+  checkInterrupted(ctx);
   if (options.torch) {
     await placeTorch(ctx, front, state, options.notes || []);
   }
@@ -532,6 +797,7 @@ async function digForward(ctx, position, heading, state, options = {}) {
 // 火把：先盘点背包，没有就用 ctx 的合成能力补。
 // 没有合成能力时只在 notes 里说明缺什么，不影响挖矿。
 async function ensureTorches(ctx, wanted, notes) {
+  checkInterrupted(ctx);
   const have = ctx.countItem('torch');
   if (have >= wanted) return { ok: true, have };
   const need = Math.max(1, wanted - have);
@@ -542,9 +808,11 @@ async function ensureTorches(ctx, wanted, notes) {
   try {
     await ctx.craftItem({ item: 'torch', count: need });
   } catch (error) {
+    checkInterrupted(ctx);
     notes.push(`火把没合成出来（${error.message}），背包里只有 ${have} 个`);
     return { ok: false, have };
   }
+  checkInterrupted(ctx);
   const after = ctx.countItem('torch');
   if (after <= have) {
     notes.push(`火把没合成出来，背包里只有 ${after} 个`);
@@ -555,6 +823,7 @@ async function ensureTorches(ctx, wanted, notes) {
 
 // 放火把：放在刚挖开的那一格的地面上，bot 还站在上一格，不会被自己挡住。
 async function placeTorch(ctx, cell, state, notes) {
+  checkInterrupted(ctx);
   if (ctx.countItem('torch') <= 0) {
     notes.push('火把用完了，巷道后半段没有放火把');
     return false;
@@ -578,9 +847,11 @@ async function placeTorch(ctx, cell, state, notes) {
       return false;
     }
   } catch (error) {
+    checkInterrupted(ctx);
     notes.push(`火把没放下去：${error.message}`);
     return false;
   }
+  checkInterrupted(ctx);
   const placed = blockAtPos(bot, spot);
   if (placed && (placed.name === 'torch' || placed.name === 'redstone_torch' || placed.name === 'soul_torch')) {
     state.torches += 1;
@@ -591,14 +862,17 @@ async function placeTorch(ctx, cell, state, notes) {
 }
 
 // 垂直竖井下降。每往下一格都要先确认脚下 3 格没有岩浆。
-async function digShaftDown(ctx, depth, state) {
+async function digShaftDown(ctx, depth, state, lowHealth = LOW_HEALTH) {
   const bot = ctx.bot;
   for (let step = 0; step < depth; step += 1) {
     requireConnected(ctx);
-    checkHealth(ctx);
+    checkHealth(ctx, lowHealth);
     const feet = floorPos(bot.entity.position);
     const below = offsetPos(feet, 0, -1, 0);
     const target = blockAtPos(bot, below);
+    if (!target || isPassableBlock(target)) {
+      throw new Error(`脚下没有可控的完整落点，已停止挖竖井：目标 ${formatPosition(below)}`);
+    }
     if (isLavaBlock(target)) {
       throw new Error(`挖竖井时遇到岩浆，已停止：岩浆在 ${formatPosition(below)}`);
     }
@@ -610,35 +884,54 @@ async function digShaftDown(ctx, depth, state) {
     if (hazards.lava.length > 0) {
       throw new Error(`挖竖井时脚下的岩浆，已停止：岩浆在 ${formatPosition(hazards.lava[0])}`);
     }
+    const landingPosition = offsetPos(feet, 0, -2, 0);
+    const landing = blockAtPos(bot, landingPosition);
+    if (!landing || isPassableBlock(landing) || isHazardBlock(landing)) {
+      throw new Error(`下方没有确认安全的落点，已停止挖竖井：${formatPosition(landingPosition)}`);
+    }
     const dug = await digAt(ctx, below);
+    checkInterrupted(ctx);
     if (!dug.ok) {
       throw new Error(`竖井挖不下去：${dug.message}（坐标 ${formatPosition(below)}）`);
     }
     state.mined += 1;
     // 脚下被挖空之后会掉下去，等落地再继续。
     await ctx.sleep(700);
+    requireConnected(ctx);
+    const landed = floorPos(bot.entity.position);
+    if (landed.y !== feet.y - 1) {
+      throw new Error(`挖竖井后落点变化异常（原 Y=${feet.y}，现 Y=${landed.y}），已停止`);
+    }
+    checkInterrupted(ctx);
   }
 }
 
 // 挖一条支巷，然后原路走回主巷。
-async function digBranch(ctx, junction, heading, length, state) {
+async function digBranch(ctx, junction, heading, length, state, lowHealth = LOW_HEALTH) {
   const side = pickPerpendicular(ctx, junction, heading);
-  if (!side) return false;
+  if (!side) return { ok: false, moved: false };
   let position = junction;
+  let moved = false;
   for (let step = 1; step <= length; step += 1) {
+    requireConnected(ctx);
+    checkHealth(ctx, lowHealth);
+    const minedBefore = state.mined;
     const result = await digForward(ctx, position, side, state, { countSteps: false });
-    if (!result.ok) return false;
+    checkInterrupted(ctx);
+    if (!result.ok) return { ok: false, moved: moved || state.mined > minedBefore };
     position = result.position;
+    moved = true;
   }
   state.branches += 1;
   // 原路退回主巷。
   for (let step = 0; step < length; step += 1) {
+    checkHealth(ctx, lowHealth);
     const back = offsetPos(position, -side.x, 0, -side.z);
     const walk = await stepForward(ctx, back);
-    if (walk !== 'reached') return false;
+    if (walk !== 'reached') return { ok: false, moved: true };
     position = back;
   }
-  return true;
+  return { ok: true, moved: false };
 }
 
 // 选一个与 heading 垂直、且前方不是岩浆水的地方。
@@ -702,6 +995,8 @@ async function mineCollect(args, ctx) {
   for (const position of positions) {
     if (ctx.countItem(itemName) - owned >= need) break;
     requireConnected(ctx);
+    checkHealth(ctx);
+    checkNearbyHostiles(ctx);
     const block = blockAtPos(bot, position);
     if (!block || block.name !== blockName) {
       failures.push(`${formatPosition(position)} 的${blockLabel}已经不见了`);
@@ -710,6 +1005,7 @@ async function mineCollect(args, ctx) {
     const distance = distanceBetween(bot.entity.position, position);
     if (distance > MINE_REACH) {
       const outcome = await ctx.travelToBlock(position, 30000);
+      checkInterrupted(ctx);
       if (outcome === 'cancelled') throw new Error('采集被取消：收到新的指令或连接断开');
       if (outcome === 'low_health') throw new Error(`血量不足，撤退中止采集（血量 ${bot.health}）`);
       if (outcome !== 'reached') {
@@ -717,13 +1013,16 @@ async function mineCollect(args, ctx) {
         continue;
       }
     }
+    checkNearbyHostiles(ctx);
     const dug = await digAt(ctx, position, { expectName: blockName });
+    checkInterrupted(ctx);
     if (!dug.ok) {
       failures.push(`${formatPosition(position)} ${dug.message}`);
       continue;
     }
     mined += 1;
     const dropped = await collectDrop(ctx, itemName);
+    checkInterrupted(ctx);
     if (dropped.gained > 0) continue;
     const state = dropFailureState(ctx, position);
     failures.push(`${formatPosition(position)} ${classifyDropOutcome(state)}`);
@@ -768,6 +1067,7 @@ async function stripMine(args, ctx) {
   // 火把：先用 ctx 的合成能力补货，没有就记下来继续挖。
   const torchPlan = torchInterval > 0 ? Math.floor(length / torchInterval) + 1 : 0;
   await ensureTorches(ctx, torchPlan, notes);
+  checkInterrupted(ctx);
 
   // 先挖竖井到目标高度。
   if (shaft > 0) {
@@ -780,13 +1080,17 @@ async function stripMine(args, ctx) {
   if (!heading) heading = CARDINAL_HEADINGS[0];
   let position = floorPos(bot.entity.position);
   if (targetY !== null && position.y !== targetY) {
-    notes.push(`目标 Y 是 ${targetY}，现在在 ${position.y}，差 ${Math.abs(position.y - targetY)} 格`);
+    throw new Error(`无法到达目标 Y=${targetY}，当前在 Y=${position.y}，已停止挖矿`);
   }
   const branchEvery = branchCount > 0 ? Math.max(2, Math.floor(length / (branchCount + 1))) : 0;
   const ores = [];
   const seenOre = new Set();
+  let completedSteps = 0;
+  let attempts = 0;
 
-  for (let step = 1; step <= length; step += 1) {
+  while (completedSteps < length && attempts < length * 4) {
+    attempts += 1;
+    const step = completedSteps + 1;
     requireConnected(ctx);
     checkHealth(ctx);
     const wantTorch = torchInterval > 0 && step % torchInterval === 0;
@@ -799,6 +1103,9 @@ async function stripMine(args, ctx) {
         throw new Error(
           `${result.message}，已停止挖矿：坐标 ${formatPosition(result.position)}（已挖 ${state.steps} 格长度的巷道）`,
         );
+      }
+      if (result.reason === 'unreachable' || result.reason === 'stopped') {
+        throw new Error(`第 ${step} 格挖开后位置未确认，已停止挖矿`);
       }
       // 走不动就换一个朝向继续。
       const alternative = pickSafeHeading(ctx.bot, position, {
@@ -814,6 +1121,7 @@ async function stripMine(args, ctx) {
       continue;
     }
     position = result.position;
+    completedSteps += 1;
     if (targetName) {
       for (const ore of scanOre(ctx, targetName, 8)) {
         const key = `${ore.x},${ore.y},${ore.z}`;
@@ -824,8 +1132,14 @@ async function stripMine(args, ctx) {
     }
     if (branchEvery > 0 && step % branchEvery === 0 && state.branches < branchCount) {
       const done = await digBranch(ctx, position, heading, branchLength, state);
-      if (!done) notes.push(`第 ${step} 格的支巷没挖成`);
+      if (!done.ok && done.moved) {
+        throw new Error(`第 ${step} 格的支巷没能返回主巷，已停止挖矿以避免位置失配`);
+      }
+      if (!done.ok) notes.push(`第 ${step} 格的支巷没挖成`);
     }
+  }
+  if (completedSteps < length) {
+    throw new Error(`只挖成 ${completedSteps}/${length} 格巷道，已停止挖矿`);
   }
   const end = floorPos(bot.entity.position);
   const parts = [
@@ -860,7 +1174,7 @@ async function deepMine(args, ctx) {
 
   // 下降到目标高度，竖井里同样要躲岩浆。
   if (start.y > targetY) {
-    await digShaftDown(ctx, start.y - targetY, state);
+    await digShaftDown(ctx, start.y - targetY, state, lowHealth);
   } else if (start.y < targetY) {
     notes.push(`现在在 Y=${start.y}，已经比目标 ${targetY} 更深，就在这里挖`);
   }
@@ -869,8 +1183,12 @@ async function deepMine(args, ctx) {
   if (!heading) heading = CARDINAL_HEADINGS[0];
   let position = floorPos(bot.entity.position);
   const branchEvery = branchCount > 0 ? Math.max(2, Math.floor(length / (branchCount + 1))) : 0;
+  let completedSteps = 0;
+  let attempts = 0;
 
-  for (let step = 1; step <= length; step += 1) {
+  while (completedSteps < length && attempts < length * 4) {
+    attempts += 1;
+    const step = completedSteps + 1;
     requireConnected(ctx);
     checkHealth(ctx, lowHealth);
 
@@ -944,6 +1262,9 @@ async function deepMine(args, ctx) {
         notes.push(`${result.message}在 ${formatPosition(result.position)}，改向${heading.name}绕行`);
         continue;
       }
+      if (result.reason === 'unreachable' || result.reason === 'stopped') {
+        throw new Error(`深层第 ${step} 格挖开后位置未确认，已中止挖矿`);
+      }
       const alternative = pickSafeHeading(ctx.bot, position, {
         exclude: [heading.name],
         ahead: 2,
@@ -958,10 +1279,17 @@ async function deepMine(args, ctx) {
       continue;
     }
     position = result.position;
+    completedSteps += 1;
     if (branchEvery > 0 && step % branchEvery === 0 && state.branches < branchCount) {
-      const done = await digBranch(ctx, position, heading, branchLength, state);
-      if (!done) notes.push(`第 ${step} 格的支巷没挖成`);
+      const done = await digBranch(ctx, position, heading, branchLength, state, lowHealth);
+      if (!done.ok && done.moved) {
+        throw new Error(`第 ${step} 格的支巷没能返回主巷，已中止深层挖矿以避免位置失配`);
+      }
+      if (!done.ok) notes.push(`第 ${step} 格的支巷没挖成`);
     }
+  }
+  if (completedSteps < length) {
+    throw new Error(`深层矿道只挖成 ${completedSteps}/${length} 格，已中止`);
   }
   const end = floorPos(bot.entity.position);
   const parts = [
@@ -1013,6 +1341,7 @@ async function plugLava(ctx, hazard, state, notes) {
         return false;
       }
       await ctx.placeBlock({ block: material, x: target.x, y: target.y, z: target.z });
+      checkInterrupted(ctx);
       const placed = blockAtPos(bot, target);
       if (placed && !isHazardBlock(placed)) {
         state.filled += 1;
@@ -1020,11 +1349,65 @@ async function plugLava(ctx, hazard, state, notes) {
         return true;
       }
     } catch (error) {
+      checkInterrupted(ctx);
       notes.push(`填埋失败：${error.message}`);
       return false;
     }
   }
   return false;
+}
+
+// 在有限数量的砂砾里寻找燧石，成功条件是燧石进入背包。
+async function collectFlint(args, ctx) {
+  requireConnected(ctx);
+  const target = clampInt(args.count, 1, 1, 16);
+  const range = clampInt(args.range, 32, 8, 64);
+  const before = ctx.countItem('flint');
+  if (before >= target) {
+    return { detail: `背包里已经有 ${before} 个燧石，不需要继续挖砂砾`, status: 'succeeded' };
+  }
+  const gravel = registryOf(ctx)?.blocksByName?.gravel;
+  if (!gravel) throw new Error('当前 Minecraft 数据里没有 gravel 方块定义');
+  const positions = await findCandidateBlocks(
+    ctx,
+    gravel.id,
+    range,
+    Math.min(256, Math.max(64, (target - before) * 24)),
+  );
+  if (positions.length === 0) throw new Error(`附近 ${range} 格内没有砂砾，无法继续找燧石`);
+  const failures = [];
+  let broken = 0;
+  for (const position of positions) {
+    requireConnected(ctx);
+    checkHealth(ctx);
+    if (ctx.countItem('flint') >= target) break;
+    const block = blockAtPos(ctx.bot, position);
+    if (!block || block.name !== 'gravel') continue;
+    if (distanceBetween(ctx.bot.entity.position, position) > MINE_REACH) {
+      const outcome = await ctx.travelToBlock(position, 30000);
+      checkInterrupted(ctx);
+      if (outcome === 'cancelled') throw new Error('寻找燧石时移动被取消');
+      if (outcome === 'low_health') throw new Error(`血量不足（血量 ${ctx.bot.health}），停止寻找燧石`);
+      if (outcome !== 'reached') {
+        failures.push(`${formatPosition(position)} 走不到`);
+        continue;
+      }
+    }
+    const dig = await digAt(ctx, position);
+    checkInterrupted(ctx);
+    if (!dig.ok) {
+      failures.push(`${formatPosition(position)} ${dig.message}`);
+      continue;
+    }
+    broken += 1;
+    await collectDrop(ctx, 'flint');
+    checkInterrupted(ctx);
+  }
+  const gained = ctx.countItem('flint') - before;
+  if (gained < target - before) {
+    throw new Error(`已挖 ${broken} 块砂砾，只获得 ${gained} 个燧石，还差 ${target - before - gained} 个${failures.length ? `；${failures.join('；')}` : ''}`);
+  }
+  return { detail: `挖了 ${broken} 块砂砾，获得 ${gained} 个燧石，背包共 ${ctx.countItem('flint')} 个`, status: 'succeeded' };
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,14 +1435,19 @@ async function findDiamond(args, ctx) {
     maxDistance: radius,
     count: Math.max(want * 4, 16),
   });
-  const hits = positions.filter((position) => position.y >= yMin && position.y <= yMax).slice(0, want);
+  const hits = positions
+    .filter((position) => position.y >= yMin && position.y <= yMax)
+    .filter((position) => {
+      const block = blockAtPos(bot, position);
+      return Boolean(block && isDiamondOre(block.name));
+    })
+    .slice(0, want);
   if (hits.length === 0) {
     throw new Error(`在 Y ${yMin} 到 ${yMax} 的区间内没有找到钻石矿（搜了 ${radius} 格）`);
   }
   const detail = hits.map((position) => {
     const block = blockAtPos(bot, position);
-    const name = block && isDiamondOre(block.name) ? block.name : DIAMOND_ORES[0];
-    return `${name} ${formatPosition(position)}`;
+    return `${block.name} ${formatPosition(position)}`;
   });
   const deep = hits.filter((position) => {
     const block = blockAtPos(bot, position);
@@ -1076,6 +1464,29 @@ async function findDiamond(args, ctx) {
 // ---------------------------------------------------------------------------
 
 export const skills = {
+  fill_water_bucket: {
+    description: '用空桶装取附近的静止水源，并确认背包实际获得水桶。',
+    parameters: [
+      { name: 'range', type: 'number', required: false, default: 32, description: '静止水源搜索范围，4-64 格。' },
+    ],
+    handler: fillWaterBucket,
+  },
+  collect_obsidian: {
+    description: '优先采集现有黑曜石；不足时在主世界将可安全接近的静止岩浆源逐个浇成黑曜石，回收水源后用钻石镐采集并按背包验收。',
+    parameters: [
+      { name: 'count', type: 'number', required: false, default: 10, description: '目标黑曜石数量，最多 10 个。' },
+      { name: 'range', type: 'number', required: false, default: 32, description: '搜索范围，8-64 格。' },
+    ],
+    handler: collectObsidian,
+  },
+  collect_flint: {
+    description: '有限挖掘砂砾并实际收集燧石；按背包燧石数量停下，不把砂砾当作任务产物。',
+    parameters: [
+      { name: 'count', type: 'number', required: false, default: 1, description: '需要的燧石数量，范围 1-16。' },
+      { name: 'range', type: 'number', required: false, default: 32, description: '砂砾搜索范围，范围 8-64 格。' },
+    ],
+    handler: collectFlint,
+  },
   mine_collect: {
     description:
       '挖指定方块：按目标换工具，挖掉之后等掉落物，走过去真的捡起来，最后核对背包数量。',

@@ -58,7 +58,18 @@ def test_stage_accepts_colored_bed_items() -> None:
     assert is_complete(stage, {"red_bed": 1, "cooked_beef": 3})
 
 
+def test_nether_stage_budget_matches_eyes_for_search_and_end_portal() -> None:
+    stage = stage_by_id("S5")
+    end_stage = stage_by_id("S6")
+    assert stage is not None and end_stage is not None
+    assert stage.produces == {"blaze_rod": 12, "ender_pearl": 24}
+    assert end_stage.requires == stage.produces
+    assert not is_complete(stage, {"blaze_rod": 7, "ender_pearl": 16})
+    assert is_complete(stage, {"blaze_rod": 12, "ender_pearl": 24})
+
+
 def test_end_stage_needs_an_event() -> None:
     stage = stage_by_id("S6")
     assert stage is not None
     assert not is_complete(stage, {})
+    assert is_complete(stage, {}, {"ender_dragon_killed"})

@@ -142,9 +142,9 @@ export function createCombat({ bot, goals, helpers }) {
 | S0 | 徒手撸树、做工作台、木镐 | gather、craft、equip_tool |
 | S1 | 石镐、石剑、熔炉 | gather、craft、smelt |
 | S2 | 食物与临时庇护所 | combat、eat、build、sleep |
-| S3 | 铁装、盾、 bucket | strip_mine、smelt、craft |
+| S3 | 铁装、盾与空桶（9 铁锭） | strip_mine、smelt、craft |
 | S4 | 钻石、附魔台 | strip_mine、craft、explore |
-| S5 | 下界、烈焰棒、末影珍珠 | nether_portal、combat、trade |
+| S5 | 主世界装水、浇铸黑曜石；下界、烈焰棒、末影珍珠 | fill_water_bucket、collect_obsidian、nether_portal、combat、trade |
 | S6 | 要塞、末地、打龙 | end_run、bow_kite、build |
 
 每个阶段只依赖前一个阶段产出的物品与方块，任务层按这个顺序编排。

@@ -32,10 +32,6 @@ const DEFAULT_DRAGON_RADIUS = 64;
 // 投掷记录只保留最近 8 次，避免长跑时越攒越多。
 const MAX_THROW_RECORDS = 8;
 
-const moduleState = {
-  throws: [],
-};
-
 // ------------------------------------------------------------------ 纯逻辑
 
 export function isEndDimension(dimension) {
@@ -161,6 +157,15 @@ function currentDimension(ctx) {
   return String((game && game.dimension) || '').toLowerCase();
 }
 
+function isExpectedDimension(ctx, expected) {
+  const actual = currentDimension(ctx);
+  if (expected === END_DIMENSION) return isEndDimension(actual);
+  if (expected === OVERWORLD_DIMENSION) {
+    return actual === OVERWORLD_DIMENSION || actual === 'overworld';
+  }
+  return actual === expected;
+}
+
 function sleepMs(ctx, ms) {
   if (typeof ctx.sleep === 'function') return ctx.sleep(ms);
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -168,6 +173,10 @@ function sleepMs(ctx, ms) {
 
 function log(ctx, ...args) {
   if (typeof ctx.log === 'function') ctx.log(...args);
+}
+
+function throwIfInterrupted(ctx, action) {
+  if (ctx && ctx.interrupted) throw new Error(`${action}被新的指令打断`);
 }
 
 function clampNumber(value, fallback, min, max) {
@@ -286,6 +295,7 @@ function entityGone(ctx, entity) {
 async function waitEntityGone(ctx, entity, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    throwIfInterrupted(ctx, '等待实体状态');
     if (entityGone(ctx, entity)) return true;
     await sleepMs(ctx, 200);
   }
@@ -293,10 +303,15 @@ async function waitEntityGone(ctx, entity, timeoutMs) {
 }
 
 async function activateOnce(ctx) {
+  throwIfInterrupted(ctx, '使用末影之眼');
   const bot = botOf(ctx);
   await bot.activateItem();
-  await sleepMs(ctx, 120);
-  if (typeof bot.deactivateItem === 'function') await bot.deactivateItem();
+  try {
+    await sleepMs(ctx, 120);
+  } finally {
+    if (typeof bot.deactivateItem === 'function') await bot.deactivateItem();
+  }
+  throwIfInterrupted(ctx, '使用末影之眼');
 }
 
 // 跟踪刚投出的末影之眼，返回它最后被看到的位置。
@@ -305,6 +320,7 @@ async function trackEye(ctx, knownIds, durationMs) {
   let eye = null;
   let last = null;
   while (Date.now() < deadline) {
+    throwIfInterrupted(ctx, '跟踪末影之眼');
     await sleepMs(ctx, 100);
     const candidates = eyeEntities(ctx).filter((entity) => entity && !knownIds.has(entity.id));
     if (candidates.length > 0) eye = candidates[0];
@@ -315,12 +331,20 @@ async function trackEye(ctx, knownIds, durationMs) {
 }
 
 async function moveToward(ctx, x, z, radius = 3) {
+  throwIfInterrupted(ctx, '靠近要塞');
   const bot = botOf(ctx);
   const y = Math.floor(bot.entity.position.y);
   try {
-    await ctx.travelTo(Math.floor(x), y, Math.floor(z), radius);
+    const result = await ctx.travelTo(Math.floor(x), y, Math.floor(z), radius);
+    const position = bot.entity.position;
+    if (![position.x, position.z].every(Number.isFinite)) return false;
+    if (Math.hypot(position.x - x, position.z - z) > radius + 1) return false;
+    if (result && Number.isFinite(result.distance) && result.distance > radius + 2) {
+      return false;
+    }
     return true;
   } catch (error) {
+    throwIfInterrupted(ctx, '靠近要塞');
     log(ctx, '朝目标移动失败', error.message);
     return false;
   }
@@ -329,6 +353,7 @@ async function moveToward(ctx, x, z, radius = 3) {
 // ------------------------------------------------------------------ 技能：投掷末影之眼
 
 async function throwEye(args, ctx) {
+  throwIfInterrupted(ctx, '寻找要塞');
   const bot = botOf(ctx);
   const dimension = currentDimension(ctx);
   if (isEndDimension(dimension)) {
@@ -346,10 +371,11 @@ async function throwEye(args, ctx) {
 
   let throws = 0;
   let lastDirection = null;
-  let lastOrigin = null;
+  const throwRecords = [];
   const notes = [];
 
   for (let index = 0; index < maxThrows && Date.now() < deadline; index += 1) {
+    throwIfInterrupted(ctx, '寻找要塞');
     const eye = findItem(ctx, EYE_ITEM);
     if (!eye) {
       if (throws === 0) {
@@ -365,11 +391,13 @@ async function throwEye(args, ctx) {
     const knownIds = new Set(eyeEntities(ctx).map((entity) => entity.id));
 
     await bot.equip(eye, 'hand');
+    throwIfInterrupted(ctx, '寻找要塞');
     await bot.look(yaw, 0, true);
     await activateOnce(ctx);
     throws += 1;
 
     const observed = await trackEye(ctx, knownIds, 2400);
+    throwIfInterrupted(ctx, '寻找要塞');
     let direction = fallback;
     let eyeDistance = null;
     if (observed) {
@@ -381,15 +409,14 @@ async function throwEye(args, ctx) {
     }
 
     lastDirection = direction;
-    lastOrigin = origin;
-    moduleState.throws.push({
+    throwRecords.push({
       x: origin.x,
       z: origin.z,
       dx: direction.dx,
       dz: direction.dz,
     });
-    if (moduleState.throws.length > MAX_THROW_RECORDS) {
-      moduleState.throws = moduleState.throws.slice(-MAX_THROW_RECORDS);
+    if (throwRecords.length > MAX_THROW_RECORDS) {
+      throwRecords.splice(0, throwRecords.length - MAX_THROW_RECORDS);
     }
 
     const frames = findFramesNearby(ctx, frameRadius);
@@ -418,17 +445,39 @@ async function throwEye(args, ctx) {
       break;
     }
 
-    if (advance > 0 && Date.now() < deadline) {
+    const estimate = estimateStronghold(throwRecords);
+    if (advance > 0 && estimate && estimate.distance <= advance + frameRadius) {
+      const moved = await moveToward(ctx, estimate.x, estimate.z, 4);
+      throwIfInterrupted(ctx, '寻找要塞');
+      if (moved) {
+        const estimatedFrames = findFramesNearby(ctx, Math.min(frameRadius * 2, 64));
+        if (estimatedFrames.length > 0) {
+          return {
+            detail:
+              `根据 ${estimate.throws} 次投掷收敛到要塞估算点 (${estimate.x}, ${estimate.z})，` +
+              `在附近发现 ${estimatedFrames.length} 个末地门框架`,
+            status: 'succeeded',
+          };
+        }
+        notes.push(`已到达要塞估算点 (${estimate.x}, ${estimate.z})，附近尚未发现门框`);
+      } else {
+        notes.push(`无法到达要塞估算点 (${estimate.x}, ${estimate.z})`);
+      }
+    } else if (advance > 0 && Date.now() < deadline) {
       const targetX = origin.x + direction.dx * advance;
       const targetZ = origin.z + direction.dz * advance;
       const moved = await moveToward(ctx, targetX, targetZ, 4);
+      throwIfInterrupted(ctx, '寻找要塞');
       if (!moved) notes.push(`朝要塞方向走 ${advance} 格失败`);
     }
   }
 
-  const estimate = estimateStronghold(moduleState.throws);
+  const estimate = estimateStronghold(throwRecords);
   if (throws === 0) {
     throw new Error('一次末影之眼都没有投出去，先确认背包里有末影之眼');
+  }
+  if (!estimate) {
+    throw new Error('已投掷末影之眼，但方向数据不足，无法可靠估算要塞位置；不会把结果当成已定位');
   }
   const head =
     `投了 ${throws} 次末影之眼，最后一次朝向 ` +
@@ -441,17 +490,19 @@ async function throwEye(args, ctx) {
   const tail = notes.length ? `；${notes.join('，')}` : '';
   return {
     detail: `${head}${guess}${tail}`,
-    status: 'succeeded',
+    status: estimate ? 'partial' : 'failed',
   };
 }
 
 // ------------------------------------------------------------------ 技能：激活末地门
 
 async function insertEye(ctx, frame) {
+  throwIfInterrupted(ctx, '激活末地门');
   const bot = botOf(ctx);
   try {
     await ctx.travelTo(frame.position.x, frame.position.y, frame.position.z, 2);
   } catch (error) {
+    throwIfInterrupted(ctx, '激活末地门');
     log(ctx, '没走到末地门框架', error.message);
   }
   const eye = findItem(ctx, EYE_ITEM);
@@ -463,6 +514,7 @@ async function insertEye(ctx, frame) {
   const before = frameHasEye(fresh);
   if (before) return true;
 
+  throwIfInterrupted(ctx, '激活末地门');
   try {
     if (typeof bot.activateBlock === 'function') {
       await bot.activateBlock(fresh);
@@ -473,6 +525,7 @@ async function insertEye(ctx, frame) {
     log(ctx, '放末影之眼失败', error.message);
   }
   await sleepMs(ctx, 400);
+  throwIfInterrupted(ctx, '激活末地门');
 
   let after = bot.blockAt(fresh.position);
   if (frameHasEye(after)) return true;
@@ -484,12 +537,15 @@ async function insertEye(ctx, frame) {
     await sleepMs(ctx, 400);
     after = bot.blockAt(fresh.position);
   } catch (error) {
+    throwIfInterrupted(ctx, '激活末地门');
     log(ctx, '第二次放末影之眼失败', error.message);
   }
+  throwIfInterrupted(ctx, '激活末地门');
   return frameHasEye(after);
 }
 
-async function enterEndPortal(ctx, portal, timeoutMs) {
+async function enterEndPortal(ctx, portal, expectedDimension, timeoutMs) {
+  throwIfInterrupted(ctx, '进入末地');
   const bot = botOf(ctx);
   const x = Math.floor(portal.x);
   const y = Math.floor(portal.y);
@@ -497,12 +553,14 @@ async function enterEndPortal(ctx, portal, timeoutMs) {
   try {
     await ctx.travelTo(x, y, z, 1);
   } catch (error) {
+    throwIfInterrupted(ctx, '进入末地');
     log(ctx, '没走到末地门', error.message);
   }
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (isEndDimension(currentDimension(ctx))) return true;
+    throwIfInterrupted(ctx, '进入末地');
+    if (isExpectedDimension(ctx, expectedDimension)) return true;
     try {
       if (typeof ctx.walkOnce === 'function') {
         await ctx.walkOnce(x, y, z, 1, 4000);
@@ -517,10 +575,11 @@ async function enterEndPortal(ctx, portal, timeoutMs) {
     }
     await sleepMs(ctx, 400);
   }
-  return isEndDimension(currentDimension(ctx));
+  return isExpectedDimension(ctx, expectedDimension);
 }
 
 async function activateEndPortal(args, ctx) {
+  throwIfInterrupted(ctx, '激活末地门');
   const dimension = currentDimension(ctx);
   if (isEndDimension(dimension)) {
     return { detail: '已经在末地，不需要再激活末地门', status: 'succeeded' };
@@ -567,8 +626,10 @@ async function activateEndPortal(args, ctx) {
       })
       .slice(0, need);
     for (const frame of unfilled) {
+      throwIfInterrupted(ctx, '激活末地门');
       if (Date.now() > deadline) break;
       const ok = await insertEye(ctx, frame);
+      throwIfInterrupted(ctx, '激活末地门');
       if (ok) inserted += 1;
       else failures.push(`${frame.position.x}, ${frame.position.y}, ${frame.position.z}`);
       await sleepMs(ctx, 250);
@@ -593,7 +654,12 @@ async function activateEndPortal(args, ctx) {
     throw new Error(`${PORTAL_FRAME_COUNT} 个框架都填满了，但没有出现末地门`);
   }
   const portal = portals[0];
-  const entered = await enterEndPortal(ctx, portal, Math.max(5000, deadline - Date.now()));
+  const entered = await enterEndPortal(
+    ctx,
+    portal,
+    END_DIMENSION,
+    Math.max(5000, deadline - Date.now()),
+  );
   if (!entered) {
     throw new Error('末地门已激活，但走进门后没有切到末地');
   }
@@ -603,7 +669,7 @@ async function activateEndPortal(args, ctx) {
       `填了 ${inserted} 个末地门框架（原有 ${filledBefore} 个），` +
       `从 (${Math.floor(portal.x)}, ${Math.floor(portal.y)}, ${Math.floor(portal.z)}) 进入末地，` +
       `现在在 (${Math.floor(position.x)}, ${Math.floor(position.y)}, ${Math.floor(position.z)})`,
-    status: 'succeeded',
+    status: outcome.status === 'partial' ? 'partial' : outcome.status === 'failed' ? 'failed' : 'succeeded',
   };
 }
 
@@ -615,7 +681,28 @@ async function clearCrystals(ctx, radius, deadline) {
   let failed = 0;
   let guard = 0;
 
+  const initialCrystals = findEntities(ctx, CRYSTAL_ENTITY, radius);
+  if (initialCrystals.length === 0) {
+    return { broken: 0, failed: 0, left: 0, notes };
+  }
+  if (typeof ctx.runSkill === 'function') {
+    throwIfInterrupted(ctx, '清除末地水晶');
+    await ctx.runSkill('break_crystal', {
+      count: 0,
+      radius,
+      safe_distance: 12,
+      interval: 1200,
+    });
+    throwIfInterrupted(ctx, '清除末地水晶');
+    const left = findEntities(ctx, CRYSTAL_ENTITY, radius).length;
+    return { broken: Math.max(0, initialCrystals.length - left), failed: 0, left, notes };
+  }
+  if (typeof ctx.findRangedWeapon !== 'function' || !ctx.findRangedWeapon() || typeof ctx.shootAt !== 'function') {
+    throw new Error('附近有末地水晶，但没有可用弓和箭；拒绝靠近水晶进行近战');
+  }
+
   while (Date.now() < deadline && guard < 40) {
+    throwIfInterrupted(ctx, '清除末地水晶');
     guard += 1;
     const crystals = findEntities(ctx, CRYSTAL_ENTITY, radius);
     if (crystals.length === 0) break;
@@ -636,10 +723,12 @@ async function clearCrystals(ctx, radius, deadline) {
         botOf(ctx).attack(crystal);
       }
     } catch (error) {
+      throwIfInterrupted(ctx, '清除末地水晶');
       notes.push(`打水晶失败：${error.message}`);
     }
 
     const gone = await waitEntityGone(ctx, crystal, 5000);
+    throwIfInterrupted(ctx, '清除末地水晶');
     if (gone) broken.add(crystal.id);
     else failed += 1;
 
@@ -673,6 +762,7 @@ async function moveToArenaCenter(ctx) {
 }
 
 async function fightDragon(args, ctx) {
+  throwIfInterrupted(ctx, '末地战斗');
   const bot = botOf(ctx);
   if (!isEndDimension(currentDimension(ctx))) {
     throw new Error(`当前在${dimensionLabel(currentDimension(ctx))}，末影龙只在末地`);
@@ -687,13 +777,21 @@ async function fightDragon(args, ctx) {
   if (!dragon) {
     const waitUntil = Math.min(deadline, Date.now() + 8000);
     while (!dragon && Date.now() < waitUntil) {
+      throwIfInterrupted(ctx, '末地战斗');
       await sleepMs(ctx, 500);
       dragon = findEntity(ctx, DRAGON_ENTITY, radius);
     }
   }
   if (!dragon) {
     if (findBlockPositions(ctx, PORTAL_BLOCK, radius, 4).length > 0) {
-      return { detail: '末影龙已经不在了，末地中央有返回传送门', status: 'succeeded' };
+      return {
+        detail: '末影龙已经不在了，末地中央有返回传送门',
+        status: 'succeeded',
+        data: {
+          events: ['ender_dragon_killed'],
+          evidence: 'return_portal_present_dragon_absent',
+        },
+      };
     }
     throw new Error('附近没有末影龙，可能还没生成');
   }
@@ -710,20 +808,30 @@ async function fightDragon(args, ctx) {
   let lastDetail = '';
   let lastHealth = Number(dragon.health);
   while (Date.now() < deadline) {
+    throwIfInterrupted(ctx, '末地战斗');
     dragon = findEntity(ctx, DRAGON_ENTITY, radius);
     if (!dragon) {
-      return {
-        detail:
-          `击败了末影龙，打碎 ${crystalResult.broken} 个末地水晶` +
-          (notes.length ? `；过程记录：${notes.slice(-3).join('，')}` : ''),
-        status: 'succeeded',
-      };
+      if (findBlockPositions(ctx, PORTAL_BLOCK, 128, 8).length > 0) {
+        return {
+          detail:
+            `确认中央返回传送门已出现，末影龙不在附近；打碎 ${crystalResult.broken} 个末地水晶` +
+            (notes.length ? `；过程记录：${notes.slice(-3).join('，')}` : ''),
+          status: 'succeeded',
+          data: {
+            events: ['ender_dragon_killed'],
+            evidence: 'return_portal_present_dragon_absent',
+          },
+        };
+      }
+      await sleepMs(ctx, 500);
+      continue;
     }
     lastHealth = Number(dragon.health);
     if (Number.isFinite(lastHealth) && lastHealth <= 0) {
       return {
         detail: `末影龙血量归零，打碎 ${crystalResult.broken} 个末地水晶`,
         status: 'succeeded',
+        data: { events: ['ender_dragon_killed'], evidence: 'dragon_health_zero' },
       };
     }
 
@@ -743,6 +851,7 @@ async function fightDragon(args, ctx) {
         try {
           await ctx.retreatFrom(dragon);
         } catch (error) {
+          throwIfInterrupted(ctx, '末地战斗');
           notes.push(`后撤失败：${error.message}`);
         }
         await sleepMs(ctx, 800);
@@ -756,6 +865,7 @@ async function fightDragon(args, ctx) {
       try {
         await ctx.retreatFrom(threat);
       } catch (error) {
+        throwIfInterrupted(ctx, '末地战斗');
         notes.push(`躲龙息失败：${error.message}`);
       }
       await sleepMs(ctx, 500);
@@ -780,6 +890,7 @@ async function fightDragon(args, ctx) {
         }
       }
     } catch (error) {
+      throwIfInterrupted(ctx, '末地战斗');
       notes.push(`攻击失败：${error.message}`);
     }
     await sleepMs(ctx, 500);
@@ -796,6 +907,7 @@ async function fightDragon(args, ctx) {
 // ------------------------------------------------------------------ 技能：返回主世界
 
 async function returnHome(args, ctx) {
+  throwIfInterrupted(ctx, '返回主世界');
   const bot = botOf(ctx);
   const dimension = currentDimension(ctx);
   if (isOverworldDimension(dimension)) {
@@ -815,6 +927,7 @@ async function returnHome(args, ctx) {
     try {
       await ctx.travelTo(0, Math.floor(position.y), 0, 6);
     } catch (error) {
+      throwIfInterrupted(ctx, '返回主世界');
       log(ctx, '回中央祭坛失败', error.message);
     }
   }
@@ -828,7 +941,7 @@ async function returnHome(args, ctx) {
   const origin = bot.entity.position;
   portals.sort((a, b) => origin.distanceTo(a) - origin.distanceTo(b));
   const portal = portals[0];
-  const entered = await enterEndPortal(ctx, portal, timeoutMs);
+  const entered = await enterEndPortal(ctx, portal, OVERWORLD_DIMENSION, timeoutMs);
   if (!entered) {
     throw new Error('走进了返回传送门，但没有回到主世界');
   }

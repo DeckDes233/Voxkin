@@ -178,3 +178,58 @@ test('leave_shelter stops after cancellation and reports its partial opening', a
   assert.equal(world.getBlock(1, 1, 0).name, 'air');
   assert.equal(world.getBlock(1, 2, 0).name, 'cobblestone');
 });
+
+test('equip_armor reports verified equipped slots and any remaining empty slots', async () => {
+  const slots = [];
+  const world = makeWorld();
+  world.bot.inventory.slots = slots;
+  world.bot.armorManager = {
+    async equipAll() {
+      slots[5] = { name: 'iron_helmet', count: 1 };
+      slots[6] = { name: 'iron_chestplate', count: 1 };
+    },
+  };
+
+  const result = await skills.equip_armor.handler({}, world.ctx);
+
+  assert.equal(result.status, 'succeeded');
+  assert.equal(result.verified, true);
+  assert.deepEqual(result.equippedSlots, {
+    helmet: { name: 'iron_helmet', count: 1 },
+    chestplate: { name: 'iron_chestplate', count: 1 },
+    leggings: null,
+    boots: null,
+  });
+  assert.deepEqual(JSON.parse(result.detail.match(/结果=(\{.*\})$/)[1]), {
+    equippedSlots: result.equippedSlots,
+    emptySlots: ['leggings', 'boots'],
+    status: 'succeeded',
+    verified: true,
+  });
+  assert.match(result.detail, /头盔：iron_helmet、胸甲：iron_chestplate/);
+  assert.match(result.detail, /空槽：护腿、靴子/);
+});
+
+test('equip_armor does not claim success when no armor is present after equipping', async () => {
+  const world = makeWorld();
+  world.bot.inventory.slots = [];
+  world.bot.armorManager = { async equipAll() {} };
+
+  const result = await skills.equip_armor.handler({}, world.ctx);
+
+  assert.equal(result.status, 'failed');
+  assert.equal(result.verified, false);
+  assert.deepEqual(result.equippedSlots, {
+    helmet: null,
+    chestplate: null,
+    leggings: null,
+    boots: null,
+  });
+  assert.deepEqual(JSON.parse(result.detail.match(/结果=(\{.*\})$/)[1]), {
+    equippedSlots: result.equippedSlots,
+    emptySlots: ['helmet', 'chestplate', 'leggings', 'boots'],
+    status: 'failed',
+    verified: false,
+  });
+  assert.match(result.detail, /未确认到已装备护甲/);
+});

@@ -2,7 +2,7 @@
 
 本文是技能清单的事实来源。技能名、分类、类型、参数、失败条件、可否取消、验收描述以 `bridge/skills/manifest.json` 为准；真实行为以 `bridge/minecraft_bridge.js` 为准；模型看到的工具定义以 `src/voxkin/agent/tools.py` 为准。
 
-> 历史审计基线（2026-10-22 21:50）：当时记录 36 条模块技能、57 条清单技能与 245 个 Python 测试；下方 21 条基线明细保留为拆分前快照。当前状态（2026-10-23）：清单已有 58 条（21 个内建 + 37 个模块技能），Python 测试 270 passed，剪羊技能另有 8 个桥接模拟测试。S2 剪羊与铁矿采集路线仍无真实服务器证据；S1 实机证据见 `docs/evidence/S1_NORMAL_20261022.md`。
+> 历史审计基线（2026-10-22 21:50）：当时记录 36 条模块技能、57 条清单技能与 245 个 Python 测试；第 2 节早期内建技能明细保留为快照。当前事实以 2026-10-24 清单为准：64 条技能（21 个内建、43 个模块），Core 暴露 63 个工具，固定 S0–S6 计划共 63 步。S0/S1 有真实服务器证据；本轮新增 `prepare_bow_arrows` 只有模拟测试，不代表 S2–S6 或全流程实机验收。
 
 ## 0. 基线与口径
 
@@ -10,7 +10,7 @@
 
 提交 `11c83c8`，加上 2026-10-22 工作区中尚未提交的改动：`bridge/minecraft_bridge.js`、`src/voxkin/agent/actions.py`、`src/voxkin/agent/run_manager.py`、`src/voxkin/agent/runner.py`、`src/voxkin/bridge/protocol.py`、`src/voxkin/runtime.py`，新增 `bridge/skills/manifest.js`、`bridge/skills/manifest.json`、`scripts/dump_manifest.js`、`src/voxkin/agent/skills.py`、`tests/test_skill_manifest.py`、`tests/test_action_status.py`。
 
-本文所有行号都指上述基线。`bridge/minecraft_bridge.js` 在 2026-10-22 下午被改过，新增了 `statusForError` 与带 `status` 的 `reply`，第 399 行之后的行号整体后移 12 行。
+以上提交和其后的 21 技能统计、旧行号及逐项内建技能验收指令均为 2026-10-22 的历史审计基线，不是当前 HEAD。当前数量与调用链请以本节日期的源码和 1.1 统计为准；下方基线条目保留作历史快照，不能据此推断模块技能当前缺失或按旧行号定位。
 
 ### 0.2 事实来源优先级
 
@@ -36,7 +36,7 @@ node scripts/dump_manifest.js
 git diff --exit-code bridge/skills/manifest.json
 ```
 
-期望：脚本打印「技能总数 21」「按 group：{"基础类":13,"实用类":8}」「按 type：{"sense":4,"act":8,"path":6,"wait":2,"voice":1}」；pytest 5 个用例通过；`bridge/skills/manifest.json` 没有改动。
+历史基线期望：脚本打印「技能总数 21」及当时的分类数量。当前清单为 64 项，运行生成脚本会更新清单文件，不能再用旧期望值或 `git diff --exit-code` 判断当前技能是否一致。
 
 A2 命令与期望：
 
@@ -44,7 +44,7 @@ A2 命令与期望：
 .\.venv\Scripts\python.exe -m pytest tests/test_action_status.py tests/test_actions.py tests/test_runner.py -q
 ```
 
-期望：27 个用例通过（12 + 8 + 7）。这一步证明技能名能进入派发链路、回帧状态能被归入七档、步骤状态会被写进 JSONL 记录。
+历史基线期望：27 个用例通过（12 + 8 + 7）。当前协议定义九种状态；当前测试数量与覆盖请按现有测试文件和本次实际运行记录为准。
 
 B 级统一准备：
 
@@ -55,7 +55,7 @@ Invoke-RestMethod http://127.0.0.1:8765/api/bridge/state
 
 期望：`connected` 为 `true`，`ready` 为 `true`，`age_s` 小于 15。
 
-B 级触发：把该技能的 `StepSpec` 写进 `src/voxkin/agent/plans.py` 的 `PLANS`（例如新增一个 `"probe"` 阶段），然后执行
+B 级触发：旧审计建议把技能临时写进 `src/voxkin/agent/plans.py` 再运行阶段脚本。该脚本会重置评测世界；仅可在确认使用专用、可丢弃且已备份的隔离世界后执行，不能对用户世界或不明服务器运行。
 
 ```
 .\.venv\Scripts\python.exe scripts\run_stage.py --stage probe --runs 1 --difficulty normal
@@ -71,10 +71,10 @@ B 级观察：`runs/<stage>-<时间戳>.json` 里的 `passed`、`detail`；同�
 
 | 项 | 数量 | 依据 |
 | --- | --- | --- |
-| 清单技能总数 | 58 | `bridge/skills/manifest.json`，21 个内建 + 37 个模块技能（2026-10-23） |
+| 清单技能总数 | 64 | `bridge/skills/manifest.json`，21 个内建 + 43 个模块技能（2026-10-24） |
 | 桥接动作分支数 | 21 | `bridge/minecraft_bridge.js` 的内建 `case`，模块技能走注册表 default 分支 |
-| Core 侧工具定义数 | 54 | `src/voxkin/agent/tools.py` 的 `build_tools()`，`chat` 不在其中 |
-| 阶段计划条数 | 53 | `src/voxkin/agent/plans.py`，S0–S6 |
+| Core 侧工具定义数 | 63 | `src/voxkin/agent/tools.py` 的 `build_tools()`，不含仅供游戏内调用的 `chat` |
+| 阶段计划条数 | 63 | `src/voxkin/agent/plans.py`，S0–S6 当前固定计划 |
 | 阶段表条数 | 7 | `src/voxkin/agent/progress.py`，S0 到 S6 |
 
 ### 1.2 按分类
@@ -82,21 +82,21 @@ B 级观察：`runs/<stage>-<时间戳>.json` 里的 `passed`、`detail`；同�
 | 分类 | 数量 | 技能 |
 | --- | --- | --- |
 | 基础类 | 13 | observe、inventory、locate_block、locate_entity、look_at_player、goto、goto_block、follow_player、come_to_player、stop、eat、sleep、chat |
-| 实用类 | 8 | attack_nearest、attack_target、collect_blocks、break_block、place_block、pickup_items、craft、smelt |
-| 专精类 | 37 | 采集、合成、生存、战斗、移动、箱子、下界、末地模块；逐条见 `bridge/skills/manifest.json` |
+| 实用类 | 9 | attack_nearest、attack_target、collect_blocks、break_block、place_block、pickup_items、craft、smelt、fill_water_bucket |
+| 专精类 | 42 | 采集、合成、生存、战斗、移动、箱子、下界、末地模块；逐条见 `bridge/skills/manifest.json` |
 
 ### 1.3 按类型
 
 | 类型 | 数量 | 技能 |
 | --- | --- | --- |
 | sense | 6 | observe、inventory、locate_block、locate_entity、find_diamond、list_chest |
-| act | 43 | 基础动作与模块技能，逐条见 `bridge/skills/manifest.json` |
+| act | 49 | 内建动作与模块技能，逐条见 `bridge/skills/manifest.json` |
 | path | 6 | goto、goto_block、follow_player、come_to_player、collect_blocks、pickup_items |
 | wait | 2 | sleep、smelt |
 | voice | 1 | chat |
 | plan | 0 | 阶段编排放在 Core 的 `src/voxkin/agent/plans.py` |
 
-### 1.4 按状态
+### 1.4 按状态（2026-10-22 历史快照）
 
 | 状态 | 数量 | 技能 |
 | --- | --- | --- |
@@ -105,11 +105,13 @@ B 级观察：`runs/<stage>-<时间戳>.json` 里的 `passed`、`detail`；同�
 | missing | 0 | 无 |
 | blocked | 1 | chat |
 
-专精类为空是独立通关最大的阻塞点，见第 6 节。
+本节的状态计数是早期 21 个内建工具的审计快照，不代表当前全部 64 项技能状态；当前技能定义与实现以清单及各模块源码为准。
 
 ## 2. 技能总表
 
-每条包含四项：来源位置、当前实际行为、缺失能力、验收方法。
+第 2.1 与 2.2 节的逐项内建技能描述、状态和行号保留自 2026-10-22 的 21 技能审计快照；后续代码可能已改变。它们不完整覆盖当前 64 项清单，也不能取代当前事实。当前技能 ID、参数和能力描述以 `bridge/skills/manifest.json` 为准；当前实现须查看对应的内建分支或 `bridge/skills/*.js`。当前真实服务器证据只包括第 7 节列出的记录。
+
+历史快照中的每条包含来源位置、当时实际行为、当时已知缺失能力与建议验收方法。
 
 ### 2.1 基础类
 
@@ -269,7 +271,7 @@ B 级观察：`runs/<stage>-<时间戳>.json` 里的 `passed`、`detail`；同�
 
 当前行为：收到 `stop` 时先把动作队列里所有待执行动作清空，逐个回「被停止指令取消」，状态 `cancelled`（`bridge/minecraft_bridge.js:221`），再通过 `interruptCurrent`（`bridge/minecraft_bridge.js:206`）设置 `interrupted` 标志、停 pathfinder、停挖掘、清控制状态，最后自己插到队列最前面执行，停掉跟随。
 
-缺失能力：Core 侧没有取消正在等待中的动作的入口，`stop` 只能从桥接本地触发。
+缺失能力：桥接本地 `stop`、Core 取消在途动作与阶段任务停止是不同控制路径，尚未统一为一个全局任务取消语义；取消请求发出也不等于每个技能都已在世界侧安全收敛。实现证据见第 5 节。
 
 验收方法：B 级，在一次 `collect_blocks` 执行中发 `stop`。期望队列里后续动作全部回「被停止指令取消」，桥接日志出现「打断当前动作」，JSONL 里对应步骤的 `status` 是 `cancelled`。
 
@@ -453,9 +455,7 @@ B 级观察：`runs/<stage>-<时间戳>.json` 里的 `passed`、`detail`；同�
 
 ### 2.3 专精类
 
-清单里没有专精类技能。`bridge/skills/README.md` 列出的 53 条里，专精类 14 条全部没有实现：`task_start`、`task_status`、`task_cancel`、`build_blueprint`、`trade`、`villager_trades`、`explore`、`find_biome`、`waypoint_save`、`waypoint_goto`、`nether_portal`、`end_run`、`bow_kite`、`shield_block`。
-
-独立通关需要的能力全部落在这 14 条里。第 6 节按依赖顺序给出缺口。
+当前清单有 42 项专精技能，包括采集、制作、生存、战斗、移动、存储、下界和末地模块；逐项以 `bridge/skills/manifest.json` 为准。旧版 `bridge/skills/README.md` 中的 53 项是设计草案，不代表当前已实现能力。本类仍需逐项实机验收；固定 S0–S6 计划不等于开放式任务规划。
 
 ## 3. 状态定义
 
@@ -470,54 +470,51 @@ B 级观察：`runs/<stage>-<时间戳>.json` 里的 `passed`、`detail`；同�
 
 ## 4. 结构化动作状态机
 
-### 4.1 七档状态的判定依据
+### 4.1 九档状态的判定依据
 
-状态词表定义在 `src/voxkin/bridge/protocol.py:7`，共七档。
+状态词表定义在 `src/voxkin/bridge/protocol.py:7`，共九档。
 
 | 状态 | 判定依据 | 产生位置 | 当前是否可达 |
 | --- | --- | --- | --- |
-| accepted | 动作已被 Core 收下并登记成待执行 | Core 侧没有这个中间态，`ActionDispatcher.dispatch_result`（`src/voxkin/agent/actions.py:81`）发出请求后直接等待结果 | 不可达 |
-| running | 动作已经在桥接进程里开始执行 | 桥接的 `runAction`（`bridge/minecraft_bridge.js:246`）只在结束时回一帧，中途不发帧 | 不可达 |
-| succeeded | 桥接执行结束且后置检查通过 | `bridge/minecraft_bridge.js:387` 回 `succeeded`；`src/voxkin/bridge/protocol.py:17` 的 `SUCCESS_STATUSES` 把它算作 `ok=true` | 可达 |
-| partial | 动作完成了一部分 | 桥接 `statusForError`（`bridge/minecraft_bridge.js:400`）把含「还差」「只拿到」的错误文本映射成 `partial`；Core 侧 `Verifier.classify`（`src/voxkin/agent/runner.py:67`）在背包判定不过关但有进展时也给 `partial` | 可达 |
-| failed | 动作失败，原因明确且不属于其它几档 | `statusForError` 的兜底档；`ActionResult.from_message`（`src/voxkin/bridge/protocol.py:49`）在回帧缺 `status` 时按 `ok` 字段兜底 | 可达 |
-| cancelled | 动作被新指令抢占、被停止指令清出队列，或连接断开 | `statusForError` 把含「打断」「取消」「断开」的文本映射成 `cancelled`；被清出队列的动作在 `bridge/minecraft_bridge.js:221` 直接回 `cancelled`；`TaskRunner.run`（`src/voxkin/agent/runner.py:244`）遇到 `cancelled` 立即停步并把任务状态置为 `cancelled` | 可达 |
-| blocked | 缺少外部条件，动作无法开始或注定无法完成 | `runAction` 在 bot 未进世界时回 `blocked`（`bridge/minecraft_bridge.js:248`）；`statusForError` 把含「没有」「材料不够」的文本映射成 `blocked`；Core 侧没有桥接连接时 `dispatch_result` 抛出 `status="blocked"` 的 `ActionError` | 可达 |
+| accepted | 动作已被 Core 收下并登记成待执行 | `ActionArbiter` 将请求放入在途票据和写世界队列；但没有发 `accepted` 状态帧 | 运行时有内部登记，协议状态不可达 |
+| running | 动作已经在桥接进程里开始执行 | Bridge 对非 sense/voice 动作发 `action_progress` 启动帧；部分动作还报告细粒度进展。Core 解析并向 Studio 广播 | 有运行进度事件，但不等于统一终态机 |
+| succeeded | 桥接技能返回成功 | 内建分支或模块技能完成后由 `reply` 回结果；Core `ActionResult.from_message` 解析 | 可达；不等于完整阶段目标或通关已完成 |
+| partial | 技能只完成部分工作，仍把结构化结果交给调用方 | 模块技能可显式返回 `partial`；Core 阶段验证也能依观察到的进度分类为 `partial` | 可达；派发器允许结果返回，但阶段 Runner 仍按 verifier 决定是否过步 |
+| failed | 动作失败、超时或异常 | Bridge 兜底状态、deadline，或 Core 等待超时；`statusForError` 仍有按错误文本分类的路径 | 可达 |
+| cancelled | 动作被新指令取消、被停止指令清出队列，或任务被取消 | Core `ActionArbiter`/`ActionDispatcher` 可按 `action_id` 或全量发 `action_cancel`；桥接停止寻路/挖掘并回结果；部分技能通过 `ctx.interrupted` 协作式退出。死亡与断线使用各自状态 | 可达，但技能取消检查点与回执语义仍不完全统一 |
+| disconnected | Core 与 Bridge 或 bot 与 Minecraft 的连接中断 | `ActionDispatcher.detach()`、Bridge `world_unavailable` 分支；在途动作会被失败并清空世界快照 | 可达 |
+| blocked | 缺少外部条件，动作无法开始或注定无法完成 | bot 未进世界、状态过期/不完整、材料或目标不足等路径；具体状态可能由 Core 或 Bridge 给出 | 可达；不同错误路径的归类仍依赖部分文本匹配 |
+| dead | Minecraft 角色死亡，动作不应继续写世界 | Bridge death 生命周期事件令 Core 标记 `alive=false`、失败在途动作并取消仲裁动作；`ActionArbiter` 也会拒绝死亡状态下的世界写入 | 可达；死亡恢复与重生续跑尚无真实服务器验收 |
 
-`partial` 与 `blocked` 都算 `ok=true`（`src/voxkin/bridge/protocol.py:17`），所以派发层不会因为这两档抛出异常，判定交给步骤级的机器判定。
+`partial` 与 `blocked` 不应混为一谈：协议把 `succeeded`、`partial` 视作成功结果类别，但 `ActionResult.ok` 可单独为 false；`ActionDispatcher` 对 `partial` 特判为返回调用方，而 `blocked` 通常作为 `ActionError` 抛出。阶段 Runner 随后应用步骤级 verifier。
 
-`accepted` 与 `running` 这两档目前没有任何来源，是状态机里真正的空洞。
+协议列出 `accepted`、`running`，但它们不是 `action_result` 终态：Core 没有 `accepted` 回执，`running` 仅由可选 `action_progress` 事件体现。状态可见性是“队列/仲裁器内部登记 + 部分动作进度事件 + 最终结果”，不是所有动作都有统一的生命周期帧。
 
-### 4.2 完整链路
+### 4.2 执行与结果链路
 
 ```mermaid
 flowchart TD
-    A["模型返回工具调用<br/>src/voxkin/pipeline.py:357"] --> B["先播报一句意图<br/>src/voxkin/pipeline.py:360"]
-    B --> C["dispatch_result<br/>src/voxkin/agent/actions.py:81"]
-    C --> D["ActionRequest.to_message<br/>src/voxkin/bridge/protocol.py:28<br/>带 action_id / skill_id / timeout_s"]
-    D --> E["桥接 enqueueAction<br/>bridge/minecraft_bridge.js:217"]
-    E --> F["runAction 执行分支<br/>bridge/minecraft_bridge.js:246"]
-    F --> G["reply 回 action_result<br/>bridge/minecraft_bridge.js:408<br/>带 ok / status / skill_id / detail"]
-    G --> H["先推 state 帧再回结果<br/>bridge/minecraft_bridge.js:2834"]
-    H --> I["ActionResult.from_message<br/>src/voxkin/bridge/protocol.py:49"]
-    I --> J{"ok 为真"}
-    J -->|"是"| K["返回 ActionResult<br/>src/voxkin/agent/actions.py:106"]
-    J -->|"否"| L["ActionError 带 status<br/>src/voxkin/agent/actions.py:10"]
-    K --> M["步骤级机器判定 Verifier.check<br/>src/voxkin/agent/runner.py:30"]
-    L --> M
-    M --> N{"判定通过"}
-    N -->|"是"| O["步骤成功 status=succeeded<br/>src/voxkin/agent/runner.py:157"]
-    N -->|"否"| P["Verifier.classify 定 partial 或 blocked<br/>src/voxkin/agent/runner.py:67"]
-    O --> Q["写 JSONL 步骤记录<br/>status / ok / skill_id / action_id<br/>src/voxkin/agent/runner.py:210"]
-    P --> Q
-    Q --> R["写检查点与任务状态<br/>src/voxkin/agent/tasks.py"]
+    A["LLM 返回工具调用<br/>src/voxkin/pipeline.py"] --> B["ActionArbiter 仲裁并提交<br/>src/voxkin/agent/arbiter.py"]
+    B --> C["ActionDispatcher 发 action<br/>action_id / skill_id / timeout_s<br/>src/voxkin/agent/actions.py"]
+    C --> D["Bridge 排队并执行<br/>builtin case 或 registry skill<br/>bridge/minecraft_bridge.js"]
+    D --> E["先推世界状态，再回 action_result"]
+    E --> F["Server resolve -> ActionResult<br/>src/voxkin/server.py / protocol.py"]
+    F --> G{"调用类型？"}
+    G -->|"语音工具调用"| H["播报结果并暂存最近动作注记<br/>下一次 LLM 请求可看到有限上下文<br/>src/voxkin/pipeline.py"]
+    G -->|"固定 TaskRunner 步骤"| I{"ActionResult 还是异常？"}
+    I -->|"ActionResult"| J["按 StepSpec.verify 核对新鲜世界状态"]
+    I -->|"ActionError/异常"| K["记录状态并按步骤配置重试"]
+    J --> L{"核验通过？"}
+    L -->|"是"| M["记录步骤并推进检查点"]
+    L -->|"否"| K
+    K --> N["达到重试上限后保存检查点并停止"]
 ```
 
 链路上已知的三处偏差：
 
 1. 桥接的 `statusForError` 靠错误文本匹配判定状态。同一句话在不同技能里的含义可能不同，「熔炼了粗铁，但没有取到铁锭」会被判成 `blocked`，实际是 `failed`。
 2. `reply` 把 `detail` 截断到 500 字，超长原因会丢掉。
-3. 动作结果只播报，没有作为一条消息回到模型上下文。`src/voxkin/pipeline.py:357` 的 `_run_action` 把结果交给 `announce`，模型下一轮看不到失败原因。
+3. 动作结果会以受限的 `[最近动作]` 系统消息注入之后一次模型请求（`src/voxkin/pipeline.py:135`、`:140-146`）；注入后清空，最多保留 5 条，不能视为同一模型回合内的显式工具结果续调协议，也不保证模型会据此重规划。固定 `TaskRunner` 的失败会记录检查点并停止或按步骤重试，不会自动改写计划。
 
 真实运行的 JSONL 里每一步都带 `status`、`skill_id` 与 `action_id`，见 `docs/evidence/S0_NORMAL_20261022.md` 第 10 次运行的完整记录。
 
@@ -527,63 +524,57 @@ flowchart TD
 
 | 指令 | 抢占范围 | 依据 |
 | --- | --- | --- |
-| `stop` | 清空动作队列里全部待执行动作；抢占正在执行的技能 | `bridge/minecraft_bridge.js:142` 的 `PRIORITY_ACTIONS`，`bridge/minecraft_bridge.js:217` 的 `enqueueAction` |
-| `attack_nearest` | 抢占正在执行的技能，插到队列最前面 | 同上，`PRIORITY_ACTIONS` 只含 `attack_nearest` 与 `stop` |
+| `stop` | 最高优先级；清空桥接待执行队列并尝试取消正在运行的动作；活动阶段任务另由 `RunManager.stop()` 取消 | `src/voxkin/agent/arbiter.py:16-20,243-285`、`src/voxkin/server.py:358-364`、`bridge/minecraft_bridge.js:384-410,426-439` |
+| 生存反射 | 安全优先级；符合条件时可抢占当前可取消动作 | `src/voxkin/agent/arbiter.py:16-20,40-52,243-254`；技能元数据的 `cancellable` 决定一般动作是否允许被更高优先级动作抢占 |
+| 新的玩家指令 | 规则快路以 `player`/`fast_path` 来源获得高于阶段任务的优先级，并且只在当前动作可取消时抢占；普通 LLM 工具调用仍按其来源/技能类型取默认优先级，不保证因“来自新玩家回合”而抢占 | `src/voxkin/agent/arbiter.py:40-52,243-254`、`src/voxkin/pipeline.py:658-672` |
 
-其余 19 个技能一律进队列尾部串行执行，见 `bridge/minecraft_bridge.js:233` 的 `pumpActions`。
+Core `ActionArbiter` 只把清单 `type` 为 `act` 或 `path` 的技能当成写世界动作并串行仲裁（`src/voxkin/agent/arbiter.py:33-35,55-60`）；`sleep`、`smelt` 的类型是 `wait`，因此不占 Core 的世界写入锁，尽管它们会改变游戏世界。Bridge `pumpActions` 仍会把收到的动作串行执行，但 Core 对 `wait` 并发请求不做互斥。普通 LLM 工具调用的 `origin` 默认是 `llm`，只有标成 `player`/`fast_path` 的快路请求才有玩家优先级；新语音回合本身不必然抢占正在运行的阶段任务。Bridge 根据清单 `cancellable` 决定一般高优先级动作能否抢占当前动作；显式 stop/取消与安全/死亡路径另有处理。
 
 ### 5.2 抢占的收敛过程
 
-1. `enqueueAction` 收到 `stop` 时把队列清空，被丢弃的动作逐个回「被停止指令取消」，状态 `cancelled`（`bridge/minecraft_bridge.js:221`）。
-2. `interruptCurrent`（`bridge/minecraft_bridge.js:206`）设置 `interrupted = true`，停 pathfinder，停挖掘，清控制状态。
-3. 正在执行的技能在检查点读到 `interrupted` 后抛出「被新的指令打断」。检查点位置：`travelTo`（`bridge/minecraft_bridge.js:433` 与 `:451`）、`collectBlocks`（`:788`）、`smeltItem`（`:1516`）、`eatFood`（`:1595`）、`sleepInBed`（`:1972`）、`attackEntity`（`:2080`）。
-4. `runAction` 的 catch 把这个错误交给 `statusForError`，映射成 `cancelled` 并回帧（`bridge/minecraft_bridge.js:389`）。
-5. `TaskRunner.run` 收到 `cancelled` 立即停止当前阶段，把任务状态置为 `cancelled` 并写检查点（`src/voxkin/agent/runner.py:244`）。
+1. `ActionArbiter.cancel()` 或 `cancel_all()` 通知 Core 等待者并向桥接发带 `action_id` 的取消消息；桥接可移除对应排队项或调用 `interruptAction`（`src/voxkin/agent/arbiter.py:256-285`、`src/voxkin/agent/actions.py:166-205`、`bridge/minecraft_bridge.js:384-412`）。
+2. `interruptAction` 停 pathfinder、停止挖掘并清控制状态；技能还需在自身检查点观察 `ctx.interrupted` 或中断状态才能安全收尾（`bridge/minecraft_bridge.js:362-381`、`bridge/skill_invoker.js`）。
+3. 阶段任务被取消时，`TaskRunner` 在步骤循环处保存检查点并结束为 `cancelled`；死亡/断线则通过单独的生命周期与状态处理（`src/voxkin/agent/runner.py:201-220,334-372`、`src/voxkin/server.py:367-413`）。
 
 ### 5.3 超时的收敛
 
-`runAction` 在开始时按 `timeout_s` 设置一个截止定时器（`bridge/minecraft_bridge.js:256`），取值截断到 5 至 300 秒。到点后同样设置 `interrupted = true` 并停 pathfinder、停挖掘、清控制状态，动作在下一个检查点抛出「被新的指令打断」，被映射成 `cancelled`。Core 侧另有一层超时：`dispatch_result` 的 `asyncio.wait_for` 到点抛出 `ActionError`，状态是 `failed`（`src/voxkin/agent/actions.py:99`）。
+`runAction` 在开始时按 `timeout_s` 设置一个截止定时器，取值截断到 5 至 300 秒。到点后设置中断状态并停 pathfinder、停挖掘、清控制状态；桥接以 `failed` 回报超时。Core 侧另有等待超时，会尝试向 Bridge 发送取消，然后以 `failed` 收场；取消消息与 Bridge deadline 同时触发时仍可能存在竞态。
 
 ### 5.4 互斥与残留
 
-- 动作开始时会停掉跟随与闲逛（`bridge/minecraft_bridge.js:267`）。
-- `interrupted` 标志在每个动作结束时被清回 `false`（`bridge/minecraft_bridge.js:394`）。
-- Core 侧的 `ActionDispatcher` 没有 `cancel` 方法（`src/voxkin/agent/actions.py:21`），`TaskRunner.cancel()`（`src/voxkin/agent/runner.py:121`）只在步骤之间生效，无法唤醒正在等待的动作。
+- 动作开始时会停掉跟随与闲逛；桥接在动作收尾后重置当前动作状态。
+- `ActionDispatcher.cancel()` 会发协议取消消息并唤醒等待者；`ActionArbiter` 负责写世界动作的串行与取消路由。`TaskRunner.cancel()` 本身是任务标志，`RunManager.stop()` 会进一步取消动作；两层语义仍需分别理解。
+- 死亡恢复不是掉落物恢复：当前代码请求重生、保存/校验步骤检查点，但没有自动寻找或回收死亡掉落物。
 
-### 5.5 缺口
+### 5.5 当前限制
 
-- 抢占集合只有两个。战斗、进食、采集这类长动作被玩家打断时没有抢占路径，只能等当前动作自己结束。
-- 抢占在桥接本地完成，Core 不知道动作被抢占了，Core 侧等待的动作仍然等到超时。
-- `stop` 清队列时清掉的是还没开始的动作，正在执行的那个靠 `interrupted` 标志停下，没有统一的取消回执。
+- 取消协议已从 Core 传到桥接并按 `action_id` 路由；但停止游戏动作、取消玩家语音回合、取消 `TaskRunner` 阶段任务是不同入口。不是所有技能都实现了密集的中断检查，取消后置状态仍需逐技能测试。
+- Core `ActionArbiter` 对写世界动作互斥、对只读动作放行；桥接 `pumpActions` 串行派发。生存反射只能抢占清单标记为可取消的当前技能，死亡与断线另有中断处理。
+- 取消等待可区分收到桥接结果与取消无回执；但 Core 等待超时后取消与桥接自身 deadline 仍可能竞态，不能仅凭发送了取消就证明游戏动作已停止。
 
-## 6. 按依赖排序的缺口清单
+## 6. 独立通关缺口与验收状态
 
-排序依据是独立通关的依赖顺序：先有采集与合成，再有挖矿与生存，再有维度与通关。前置技能全部来自第 2 节。
+下面区分“代码不存在”和“代码存在但无真实服务器验收”。本清单不把已有实现重复列作待开发功能；按独立通关依赖排序，先完成阶段实机验证，再集中处理恢复、战斗和端到端胜利判定。
 
-| 序 | 缺口 | 缺什么 | 补齐后的验收方法 | 前置技能 |
+| 序 | 缺口/状态 | 当前代码事实 | 仍需做什么 | 主要证据 |
 | --- | --- | --- | --- | --- |
-| 1 | 死亡重生与掉落回收 | `createBot`（`bridge/minecraft_bridge.js:2708`）的 death 处理只停跟随与闲逛，没有重生，没有回到安全点，没有掉落物回收 | 在评测服执行 `/kill Voxkin`，期望 5 秒内重新进入世界并继续当前阶段，死亡前的物品按规则回收 | observe、inventory、collect_blocks |
-| 2 | 挖竖井与主巷道 | 没有向下挖安全竖井的技能，也没有主巷道加分支的挖矿编排。`collect_blocks` 只搜水平半径 64 格内的方块，挖不到深层矿脉 | 挖 32 格长的竖井与主巷道，期望全程不掉血、不踩空，挖到指定深度后能沿巷道返回 | collect_blocks、place_block、goto_block |
-| 3 | 缺料查询 | 没有「当前材料能做什么」的技能。`craft` 把缺料清单塞在错误文本里，模型拿不到结构化的缺料数量 | 背包里放 5 种材料，期望返回可合成物品清单与每种还差多少 | inventory、craft |
-| 4 | 战斗结果判定 | `attack_nearest` 与 `attack_target` 在目标还活着时回 `succeeded`，Core 侧据此继续往下走 | 目标还活着时期望动作判为失败，目标被击败时期望判为成功 | attack_nearest、observe |
-| 5 | 阶段计划补全 | 已补 `src/voxkin/agent/plans.py` 的 S0–S6 共 53 步；S1 已 1 次 5/5，S2–S6 没有真实服务器运行记录 | 依次用 `scripts/run_stage.py --stage S<n> --runs 10` 跑，达到路线图退出条件后再标记完成 | collect_blocks、craft、smelt、eat、sleep、mine_collect、strip_mine、deep_mine、fight_blaze、hunt_enderman、throw_eye、activate_end_portal、fight_dragon |
-| 6 | 箱子暂存 | 没有存箱子、取箱子、看箱子三个技能，长程任务没有物资暂存点 | 存入 16 个圆石再取出，期望背包与箱子数量对得上 | inventory、place_block、goto_block |
-| 7 | 弓盾战斗 | 没有举盾格挡与放风筝的技能。`attackEntity` 只能近战，或在 6 格外用弓，没有拉开距离的控距循环 | 8 格外放一只骷髅，期望 bot 举盾挡下攻击，或边退边射并保持 6 格以上 | attack_nearest、inventory |
-| 8 | 下界门 | 没有采集黑曜石、造门、点火、维度切换的技能 | 采 10 个黑曜石并造门点火，期望往返主世界 3 次成功，坐标换算偏差不超过 16 格 | collect_blocks、craft、place_block、smelt |
-| 9 | 下界战斗 | 没有烈焰人与末影人的专门战斗。`attackEntity` 的近战循环对上烈焰人很难打中 | 在堡垒里打 7 根烈焰棒，期望 40 分钟内完成且死亡不超过 2 次 | attack_nearest、attack_target |
-| 10 | 末影之眼与要塞 | 已补 `throw_eye` 与 `activate_end_portal`（`bridge/skills/end.js`），未实跑 | 合成 12 个末影之眼并投掷，期望定位收敛；进要塞填满 12 个末地门框架并进入末地 | craft、throw_eye、activate_end_portal |
-| 11 | 末影龙战斗 | 已补 `fight_dragon` 与 `return_home`（`bridge/skills/end.js`），复用 `break_crystal`，未实跑 | 从主世界检查点起跑 60 分钟内击杀末影龙，期望 bot 存活并回到主世界 | fight_dragon、break_crystal、return_home、缺口 7 的弓盾战斗 |
-| 12 | 清单驱动的 dispatch | `bridge/skills/index.js` 不存在，`runAction` 仍是 21 个手写 `case` 分支。`src/voxkin/agent/tools.py:5` 也是手写清单，`src/voxkin/agent/skills.py:71` 的 `tool_schemas` 没有接进 `src/voxkin/pipeline.py:130` | 清单里加一条技能后，桥接分支与工具定义自动出现；`tests/test_skill_manifest.py` 与 `scripts/dump_manifest.js` 全绿 | 无 |
-| 13 | 状态机补全 | `accepted` 与 `running` 两档没有来源；`statusForError` 靠错误文本匹配 | 一个动作从派发到结束能观察到三帧状态，Core 侧按帧推进 | 无 |
-| 14 | 工具结果回灌 | 动作结果只播报，没有回到模型上下文，模型无法根据失败原因重规划 | 一次 `collect_blocks` 失败后，同一回合内模型改调 `goto_block` | 无 |
-| 15 | 单技能直发入口 | 没有直接向已连接的桥接发一条动作的接口，每个技能只能靠整阶段回归来验收 | 加一个能发单条动作并读回 `action_result` 的入口，21 个技能各跑一次 | 无 |
-| 16 | 客户端 Mod 空间音频 | `mod/` 已能编译，WebSocket PCM 推送也跑通，但没有在真实 Minecraft 客户端里验证过距离衰减与跟随移动 | 在真实客户端里听语音随 bot 移动改变音量与方向 | 无 |
+| 1 | 阶段计划实机验收 | 固定 `PLANS` 有 S0–S6 共 63 步；S0、S1 有真实服务器证据。S2–S6 尚无完整验收，新增路线主要由模拟测试支持 | 在专用、可重置评测世界逐阶段跑并记录失败原因；不以 mock 通过替代 | `src/voxkin/agent/plans.py`、`docs/evidence/S0_NORMAL_20261022.md`、`docs/evidence/S1_NORMAL_20261022.md` |
+| 2 | 死亡恢复的真实世界行为 | Bridge 已请求重生并上报带 lifecycle ID 的 death/respawn；Core 取消在途动作、保存阶段检查点，并只在新鲜世界状态能证明当前步骤完成时续跑。无法确认时 fail-closed 暂停。未实现死亡掉落物回收策略 | 实测 `/kill`、掉落保留/消失、重连、恢复后物资/位置对账；明确安全放弃或回收规则 | `bridge/minecraft_bridge.js:3258-3295`、`src/voxkin/server.py:367-405`、`src/voxkin/agent/run_manager.py:95-188`、`tests/test_run_manager.py` |
+| 3 | S2–S4 生存与资源链路 | 已有 `safe_descend`、`strip_mine`、`deep_mine`、`find_diamond`、箱子存取/盘点、装备与进食等实现；这不证明在自然生成世界可稳定寻路、挖到并取回所需资源 | 先在 Normal 难度验证矿道、熔炼/装备、过夜和庇护所组合；观测死亡率、资源缺口和恢复行为 | `bridge/skills/gather.js`、`bridge/skills/storage.js`、`bridge/skills/survival.js`、`docs/STATUS.md` |
+| 4 | S5 下界资源获取 | 已有黑曜石采集/浇铸、造门、维度往返、堡垒探索、烈焰人与末影人技能；仍无 S5 真实服务器阶段记录 | 验证从自然出生/检查点到够用的烈焰棒与珍珠，包含迷路、补给、返回主世界 | `bridge/skills/nether.js`、`bridge/skills/combat.js`、`src/voxkin/agent/plans.py` |
+| 5 | S6 要塞与末地通关 | `fight_dragon` 要求 `result_event: ender_dragon_killed`；Bridge 仅在龙血归零或同时观察到龙缺席与返回门时报告事件。Runner 验收后把事件写入当前任务 SQLite 历史，阶段状态和断点恢复会按该历史消费。仍无末地实机证据 | 在隔离世界实测定位/进门/水晶/龙战/返回，并确认事件来自可信世界观察 | `bridge/skills/end.js`、`src/voxkin/agent/plans.py`、`src/voxkin/agent/runner.py`、`src/voxkin/agent/run_manager.py`、`src/voxkin/agent/progress.py` |
+| 6 | 战斗动作语义与目标完成核验 | 内建 `attackEntity` 最多挥击 20 次；若目标仍有效会返回“攻击了…它还在”，调用层仍可能将这次攻击尝试作为 `succeeded` 回报。专精 `fight_blaze`、`hunt_enderman`、`fight_dragon` 则有各自更具体的状态/产物检查，但尚未实机验收 | 对需要击杀的计划步骤明确核对目标消失、战利品或胜利事件；不要将“完成攻击调用”等同“击杀成功” | `bridge/minecraft_bridge.js:2505-2561`、`bridge/skills/combat.js`、`bridge/skills/end.js` |
+| 7 | 用户目标到开放任务规划 | 模型可调用清单工具，模块技能可用 `ctx.runSkill` 嵌套；S0–S6 仍由固定 `StepSpec` 列表驱动，没有通用动态计划生成、验证与修复引擎 | 通关之前可先提升固定计划和阶段验收；动态组合属于后续能力建设，不是现阶段“技能不存在”的问题 | `src/voxkin/agent/plans.py`、`src/voxkin/agent/runner.py`、`bridge/skill_invoker.js` |
+| 8 | 单技能/长链路评估覆盖 | 有模块模拟测试、动作/阶段日志和 `/api/run/*` 阶段入口；该 API 启动的是固定阶段，不是任意技能的一次性评估端点。大部分技能没有真实服务器验收，S0/S1 固定路线也不包含全局无人干预长跑 | 建立可复现的隔离世界运行、逐技能调用/结果核验、动作/死亡/资源日志和版本标记，并按阶段回归 | `bridge/tests/`、`scripts/run_stage.py`、`src/voxkin/server.py`、`docs/plans/EVALUATION.md` |
+| 9 | 客户端 Mod 空间音频 | Mod 已编译且 WebSocket PCM 推送已实现，真实 Minecraft 客户端中的距离衰减与方向效果尚未验证 | 在目标客户端验证音量衰减、方向和移动跟随 | `mod/`、`docs/STATUS.md` |
 
-第 1 到第 5 项阻塞 M2 与 M3 的退出条件，第 6 到第 11 项阻塞 M5 到 M8，第 12 到第 16 项是全链路的通透性问题。
+早期审计中提到的“箱子技能”“清单 dispatch”“死亡/重生协议”已有实现；动作结果有受限的跨回合注记回填；但 `craft.js` 的 `missingFor` 等只是内部配方辅助函数，尚无可供模型独立调用的“当前能做什么/结构化缺料”查询工具；也没有任意技能的专用 HTTP 评测端点。仍需区分可执行代码、自动化替身验证、协议能力与真实服务器通关证据。
 
 ## 7. 已执行的测试与结果
 
 ### 7.1 本次实跑
+
+以下是 2026-10-22 的历史运行记录，不是本轮执行结果。不要把历史通过数、语法检查、smoke test 或模拟 bot 测试写成 Minecraft 实机验收。
 
 命令：
 
@@ -591,7 +582,7 @@ flowchart TD
 .\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
-结果：`245 passed, 40 warnings in 48.17s`。警告全部来自 `tools/dev_llm_server.py:20` 与 `:21` 的 `NotAppKeyWarning`。
+结果：这是 2026-10-22 的历史测试结果，不代表本轮或当前代码的测试结果。
 
 各测试文件的用例数：
 
@@ -629,16 +620,18 @@ flowchart TD
 | 真实服务器 | `docs/evidence/S0_20261022.md`：Paper 1.21.1-133，seed 20261022，Peaceful 难度，`VOXKIN_INDEPENDENT=1`，连续两次跑完 S0 的 5 步，task_id 37 与 38，用时 52.4 秒与 32.6 秒。 |
 | 真实服务器 | `docs/evidence/S0_NORMAL_20261022.md`：同一套环境，Normal 难度，怪物生成开启，`.\.venv\Scripts\python.exe scripts\run_stage.py --stage S0 --runs 10 --difficulty normal` 连续 10 次全部 5/5 通过，用时 34.3 到 38.5 秒，P50 36.4 秒。阶段计划是固定规则，没有调用 LLM。这两条证据覆盖 `collect_blocks` 与 `craft`。 |
 | 真实服务器 | `docs/evidence/S1_NORMAL_20261022.md`：同一评测世界接在 S0 后跑 S1，Paper 1.21.1-133、Normal、seed 20261022，5/5 步、78.9 秒；`mine_collect` 与 3 次 `craft` 均一次成功。阶段计划是固定规则，没有调用 LLM。 |
+| 真实服务器 | `docs/evidence/S1_NORMAL_20261022.md`：同一评测世界接在 S0 后跑 S1，Paper 1.21.1-133、Normal、seed 20261022；另有 3 轮白天 S0→S1 链式回归。`mine_collect` 与 `craft` 在这些特定计划步骤成功；固定计划没有调用 LLM。 |
+| 真实服务器 | `docs/evidence/S0_S6_CHAIN_20261024.md`：两次隔离服务器全链尝试均在 S2 中断；第二次 S0、S1 各 5/5，S2 在 `shear_sheep` 未找到羊、重试后桥接断开。S3–S6 没有运行。这是失败证据，不是技能通过结论。 |
 | 真实模型 | `docs/BENCHMARK_RESULTS.md:93`：真实模型在游戏内聊天里返回 `collect_blocks` 调用，桥接执行并回报「挖到 3 个 泥土」。 |
-| 未验证 | 除 S0 的 `collect_blocks`/`craft` 与 S1 的 `mine_collect`/`craft` 外，其余内建技能与 37 个模块技能没有真实服务器运行记录；S2–S6 的阶段计划也没有实跑。`shear_sheep` 只有模拟 bot 测试，尚无真实服务器证据。`docs/STATUS.md` 记录客户端 Mod 只完成编译与协议实现，没有在真实 Minecraft 客户端验证。 |
+| 未验证 | 除证据文档明确覆盖的 S0/S1 计划操作外，其余技能没有真实服务器验收记录；2026-10-24 两次全链均在 S2 失败，S3–S6 未运行。`shear_sheep`、`collect_flint`、`prepare_bow_arrows` 等虽有模拟 bot 测试，但不能据此声称实机可用。技能实现、自动化/模拟测试、Minecraft 实机通过是三种不同状态。 |
 
 ### 7.3 文档与代码的偏差
 
 | 项 | 现状 | 证据 |
 | --- | --- | --- |
-| 技能清单来源 | 模块文件已落地：`combat.js`、`craft.js`、`gather.js`、`movement.js`、`nether.js`、`storage.js`、`survival.js`、`end.js` 与 `manifest.js`、`registry.js`；当前清单 58 条（21 个内建 + 37 个模块技能）。以 `manifest.json` 为准 | `bridge/skills/` 目录 |
+| 技能清单来源 | 模块文件已落地：`combat.js`、`craft.js`、`gather.js`、`movement.js`、`nether.js`、`storage.js`、`survival.js`、`end.js` 与 `manifest.js`、`registry.js`；当前清单 64 条（21 个内建 + 43 个模块技能），Core 暴露 63 个工具。以 `manifest.json` 为准 | `bridge/skills/` 目录与 `src/voxkin/agent/tools.py` |
 | 清单驱动的 dispatch | `bridge/skills/registry.js` 已存在，`runAction` 的 default 分支查注册表；仍有 21 个内建 `case` 分支 | `bridge/minecraft_bridge.js` |
 | 工具定义来源 | `src/voxkin/agent/tools.py` 已改为 `build_tools()`，从清单生成；`src/voxkin/pipeline.py` 使用 `MINECRAFT_TOOLS` | `src/voxkin/pipeline.py` |
-| 测试数量 | 2026-10-23 本次实跑 270 个 Python 测试通过；剪羊技能另有 8 个 Node 模拟测试 | 本次实跑输出 |
-| 阶段模板 | `PLANS` 已有 S0–S6 共 53 步；S1–S6 未实跑 | `src/voxkin/agent/plans.py` |
-| 阶段产出 | S2 产出 `bed` 与 `cooked_beef`，S3 产出 `shield`，S4 产出 `diamond_pickaxe`，计划已按这些产出写死；S6 仍靠 `ender_dragon_killed` 事件判定，事件上报未实现，当前只有 `fight_dragon` 的动作层成功 | `src/voxkin/agent/progress.py` |
+| 测试数量 | Python 全量 323 项、Bridge 模拟测试 93 项通过；均为本地测试，不是 Minecraft 实机验收 | `docs/STATUS.md` 记录命令及 pytest 插件加载问题；本轮实际测试输出 |
+| 阶段模板 | `PLANS` 已有 S0–S6 共 63 步；S0/S1 有分段实跑记录，S2–S6 未完成实机验收 | `src/voxkin/agent/plans.py` |
+| 阶段产出 | S2 产出 `bed` 与 `cooked_beef`，S3 产出 `shield`，S4 产出 `diamond_pickaxe`，计划已按这些产出写死；S6 消费并持久化结构化 `ender_dragon_killed` 事件，阶段状态通过当前任务历史判断 | `src/voxkin/agent/progress.py`、`src/voxkin/agent/runner.py`、`src/voxkin/agent/run_manager.py` |

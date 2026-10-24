@@ -128,9 +128,26 @@ cd D:\Voxkin
 
 ### 第 1 步：准备一个 Minecraft 服务器
 
-单人游戏也可以用，但需要先开一个本地服务器。最简单的方法是用 Paper 或官方服务端，版本选 1.21.1，关闭正版验证（`online-mode=false`）。
+单人游戏也可以用，但需要先开一个专用本地服务器。建议使用 Paper 1.21.1，将 `online-mode=false`，只在本机/可信局域网测试，不要开放到公网。实机测试请使用可丢弃的测试世界；启动脚本不会启动或重置服务器。
 
-### 第 2 步：启动桥接
+### 第 2 步：一键启动 Studio 和桥接
+
+在仓库根目录打开 PowerShell，运行下面这一条命令。请先确认本地测试服已启动并监听 25566 端口：
+
+```powershell
+cd D:\Voxkin
+.\scripts\eval_stack.ps1 -Action start -McPort 25566
+```
+
+脚本启动已配置的 GPT-SoVITS（若本机运行包存在）、Studio 和独立模式桥接，不启动/重置 Minecraft 世界。浏览器打开 <http://127.0.0.1:8765>，确认桥接状态已连接。结束后从仓库根目录运行：
+
+```powershell
+.\scripts\eval_stack.ps1 -Action stop
+```
+
+这只停止该脚本启动的程序，不会关闭 Minecraft 服务器。
+
+如需手动启动桥接，可按以下步骤：
 
 新开一个 PowerShell 窗口：
 
@@ -138,7 +155,7 @@ cd D:\Voxkin
 cd D:\Voxkin\bridge
 npm install
 $env:MC_HOST="127.0.0.1"
-$env:MC_PORT="25565"
+$env:MC_PORT="25566"
 $env:MC_USERNAME="Voxkin"
 node minecraft_bridge.js
 ```

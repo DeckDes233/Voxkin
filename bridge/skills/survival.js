@@ -833,6 +833,70 @@ async function waitLeaveBed(ctx, timeoutMs = 10000) {
 /* ============================ 技能 ============================ */
 
 export const skills = {
+  equip_armor: {
+    description:
+      '检查背包并自动穿上更好的护甲；完成后读取头盔、胸甲、护腿和靴子槽验证实际装备，没有确认到任何已穿护甲时返回失败。',
+    parameters: [],
+    handler: async (_args, ctx) => {
+      const bot = ctx.bot;
+      if (!bot || !bot.entity) throw new Error('bot 还没进入世界，没有办法整理护甲');
+      if (!bot.armorManager || typeof bot.armorManager.equipAll !== 'function') {
+        throw new Error('护甲管理器不可用，无法整理护甲');
+      }
+
+      await bot.armorManager.equipAll();
+      if (!bot.inventory || !Array.isArray(bot.inventory.slots)) {
+        throw new Error('护甲整理后无法读取装备槽，不能确认是否穿上护甲');
+      }
+
+      const slotDefinitions = [
+        ['helmet', '头盔', 5],
+        ['chestplate', '胸甲', 6],
+        ['leggings', '护腿', 7],
+        ['boots', '靴子', 8],
+      ];
+      const equippedSlots = Object.fromEntries(
+        slotDefinitions.map(([key, , index]) => {
+          const item = bot.inventory.slots[index];
+          return [key, item ? { name: item.name, count: Number(item.count) || 1 } : null];
+        }),
+      );
+      const equipped = slotDefinitions
+        .filter(([key]) => equippedSlots[key])
+        .map(([key, label]) => `${label}：${equippedSlots[key].name}`);
+      const empty = slotDefinitions
+        .filter(([key]) => !equippedSlots[key])
+        .map(([key]) => key);
+      const emptyLabels = slotDefinitions
+        .filter(([key]) => !equippedSlots[key])
+        .map(([, label]) => label);
+
+      if (!equipped.length) {
+        const result = {
+          equippedSlots,
+          emptySlots: empty,
+          status: 'failed',
+          verified: false,
+        };
+        return {
+          ...result,
+          detail: '未确认到已装备护甲；结果=' + JSON.stringify(result),
+        };
+      }
+
+      const result = {
+        equippedSlots,
+        emptySlots: empty,
+        status: 'succeeded',
+        verified: true,
+      };
+      return {
+        ...result,
+        detail: '已确认护甲槽：' + equipped.join('、') + (emptyLabels.length ? '；空槽：' + emptyLabels.join('、') : '；四个护甲槽均已装备') + '；结果=' + JSON.stringify(result),
+      };
+    },
+  },
+
   eat_if_hungry: {
     description:
       '饥饿值低于阈值时自动进食：按熟肉 > 生肉 > 面包 > 其它有 food 值物品的优先级挑食物，吃完核对饥饿值真的上升。',

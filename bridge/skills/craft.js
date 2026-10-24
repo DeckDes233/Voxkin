@@ -145,7 +145,7 @@ export const TOOL_SETS = {
         item: 'shield',
         count: 1,
         inputs: [
-          { item: 'iron_ingot', count: 6 },
+          { item: 'iron_ingot', count: 1 },
           { item: 'planks', count: 1, chain: 'planks' },
         ],
       },
@@ -171,7 +171,7 @@ export const TOOL_SETS = {
         item: 'shield',
         count: 1,
         inputs: [
-          { item: 'iron_ingot', count: 6 },
+          { item: 'iron_ingot', count: 1 },
           { item: 'planks', count: 1, chain: 'planks' },
         ],
       },
@@ -312,6 +312,136 @@ function toCount(value, fallback = 1, max = 64) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) return fallback;
   return Math.min(Math.floor(number), max);
+}
+
+function findWoodForPlanks(ctx, requiredPlanks, range) {
+  const registry = registryOf(ctx);
+  const bot = ctx.bot;
+  const sources = [
+    ...CRAFT_CHAINS.planks.sources,
+    { plank: 'bamboo_planks', log: null },
+    { plank: 'crimson_planks', log: null },
+    { plank: 'warped_planks', log: null },
+  ];
+  const candidates = sources.map((source) => {
+    const planks = countOf(ctx, source.plank);
+    const logs = source.log ? countOf(ctx, source.log) : 0;
+    return { ...source, planks, logs, available: planks + logs * 4 };
+  });
+  const stocked = candidates
+    .filter((source) => source.available >= requiredPlanks)
+    .sort((left, right) => right.planks - left.planks || right.logs - left.logs);
+  if (stocked.length) return stocked[0];
+
+  if (typeof bot?.findBlocks !== 'function') return null;
+  for (const source of candidates) {
+    if (!source.log) continue;
+    const block = registry?.blocksByName?.[source.log];
+    if (!block) continue;
+    try {
+      const positions = bot.findBlocks({ matching: block.id, maxDistance: range, count: 1 });
+      if (positions.length) return source;
+    } catch {
+    }
+  }
+  return null;
+}
+
+async function prepareBowArrows(args, ctx) {
+  const count = toCount(args.count, 64, 64);
+  const range = Math.max(8, toCount(args.range, 48, 64));
+  if (ctx.interrupted) throw new Error('制作弓箭被新的指令打断');
+  if (typeof ctx.craftItem !== 'function') throw new Error('桥接没有提供合成接口');
+
+  const arrowDeficit = Math.max(0, count - countOf(ctx, 'arrow'));
+  const needsBow = countOf(ctx, 'bow') < 1;
+  const arrowCrafts = Math.ceil(arrowDeficit / 4);
+  const requiredSticks = (needsBow ? 3 : 0) + arrowCrafts;
+  const sticksToCraft = Math.max(0, requiredSticks - countOf(ctx, 'stick'));
+  const stickCrafts = Math.ceil(sticksToCraft / 4);
+  const hasCraftingTable =
+    countOf(ctx, 'crafting_table') > 0 ||
+    (typeof ctx.nearbyBlock === 'function' && Boolean(ctx.nearbyBlock('crafting_table', 32)));
+  const needsCraftingTable = !hasCraftingTable && (needsBow || arrowDeficit > 0);
+  const requiredPlanks = stickCrafts * 2 + (needsCraftingTable ? 4 : 0);
+
+  if (needsBow && countOf(ctx, 'string') < 3) {
+    throw new Error(`制作弓还差 ${3 - countOf(ctx, 'string')} 根线`);
+  }
+  if (arrowCrafts > 0) {
+    if (countOf(ctx, 'feather') < arrowCrafts) {
+      throw new Error(`制作 ${count} 支箭还差 ${arrowCrafts - countOf(ctx, 'feather')} 根羽毛`);
+    }
+    if (countOf(ctx, 'flint') < arrowCrafts) {
+      throw new Error(`制作 ${count} 支箭还差 ${arrowCrafts - countOf(ctx, 'flint')} 个燧石`);
+    }
+  }
+
+  if (requiredPlanks > 0) {
+    const source = findWoodForPlanks(ctx, requiredPlanks, range);
+    if (!source) {
+      throw new Error(`缺少木材：需要 ${requiredPlanks} 块同种木板，或附近 ${range} 格内可采集的原木`);
+    }
+    const stickPlanks = stickCrafts * 2;
+    const craftingTablePlanks = needsCraftingTable ? 4 : 0;
+    const missingPlanks = Math.max(0, requiredPlanks - source.planks);
+    const requiredLogs = Math.ceil(missingPlanks / 4);
+    if (source.logs < requiredLogs) {
+      if (typeof ctx.runSkill !== 'function') throw new Error('桥接没有提供采集技能入口');
+      if (ctx.interrupted) throw new Error('制作弓箭被新的指令打断');
+      const outcome = await ctx.runSkill('mine_collect', {
+        block: source.log,
+        count: requiredLogs,
+        range,
+      });
+      if (outcome?.status !== 'succeeded') {
+        throw new Error(outcome?.detail || `采集${labelOf(ctx, source.log)}失败`);
+      }
+    }
+    if (ctx.interrupted) throw new Error('制作弓箭被新的指令打断');
+    if (countOf(ctx, source.log) < requiredLogs) {
+      throw new Error(`采集${labelOf(ctx, source.log)}后库存不足，至少需要 ${requiredLogs} 根`);
+    }
+    if (missingPlanks > 0) {
+      await ctx.craftItem({ item: source.plank, count: missingPlanks });
+      if (ctx.interrupted) throw new Error('制作弓箭被新的指令打断');
+    }
+    if (countOf(ctx, source.plank) < requiredPlanks) {
+      throw new Error(`木板没有做够：${labelOf(ctx, source.plank)}需要 ${requiredPlanks} 块`);
+    }
+    if (needsCraftingTable) {
+      await ctx.craftItem({ item: 'crafting_table', count: 1 });
+      if (ctx.interrupted) throw new Error('制作弓箭被新的指令打断');
+      if (countOf(ctx, 'crafting_table') < 1) throw new Error('制作弓箭所需的工作台没有做出来');
+      if (craftingTablePlanks > 0 && countOf(ctx, source.plank) < stickPlanks) {
+        throw new Error('制作工作台后，剩余木板不足以制作弓箭所需木棍');
+      }
+    }
+    if (sticksToCraft > 0) {
+      await ctx.craftItem({ item: 'stick', count: sticksToCraft });
+      if (ctx.interrupted) throw new Error('制作弓箭被新的指令打断');
+    }
+  }
+
+  if (countOf(ctx, 'stick') < requiredSticks) {
+    throw new Error(`木棍没有做够：需要 ${requiredSticks} 根`);
+  }
+  if (needsBow) {
+    await ctx.craftItem({ item: 'bow', count: 1 });
+    if (ctx.interrupted) throw new Error('制作弓箭被新的指令打断');
+  }
+  if (arrowDeficit > 0) {
+    await ctx.craftItem({ item: 'arrow', count: arrowDeficit });
+    if (ctx.interrupted) throw new Error('制作弓箭被新的指令打断');
+  }
+  if (countOf(ctx, 'bow') < 1 || countOf(ctx, 'arrow') < count) {
+    throw new Error(`弓箭库存未达标：需要 1 把弓和 ${count} 支箭`);
+  }
+
+  return {
+    detail: `弓箭准备完成：弓 ${countOf(ctx, 'bow')} 把、箭 ${countOf(ctx, 'arrow')} 支`,
+    status: 'succeeded',
+  };
 }
 
 // 参数取布尔值，字符串 'false' 也要当假。
@@ -766,7 +896,7 @@ export const skills = {
         if (typeof ctx.placeInventoryBlock !== 'function') {
           throw new Error('附近没有熔炉，背包里也没有熔炉');
         }
-        furnace = await ctx.placeInventoryBlock('furnace', '熔炉');
+        furnace = await ctx.placeInventoryBlock('furnace', '熔炉', 4);
         placed = true;
       }
 
@@ -783,6 +913,7 @@ export const skills = {
           }
           const before = countOf(ctx, outputName);
           const detail = await ctx.smeltItem({ item: name, count: size });
+          if (typeof ctx.syncInventory === 'function') await ctx.syncInventory();
           const after = countOf(ctx, outputName);
           if (after <= before) {
             throw new Error(`熔炼了 ${labelOf(ctx, name)}，但没有取到${labelOf(ctx, outputName)}`);
@@ -867,6 +998,28 @@ export const skills = {
         status: 'succeeded',
       };
     },
+  },
+
+  prepare_bow_arrows: {
+    description:
+      '准备末影龙战斗用弓和箭：核对线、羽毛、燧石，按库存选择可用木种，缺少木材时采集并验证最终背包数量。',
+    parameters: [
+      {
+        name: 'count',
+        type: 'number',
+        required: false,
+        default: 64,
+        description: '目标箭数量，范围 1-64。',
+      },
+      {
+        name: 'range',
+        type: 'number',
+        required: false,
+        default: 48,
+        description: '缺木材时搜索原木的范围，8-64 格。',
+      },
+    ],
+    handler: prepareBowArrows,
   },
 
   craft_torch: {

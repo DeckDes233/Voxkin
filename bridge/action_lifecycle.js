@@ -26,3 +26,17 @@ export function acknowledgeLifecycleEvent(pending, type, lifecycleId) {
   pending.splice(index, 1);
   return true;
 }
+
+export function worldHealthSnapshot(health) {
+  if (typeof health !== 'number' || !Number.isFinite(health)) return null;
+  return { health, alive: health > 0 };
+}
+
+export function inventoryItemType(item) {
+  return Number.isInteger(item?.type) ? item.type : null;
+}
+
+export async function closeWindowAndSyncInventory(window, syncInventory) {
+  await window.close();
+  await syncInventory();
+}

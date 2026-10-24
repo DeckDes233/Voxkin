@@ -1,189 +1,112 @@
 # Voxkin
 
 <p align="center">
-  <b>An AI companion that lives, talks and works with you in Minecraft</b><br>
-  Real-time voice · autonomous actions · long-term memory · local-first
+  <b>A real-time voice companion and autonomous-action prototype for Minecraft</b><br>
+  Conversation and speech · Minecraft action bridge · Fixed-stage tasks · Reproducible evaluation
 </p>
 
-<p align="center">
-  <a href="https://github.com/DeckDes233/Voxkin/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DeckDes233/Voxkin/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="Python" src="https://img.shields.io/badge/Python-3.10-3776ab">
-  <img alt="Minecraft" src="https://img.shields.io/badge/Minecraft-1.21.1-3c8527">
-  <img alt="Status" src="https://img.shields.io/badge/status-prototype-orange">
-  <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
-</p>
+Voxkin connects a Python Core, a Minecraft bridge process, and a Minecraft world. Players can use in-game chat or a microphone; the Core generates replies and dispatches supported game actions, and the bridge reports structured results. The project explores unattended survival and completion, but cannot yet complete Minecraft independently: long-running tasks use fixed stage plans, with no general dynamic workflow engine or autonomous skill-generation and release loop.
 
-Voxkin is an AI companion for Minecraft. It splits "hear the player → understand → answer with natural speech → act in the world" into two channels that never block each other: the voice channel starts speaking as early as possible, while the action channel runs in the background and reports verified results.
+中文: [README.md](README.md).
 
-The current build closes the loop locally: a player says one sentence in game, Voxkin starts speaking within 1 to 4 seconds, decides on a game action, executes it, and speaks the result when it finishes.
+## Current status
 
-> Chinese documentation: [README.md](README.md). Beginner guide: [docs/GETTING_STARTED_CN.md](docs/GETTING_STARTED_CN.md) (Chinese).
-
----
-
-## Contents
-
-- [What it does](#what-it-does)
-- [How it works](#how-it-works)
-- [Measured latency](#measured-latency)
-- [Quick start](#quick-start)
-- [Configuration](#configuration)
-- [Project layout](#project-layout)
-- [Documentation](#documentation)
-- [License](#license)
-
----
-
-## What it does
-
-| Capability | Status | Notes |
+| Capability | Status | Evidence |
 | --- | --- | --- |
-| Real-time voice conversation | Working | Microphone → local STT → streaming LLM → sentence split → streaming TTS → speaker |
-| In-game chat | Working | Players talk in Minecraft chat, Voxkin answers with voice |
-| Game actions | Working | Dig blocks, walk to coordinates, look at a player, stop |
-| Interruption | Working | New speech closes the old TTS request and clears the playback queue |
-| Long-term memory | Working | SQLite stores turns, idle-time summaries, keyword retrieval into context |
-| Control console | Working | Status, TTS preview, live events, latency breakdown, config, service control, logs |
-| Client audio mod | Builds, not verified in a live client | Receives PCM over WebSocket and plays it through a Minecraft streaming source positioned at the bot |
-| Engine adapters | Working | GPT-SoVITS or Genie for TTS; any OpenAI-compatible endpoint for the LLM |
+| Core conversation, voice, and Minecraft action bridge | Implemented; engines require local configuration, and the skill catalog does not mean every skill was live-tested | [Status](docs/STATUS.md), [bridge protocol](bridge/README.md), [skills](docs/SKILLS.md) |
+| S0 | Live-tested: 10/10 Normal-difficulty runs completed all 5/5 steps | [S0 evidence](docs/evidence/S0_NORMAL_20261022.md) |
+| S1 | Partially verified: 3/3 daytime S0→S1 chained regressions; overnight survival is unverified, so M3 is not accepted | [S1 evidence](docs/evidence/S1_NORMAL_20261022.md) |
+| S2–S6 and full run | Two isolated live runs on 2026-10-24 stopped in S2; S3–S6 did not run, and unattended completion is not achieved | [Live run record](docs/evidence/S0_S6_CHAIN_20261024.md), [milestone](docs/MILESTONE.md) |
+| Skills | Skill code is implemented; except for skills explicitly covered by S0/S1 evidence, the catalog and simulated tests do not establish live success | [Skill catalog and evidence boundaries](docs/SKILLS.md) |
+| Fabric audio mod | Builds; end-to-end behavior in a real client is unverified | [Status](docs/STATUS.md) |
 
-## How it works
+Automated tests, simulated-world tests, and live Paper regressions are different evidence and are not interchangeable. See [docs/MILESTONE.md](docs/MILESTONE.md) for the final objective and acceptance criteria.
+
+## Internal and external boundaries
+
+“Internal / external” describes Voxkin’s boundary with its environment and services; it does not imply plugin-style hot swapping.
 
 ```mermaid
 flowchart LR
-    P[Player voice or game chat] --> A[STT or bridge]
-    A --> B[Voxkin Core]
-    B --> C[Streaming LLM]
-    C --> D[Sentence splitter]
-    D --> E[Streaming TTS]
-    E --> F[Speaker or in-game mod]
-    C --> G[Tool calls]
-    G --> H[Minecraft bridge]
-    H --> I[Game actions]
-    I --> J[Result verification]
-    J --> B
-    B --> K[Memory store]
-    K --> B
+    P[Player: chat / microphone] --> C[Internal: Python Core]
+    B[External integration: Node.js mineflayer bridge] <-->|WebSocket: chat, state, actions, results| C
+    P -->|game chat| B
+    B <-->|Minecraft protocol| M[External Minecraft server]
+    C <--> L[External LLM / TTS]
+    U[Studio] <-->|HTTP / WebSocket| C
+    A[Optional Fabric audio mod] <-->|audio WebSocket| C
 ```
 
-## Measured latency
-
-Machine: i9-14900HX, RTX 4060 Laptop 8 GB, 32 GB RAM; GPT-SoVITS v2Pro for TTS, faster-whisper small for STT.
-
-| Scenario | First audible (median) | Notes |
+| Boundary | Responsibility | Code |
 | --- | --- | --- |
-| Local test LLM + real TTS | 964 ms | Pipeline overhead only |
-| Real LLM + real TTS | 3871 ms | Network and model first token dominate |
-| In-game chat to voice | 975–1494 ms | Local test LLM used for these runs |
-| Speech recognition | 2.58 s for 9.88 s audio | CPU, int8 |
+| Internal Core | Voice turns, engine adapters, action dispatch/arbitration, fixed-task runner, memory, Studio API | [`src/voxkin/`](src/voxkin/), [`__main__.py`](src/voxkin/__main__.py) |
+| External game bridge | mineflayer login, action/skill execution, result and world-state reporting | [`bridge/minecraft_bridge.js`](bridge/minecraft_bridge.js), [`bridge/skills/`](bridge/skills/) |
+| External services | Minecraft, LLM, and TTS, connected through configuration or protocols | [`config/voxkin.example.yaml`](config/voxkin.example.yaml) |
+| Optional client output | Mod receives PCM and plays it in the game client; it does not execute game actions | [`mod/`](mod/) |
 
-Full numbers and reproduction steps: [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md).
+Actual control path: input → Core conversation/intent → LLM tool call or local fast path → action arbitration/dispatch → bridge execution → result reporting. Autonomous stage tasks are fixed steps run by `TaskRunner`, not a general task graph dynamically planned by an LLM. See the [bridge protocol](bridge/README.md) and [current status](docs/STATUS.md).
 
-## Quick start
+## Minimal startup
 
-![Voxkin Studio](docs/images/studio.png)
-
-Requirements: Windows 10/11, Python 3.10, Node.js 20+, JDK 21 for the mod build, a GPT-SoVITS v2Pro runtime and a trained voice.
+The following uses Windows PowerShell and requires Python 3.10:
 
 ```powershell
-git clone https://github.com/DeckDes233/Voxkin.git
-cd Voxkin
-python -m venv .venv --system-site-packages
-.\.venv\Scripts\python.exe -m pip install -U pip
+python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 Copy-Item config\voxkin.example.yaml config\voxkin.yaml
+$env:DEEPSEEK_API_KEY = "<your API key>"
+.\.venv\Scripts\python.exe -m voxkin doctor
+.\.venv\Scripts\python.exe -m voxkin serve
 ```
 
-Put provider credentials in `config/local.yaml`:
+Open <http://127.0.0.1:8765>. Provide credentials through environment variables or a local override in git-ignored `config/local.yaml`; never commit secrets. Without valid LLM credentials, model conversation is unavailable. If TTS is unavailable, the Core falls back to log-only output. Microphone input additionally requires STT/audio dependencies and recognition models; speech synthesis requires a working TTS engine.
 
-```yaml
-llm:
-  base_url: "https://opencode.ai/inference/go/openai/v1"
-  model: "deepseek-v4.1-flash"
-  api_key: "<your key>"
-  headers:
-    x-opencode-session: "voxkin-deepseek-chan-01"
-```
+## Connect Minecraft
 
-Start the services:
+Prepare a Minecraft 1.21.1 server. Start the Core first, then launch the bridge:
 
 ```powershell
-# TTS
-<GPT-SoVITS>\runtime\python.exe api_v2.py -a 127.0.0.1 -p 9880 -c GPT_SoVITS\configs\tts_infer.yaml
-
-# Console
-.\.venv\Scripts\python.exe -m voxkin serve
-
-# Minecraft bridge
 cd bridge
 npm install
-$env:MC_HOST="127.0.0.1"; $env:MC_PORT="25565"; $env:MC_USERNAME="Voxkin"
+$env:MC_HOST = "127.0.0.1"
+$env:MC_PORT = "25565"
+$env:MC_USERNAME = "Voxkin"
+$env:MC_AUTH = "offline"
+$env:VOXKIN_WS = "ws://127.0.0.1:8765/ws/bridge"
 node minecraft_bridge.js
 ```
 
-Open <http://127.0.0.1:8765>, type a sentence, and the full chain runs.
+Offline accounts should only connect to a local or trusted test server. `online-mode=false` weakens identity checks; do not expose such a server publicly. The optional mod builds, but playback/spatial audio in a real client is not accepted. Full guide: [Minecraft setup (Chinese)](docs/ENTER_MINECRAFT_CN.md).
 
-### 4. Enter Minecraft
+### One-command local live-test startup
 
-The full walkthrough (dedicated server, bridge, microphone, client mod, YSM) is currently Chinese-only: [docs/ENTER_MINECRAFT_CN.md](docs/ENTER_MINECRAFT_CN.md). The short version:
-
-1. Run a Paper 1.21.1 server with `online-mode=false` and `spawn-protection=0`; a LAN world rejects the offline bot.
-2. Start Studio and the bridge, then confirm the console shows the bridge connected and the bot `Voxkin` in the world.
-3. Join the server and talk to Voxkin in chat. It answers with voice and performs actions such as digging, walking, or turning.
-4. For positional audio, build the client mod (`cd mod; gradle build` with JDK 21), install the jar plus Fabric API, set `audio.output: websocket`, and add `-Dvoxkin.audio.url=ws://127.0.0.1:8765/ws/audio -Dvoxkin.audio.bot=Voxkin` to the client JVM arguments.
-
-The mod plays through Minecraft's streaming sound source at the bot entity, with distance attenuation; the spatial effect has not been verified in a live client yet.
-
-### 5. Talk through the microphone
+First start your dedicated Minecraft 1.21.1 test server and confirm it listens on local port `25566`. From the repository root, run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m voxkin mic
+.\scripts\eval_stack.ps1 -Action start -McPort 25566
 ```
 
-Speak naturally; press `Ctrl+C` to stop. Useful flags:
+This starts the configured GPT-SoVITS runtime if present, Voxkin Studio, and the independent-mode Minecraft bridge. It **does not start, reset, or create a Minecraft server/world**. Open <http://127.0.0.1:8765> and confirm the bridge is connected. Stop the processes launched by the script with:
 
-| Flag | Purpose |
-| --- | --- |
-| `--listen-only` | Transcribe only, no LLM or TTS |
-| `--gain 4` | Boost a quiet microphone |
-| `--no-barge-in` | Disable interruption on open speakers to avoid hearing itself |
-| `--output speaker` | Override the audio output for this run |
-
-With open speakers, add `--no-barge-in`: microphone input is ignored for 1.5 seconds after playback ends, preventing the bot from answering its own voice. Headphones give the most natural interruption behaviour.
-
-## Configuration
-| File | Purpose |
-| --- | --- |
-| `config/voxkin.example.yaml` | Committed defaults |
-| `config/voxkin.yaml` | Local settings, ignored |
-| `config/local.yaml` | Secrets and personal paths, ignored |
-| `data/voxkin.db` | Conversation and memory database, ignored |
-
-## Project layout
-
+```powershell
+.\scripts\eval_stack.ps1 -Action stop
 ```
-src/voxkin/          Core: config, pipeline, adapters, memory, services
-src/voxkin/studio/   Console frontend
-bridge/              Minecraft bridge (mineflayer)
-mod/                 Fabric client audio mod
-tests/               Automated tests
-tools/               Local test LLM
-docs/                Audit, architecture, evaluation, decisions, roadmap, status, benchmarks
-```
+
+Paper is not stopped. Use a disposable test world, not a valuable save or an in-use evaluation world. The bridge defaults to offline username `Voxkin`; pass a different `-McPort` when needed. See [Minecraft setup](docs/ENTER_MINECRAFT_CN.md) for prerequisites.
+
+## Autonomous completion progress
+
+- **S0:** all 10 Normal-difficulty runs completed 5/5; this validates one stage, not full autonomy.
+- **S1:** three daytime S0→S1 chained regressions; three-night survival is unverified, so M3 has not passed.
+- **S2–S6:** plans and skill implementations exist; two isolated live runs on 2026-10-24 stopped in S2, and S3–S6 did not run. Death recovery, cross-dimension progression, and the Ender Dragon fight lack final acceptance.
+- **G1:** no unattended end-to-end completion has been performed.
+
+The roadmap is not a capability claim. See [status](docs/STATUS.md), [stage plan](docs/plans/INDEPENDENT_RUN_ROADMAP.md), and the [live evidence directory](docs/evidence/).
 
 ## Documentation
 
-- [Getting started (Chinese)](docs/GETTING_STARTED_CN.md)
-- [Enter Minecraft (Chinese)](docs/ENTER_MINECRAFT_CN.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Repository audit](docs/REPO_AUDIT.md)
-- [Technology evaluation](docs/TECH_EVALUATION.md)
-- [Decisions](docs/DECISIONS.md)
-- [Roadmap](docs/ROADMAP.md)
-- [Status](docs/STATUS.md)
-- [Benchmark results](docs/BENCHMARK_RESULTS.md)
-- [License analysis](docs/LICENSE_ANALYSIS.md)
+[Getting started (Chinese)](docs/GETTING_STARTED_CN.md) · [Bridge protocol](bridge/README.md) · [Skill catalog](docs/SKILLS.md) · [Status](docs/STATUS.md) · [Milestone](docs/MILESTONE.md) · [Evaluation](docs/plans/EVALUATION.md) · [Benchmarks](docs/BENCHMARK_RESULTS.md) · [License analysis](docs/LICENSE_ANALYSIS.md)
 
 ## License
 
-MIT. See [LICENSE](LICENSE) and [docs/LICENSE_ANALYSIS.md](docs/LICENSE_ANALYSIS.md).
+MIT. See [LICENSE](LICENSE).

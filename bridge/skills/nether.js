@@ -266,11 +266,24 @@ function log(ctx, ...args) {
   if (typeof ctx.log === 'function') ctx.log(...args);
 }
 
+function throwIfInterrupted(ctx, action) {
+  if (ctx && ctx.interrupted) throw new Error(`${action}被新的指令打断`);
+}
+
 // 当前维度 id，例如 minecraft:the_nether。
 function currentDimension(ctx) {
   const bot = ctx && ctx.bot;
   const game = bot && bot.game;
   return String((game && game.dimension) || '').toLowerCase();
+}
+
+function isExpectedDimension(ctx, expected) {
+  const actual = currentDimension(ctx);
+  if (expected === NETHER_DIMENSION) return isNetherDimension(actual);
+  if (expected === OVERWORLD_DIMENSION) {
+    return actual === OVERWORLD_DIMENSION || actual === 'overworld';
+  }
+  return actual === expected;
 }
 
 function dimensionLabel(dimension) {
@@ -385,6 +398,7 @@ async function clearPortalSpace(ctx, frame) {
   let cleared = 0;
   const targets = [...frame.interior, ...frame.frame];
   for (const target of targets) {
+    throwIfInterrupted(ctx, 'Building nether portal');
     const block = blockAt(ctx, target.x, target.y, target.z);
     if (!block) continue;
     if (block.name === 'obsidian') continue;
@@ -393,6 +407,7 @@ async function clearPortalSpace(ctx, frame) {
       await ctx.breakBlock({ x: target.x, y: target.y, z: target.z });
       cleared += 1;
     } catch (error) {
+      throwIfInterrupted(ctx, '清理下界门空间');
       throw new Error(
         `附近清不出门框空间：${error.message}；没有钻石镐的话黑曜石挖不动，先去挖黑曜石`
       );
@@ -405,6 +420,7 @@ async function clearPortalSpace(ctx, frame) {
 async function placeObsidianFrame(ctx, frame) {
   let placed = 0;
   for (const target of [...frame.bottom, ...frame.sides]) {
+    throwIfInterrupted(ctx, 'Building nether portal');
     const block = blockAt(ctx, target.x, target.y, target.z);
     if (block && block.name === 'obsidian') {
       placed += 1;
@@ -414,6 +430,7 @@ async function placeObsidianFrame(ctx, frame) {
       await ctx.placeBlock({ block: 'obsidian', x: target.x, y: target.y, z: target.z });
       placed += 1;
     } catch (error) {
+      throwIfInterrupted(ctx, '摆放下界门框架');
       throw new Error(`门框摆不上去：${error.message}；附近没有可以依附的方块`);
     }
   }
@@ -445,16 +462,23 @@ async function lightPortal(ctx, frame) {
   aims.push(makeVec(ctx, center.x + 0.5, center.y + 0.5, center.z + 0.5));
 
   for (const aim of aims) {
+    throwIfInterrupted(ctx, 'Lighting nether portal');
     try {
       await bot.lookAt(aim, true);
       await sleepMs(ctx, 150);
-      bot.activateItem();
-      await sleepMs(ctx, 400);
-      bot.deactivateItem();
+      throwIfInterrupted(ctx, '点燃下界门');
+      await bot.activateItem();
+      try {
+        await sleepMs(ctx, 400);
+      } finally {
+        if (typeof bot.deactivateItem === 'function') await bot.deactivateItem();
+      }
     } catch (error) {
+      throwIfInterrupted(ctx, '点燃下界门');
       log(ctx, '点火动作失败，换一个瞄准点', error.message);
     }
     for (let attempt = 0; attempt < 8; attempt += 1) {
+      throwIfInterrupted(ctx, 'Lighting nether portal');
       if (portalLit(ctx, frame)) return true;
       await sleepMs(ctx, 250);
     }
@@ -464,6 +488,7 @@ async function lightPortal(ctx, frame) {
 
 // 建下界门并点火。
 async function makeNetherPortal(args, ctx) {
+  throwIfInterrupted(ctx, 'Building nether portal');
   const dimension = currentDimension(ctx);
   if (isNetherDimension(dimension)) {
     throw new Error('已经在下界里了，下界门只能在主世界点燃');
@@ -502,6 +527,7 @@ async function makeNetherPortal(args, ctx) {
       throw new Error('打火石点了火，但门框里没有出现下界门，附近没有生成门');
     }
   }
+  throwIfInterrupted(ctx, 'Building nether portal');
 
   moduleState.portal = {
     x: site.origin.x,
@@ -528,6 +554,7 @@ async function makeNetherPortal(args, ctx) {
         );
       }
     }
+    throwIfInterrupted(ctx, 'Building nether portal');
     parts.push(
       `返程门也建好了，位置 (${second.origin.x}, ${second.origin.y}, ${second.origin.z})，` +
         `门框 ${secondPlaced} 个黑曜石`
@@ -565,6 +592,7 @@ function findNearbyPortal(ctx, radius) {
 async function waitDimension(ctx, expected, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    throwIfInterrupted(ctx, '等待维度切换');
     if (currentDimension(ctx) === expected) return true;
     await sleepMs(ctx, 250);
   }
@@ -572,28 +600,33 @@ async function waitDimension(ctx, expected, timeoutMs) {
 }
 
 // 走进下界门。
-async function enterPortal(ctx, portal, timeoutMs) {
+async function enterPortal(ctx, portal, expectedDimension, timeoutMs) {
+  throwIfInterrupted(ctx, '穿过下界门');
   try {
     await ctx.travelTo(portal.x, portal.y, portal.z, 1);
   } catch (error) {
+    throwIfInterrupted(ctx, '穿过下界门');
     log(ctx, '没走到下界门', error.message);
   }
   // 再往门里挤一挤，必要时多试几次。
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (currentDimension(ctx) !== OVERWORLD_DIMENSION) break;
+    throwIfInterrupted(ctx, '穿过下界门');
+    if (isExpectedDimension(ctx, expectedDimension)) return true;
     try {
       await ctx.walkOnce(portal.x, portal.y, portal.z, 1, 4000);
     } catch (error) {
+      throwIfInterrupted(ctx, '穿过下界门');
       log(ctx, '进门动作失败', error.message);
     }
     await sleepMs(ctx, 400);
   }
-  return currentDimension(ctx) !== OVERWORLD_DIMENSION;
+  return isExpectedDimension(ctx, expectedDimension);
 }
 
 // 下界坐标换算与过门。
 async function netherTravel(args, ctx) {
+  throwIfInterrupted(ctx, '穿过下界门');
   const bot = botOf(ctx);
   const dimension = currentDimension(ctx);
   const mode = String(args.mode || 'auto').toLowerCase();
@@ -647,7 +680,8 @@ async function netherTravel(args, ctx) {
   }
   moduleState.portal = { x: portal.x, y: portal.y, z: portal.z, dimension };
 
-  const passed = await enterPortal(ctx, portal, timeoutMs);
+  const expectedDimension = wanted === 'enter' ? NETHER_DIMENSION : OVERWORLD_DIMENSION;
+  const passed = await enterPortal(ctx, portal, expectedDimension, timeoutMs);
   if (!passed) {
     throw new Error(
       `没有走进下界门，附近 (${portal.x}, ${portal.y}, ${portal.z}) 的门没有把维度切过去`
@@ -745,6 +779,7 @@ async function callCombatEntry(ctx, options) {
 // 迷路时的回退路径：优先走回最近看到的堡垒结构，其次走回下界门，
 // 都没有就按螺旋方向往外扩一圈再找。
 async function fallbackStep(ctx, radius) {
+  throwIfInterrupted(ctx, '探索下界堡垒');
   const bot = botOf(ctx);
   const base = bot.entity.position;
   const headings = [
@@ -769,6 +804,7 @@ async function fallbackStep(ctx, radius) {
       log(ctx, `回退到${target.label}`, `${target.x}, ${target.y}, ${target.z}`);
       return true;
     } catch (error) {
+      throwIfInterrupted(ctx, '探索下界堡垒');
       log(ctx, `回退到${target.label}失败`, error.message);
     }
   }
@@ -787,6 +823,7 @@ async function fallbackStep(ctx, radius) {
     await ctx.travelTo(target.x, target.y, target.z, 3);
     return true;
   } catch (error) {
+    throwIfInterrupted(ctx, '探索下界堡垒');
     log(ctx, '外扩搜索走不动', error.message);
     return false;
   }
@@ -810,6 +847,7 @@ async function raidFortress(args, ctx) {
   let lastSearch = 0;
 
   while (Date.now() < deadline) {
+    throwIfInterrupted(ctx, '探索下界堡垒');
     // 1. 先看附近有没有烈焰人。
     const blaze = findBlaze(ctx, radius);
     if (blaze) {
@@ -828,6 +866,7 @@ async function raidFortress(args, ctx) {
         radius,
         min_health: 6,
       });
+      throwIfInterrupted(ctx, '探索下界堡垒');
       if (outcome) {
         const rods = ctx.countItem('blaze_rod');
         return {
@@ -836,7 +875,7 @@ async function raidFortress(args, ctx) {
             `${outcome.detail || '战斗结束'}；` +
             `烈焰棒现在 ${rods} 根` +
             (notes.length ? `；${notes.join('，')}` : ''),
-          status: 'succeeded',
+          status: outcome.status === 'partial' ? 'partial' : outcome.status === 'failed' ? 'failed' : 'succeeded',
         };
       }
 
@@ -849,7 +888,7 @@ async function raidFortress(args, ctx) {
           (structureFound
             ? `堡垒结构在 (${structureFound.x}, ${structureFound.y}, ${structureFound.z})。`
             : `附近还没找到堡垒结构，只看到这只烈焰人。`),
-        status: 'succeeded',
+        status: 'partial',
       };
     }
 
@@ -865,6 +904,7 @@ async function raidFortress(args, ctx) {
         try {
           await ctx.travelTo(structure.x, structure.y, structure.z, 3);
         } catch (error) {
+          throwIfInterrupted(ctx, '探索下界堡垒');
           log(ctx, '走不到堡垒结构', error.message);
         }
         continue;
@@ -1018,8 +1058,10 @@ async function collectBlazeRods(args, ctx) {
   let blazeNoted = false;
 
   while (Date.now() < deadline && rods < wanted) {
+    throwIfInterrupted(ctx, '收集烈焰棒');
     // 1. 先确认自己不在岩浆里。
     if (await escapeLava(ctx)) avoided += 1;
+    throwIfInterrupted(ctx, '收集烈焰棒');
 
     // 2. 找附近还没试过的烈焰棒掉落物。
     const drop = findBlazeRodDrop(ctx, radius, tried);
@@ -1033,9 +1075,11 @@ async function collectBlazeRods(args, ctx) {
         try {
           await ctx.travelTo(drop.position.x, drop.position.y, drop.position.z, 1);
         } catch (error) {
+          throwIfInterrupted(ctx, '收集烈焰棒');
           log(ctx, '走不到烈焰棒掉落物', error.message);
         }
         await sleepMs(ctx, 400);
+        throwIfInterrupted(ctx, '收集烈焰棒');
         const after = ctx.countItem('blaze_rod');
         if (after > rods) {
           picked += after - rods;
@@ -1046,6 +1090,7 @@ async function collectBlazeRods(args, ctx) {
         if (typeof ctx.collectDrops === 'function') {
           try {
             const result = await ctx.collectDrops(radius, 'blaze_rod');
+            throwIfInterrupted(ctx, '收集烈焰棒');
             const gained = ctx.countItem('blaze_rod');
             if (gained > rods) {
               picked += gained - rods;
@@ -1056,6 +1101,7 @@ async function collectBlazeRods(args, ctx) {
               notes.push(`有 ${result.missed.length} 根烈焰棒没捡到`);
             }
           } catch (error) {
+            throwIfInterrupted(ctx, '收集烈焰棒');
             log(ctx, '捡烈焰棒失败', error.message);
           }
         }
@@ -1071,6 +1117,7 @@ async function collectBlazeRods(args, ctx) {
         radius,
         min_health: 6,
       });
+      throwIfInterrupted(ctx, '收集烈焰棒');
       if (outcome) {
         rods = ctx.countItem('blaze_rod');
         if (rods >= wanted) {

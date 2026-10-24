@@ -3,9 +3,12 @@ import test from 'node:test';
 
 import {
   drainActions,
+  inventoryItemType,
   queueLifecycleEvent,
   rejectBlockedAction,
   acknowledgeLifecycleEvent,
+  closeWindowAndSyncInventory,
+  worldHealthSnapshot,
 } from '../action_lifecycle.js';
 
 test('blocked actions are rejected before entering the execution queue', () => {
@@ -46,4 +49,35 @@ test('lifecycle events remain pending until acknowledged and can be replayed', (
   assert.equal(pending.length, 1);
   assert.equal(acknowledgeLifecycleEvent(pending, 'respawn', 'death-1'), true);
   assert.equal(pending.length, 0);
+});
+
+test('world health snapshot rejects unknown values and reports alive state', () => {
+  assert.equal(worldHealthSnapshot(undefined), null);
+  assert.equal(worldHealthSnapshot(Number.NaN), null);
+  assert.equal(worldHealthSnapshot(Number.POSITIVE_INFINITY), null);
+  assert.deepEqual(worldHealthSnapshot(20), { health: 20, alive: true });
+  assert.deepEqual(worldHealthSnapshot(0), { health: 0, alive: false });
+});
+
+test('inventory stack IDs use the Mineflayer item type field', () => {
+  assert.equal(inventoryItemType({ type: 803, name: 'coal', count: 1 }), 803);
+  assert.equal(inventoryItemType({ id: 803, name: 'coal', count: 1 }), null);
+  assert.equal(inventoryItemType(null), null);
+});
+
+test('furnace inventory is copied after closing its container and before syncing', async () => {
+  const inventory = { cooked_beef: 0 };
+  const events = [];
+  const window = {
+    async close() {
+      events.push('close');
+      inventory.cooked_beef = 3;
+    },
+  };
+
+  await closeWindowAndSyncInventory(window, async () => {
+    events.push(`sync:${inventory.cooked_beef}`);
+  });
+
+  assert.deepEqual(events, ['close', 'sync:3']);
 });

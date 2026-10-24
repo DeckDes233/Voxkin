@@ -89,6 +89,11 @@ def test_tool_parameters_follow_the_manifest():
             assert properties[key].get("maximum") == bounds.get("max"), (name, key)
 
 
+def test_hunt_material_schema_exposes_its_supported_item_values():
+    schema = tool_map()["hunt_material"]["parameters"]["properties"]["item"]
+    assert schema["enum"] == ["feather", "string"]
+
+
 def test_existing_tools_keep_their_parameters():
     tools = tool_map()
     assert set(EXISTING_TOOLS) <= set(tools)

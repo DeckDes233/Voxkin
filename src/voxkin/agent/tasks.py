@@ -115,6 +115,21 @@ class TaskStore:
             updated_at=row["updated_at"],
         )
 
+    def latest_task(self) -> Task | None:
+        row = self._connection.execute(
+            "select * from tasks order by updated_at desc, id desc limit 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return Task(
+            id=row["id"],
+            objective=row["objective"],
+            stage=row["stage"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
     def latest_resumable(self) -> Task | None:
         row = self._connection.execute(
             "select * from tasks where status in ('active', 'cancelled', 'blocked', 'failed', 'dead') "
@@ -231,6 +246,13 @@ class TaskStore:
             }
             for row in reversed(rows)
         ]
+
+    def has_event(self, task_id: int, kind: str, event: str) -> bool:
+        rows = self._connection.execute(
+            "select payload from events where task_id = ? and kind = ? order by id desc",
+            (task_id, kind),
+        ).fetchall()
+        return any(json.loads(row["payload"]).get("event") == event for row in rows)
 
     def close(self) -> None:
         self._connection.close()

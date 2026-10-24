@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from voxkin.agent.plans import AUX_PLANS, PLANS
+from voxkin.agent.progress import is_complete, stage_by_id
 from voxkin.agent.runlog import RunLogger
 from voxkin.agent.runner import StepSpec, TaskRunner, Verifier
 from voxkin.agent.tasks import TaskStore
@@ -48,11 +49,41 @@ class RunManager:
         return self._task is not None and not self._task.done()
 
     def status(self) -> dict[str, Any]:
+        if self._task_id is None and self._runner is None:
+            latest_task = self._store.latest_task()
+            if latest_task is not None:
+                self._task_id = latest_task.id
+                self._stage = latest_task.stage
+                checkpoint = self._store.load_checkpoint(latest_task.id)
+                checkpoint_payload = checkpoint["payload"] if checkpoint else {}
+                self._result = {
+                    "ok": latest_task.status == "done",
+                    "status": latest_task.status,
+                    "cursor": checkpoint["cursor"] if checkpoint else 0,
+                    "detail": checkpoint_payload.get("detail")
+                    or checkpoint_payload.get("reason")
+                    or "",
+                }
+        task_id = self._task_id or (self._runner.task_id if self._runner is not None else None)
+        stage = stage_by_id(self._stage)
+        stage_complete = None
+        if stage is not None:
+            state = self._state_provider()
+            completed_events = (
+                {stage.event}
+                if task_id is not None
+                and stage.event
+                and self._store.has_event(task_id, "goal_event", stage.event)
+                else set()
+            )
+            stage_complete = is_complete(
+                stage, state.get("inventory") or {}, completed_events
+            )
         return {
             "running": self.running,
             "stage": self._stage,
-            "task_id": self._task_id
-            or (self._runner.task_id if self._runner is not None else None),
+            "task_id": task_id,
+            "stage_complete": stage_complete,
             "cursor": self._runner.cursor if self._runner is not None else 0,
             "started_at": self._started_at,
             "result": self._result,

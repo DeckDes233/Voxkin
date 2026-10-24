@@ -158,9 +158,16 @@ def test_parse_chat_rejects_empty():
 
 def test_action_result_validation():
     result = ActionResult.from_message(
-        {"type": "action_result", "action_id": "abc", "ok": True, "detail": "ok"}
+        {
+            "type": "action_result",
+            "action_id": "abc",
+            "ok": True,
+            "detail": "ok",
+            "data": {"events": ["ender_dragon_killed"]},
+        }
     )
     assert result.ok and result.action_id == "abc"
+    assert result.data == {"events": ["ender_dragon_killed"]}
     with pytest.raises(ValueError):
         ActionResult.from_message({"type": "action_result", "ok": True})
 

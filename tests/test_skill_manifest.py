@@ -95,6 +95,16 @@ def test_manifest_schema_generation_keeps_every_skill():
         assert set(parameters.get("required", [])) <= set(parameters["properties"])
 
 
+def test_hunt_material_tool_schema_restricts_supported_drops():
+    properties = tool_map()["hunt_material"]["parameters"]["properties"]
+    assert properties["item"]["enum"] == ["feather", "string"]
+
+
+def test_prepare_bow_arrows_is_exposed_as_a_core_tool():
+    tool = tool_map()["prepare_bow_arrows"]
+    assert set(tool["parameters"]["properties"]) == {"count", "range"}
+
+
 def test_every_skill_declares_observable_verification():
     for name, skill in manifest_map().items():
         assert skill["verifies"].strip(), name
