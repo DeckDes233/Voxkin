@@ -1039,7 +1039,7 @@ async function waitForHealth(minHealth, timeoutMs = 20000) {
 }
 
 // 走一次并分类结果：'reached' | 'unreachable' | 'stopped' | 'cancelled'。
-async function walkOnce(x, y, z, radius, timeoutMs) {
+async function walkOnce(x, y, z, radius, timeoutMs, horizontalOnly = false) {
   const cancel = externalCancelReason();
   if (cancel) {
     log('采集被外部取消', cancel);
@@ -1048,7 +1048,11 @@ async function walkOnce(x, y, z, radius, timeoutMs) {
   resetPathfinderGoal();
   try {
     await withTimeout(
-      bot.pathfinder.goto(new goals.GoalNear(x, y, z, radius)),
+      bot.pathfinder.goto(
+        horizontalOnly
+          ? new goals.GoalNearXZ(x, z, radius)
+          : new goals.GoalNear(x, y, z, radius)
+      ),
       timeoutMs,
       '走到目标超时',
       stopPathfinding,

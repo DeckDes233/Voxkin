@@ -15,6 +15,8 @@ const ENDERMAN_TIMEOUT_MS = 180000;
 const CRYSTAL_TIMEOUT_MS = 180000;
 // 搜索不到目标时最多空等的时长，超过就按失败收尾。
 const SEARCH_WAIT_MS = 20000;
+const SHEEP_SEARCH_MAX_STEPS = 12;
+const SHEEP_SEARCH_STEP_TIMEOUT_MS = 10000;
 // 近战可命中的距离上限（格）。
 const MELEE_RANGE = 3.0;
 const MELEE_REACH = 3.6;
@@ -289,54 +291,213 @@ function assertSafeSheepSearch(ctx) {
   }
 }
 
-async function searchForSheep(ctx, radius, color, count) {
-  if (typeof ctx.walkOnce !== 'function') return [];
+async function searchForSheep(
+  ctx,
+  radius,
+  color,
+  maxSteps,
+  excluded = new Set(),
+  targetWoolCount = 1,
+  minimumSearchSteps = 1,
+) {
+  if (typeof ctx.walkOnce !== 'function') return { candidates: [], stepsUsed: 0 };
   const origin = ctx.bot.entity.position;
   const originX = origin.x;
-  const originY = Math.max(1, Math.floor(origin.y));
   const originZ = origin.z;
   const searchRadius = Math.min(radius, 48);
-  const radii = [];
-  for (let distance = 12; distance < searchRadius; distance += 12) radii.push(distance);
-  radii.push(searchRadius);
-  const headings = [
-    [0, -1],
-    [1, -1],
-    [1, 0],
-    [1, 1],
-    [0, 1],
-    [-1, 1],
-    [-1, 0],
-    [-1, -1],
-  ];
-  const waypoints = radii.flatMap((distance) =>
-    headings.map(([x, z]) => [Math.round(x * distance), Math.round(z * distance)])
-  );
+  const visited = new Set();
   const discovered = new Map();
-  for (const [dx, dz] of waypoints) {
+  let stepsUsed = 0;
+  const stepLimit = Math.min(SHEEP_SEARCH_MAX_STEPS, Math.max(0, maxSteps));
+  for (let step = 0; step < stepLimit; step += 1) {
     assertSafeSheepSearch(ctx);
-    const outcome = await ctx.walkOnce(
-      originX + dx,
-      originY,
-      originZ + dz,
-      3,
-      4000,
+    const currentPosition = ctx.bot.entity.position;
+    const waypoint = nextSheepSearchWaypoint(
+      ctx,
+      originX,
+      originZ,
+      currentPosition.x,
+      currentPosition.z,
+      searchRadius,
+      visited,
+      ctx.random,
     );
+    if (!waypoint) break;
+    stepsUsed += 1;
+    if (typeof ctx.log === 'function') {
+      ctx.log('剪羊搜索路线', `${step + 1}/${SHEEP_SEARCH_MAX_STEPS}`, `(${waypoint.x}, ${waypoint.y}, ${waypoint.z})`);
+    }
+    const outcome = await walkSheepSearchWaypoint(ctx, waypoint);
     if (outcome !== 'reached') {
       if (outcome === 'unreachable' || outcome === 'stopped') continue;
       throw new Error(`寻找羊时移动未完成（${outcome || '未知状态'}），停止探索`);
     }
     assertSafeSheepSearch(ctx);
-    const candidates = sheepCandidates(ctx, radius, color, new Set());
-    for (const candidate of candidates) discovered.set(candidate.sheep.id, candidate);
-    const current = [...discovered.values()];
-    const selectedColor = pickSheepColor(ctx, current, color || 'auto', count);
-    if (selectedColor &&
-        ctx.countItem(`${selectedColor}_wool`) + current.filter((item) => item.color === selectedColor).length >= count) {
-      return current;
+    const candidates = sheepCandidates(ctx, radius, color, excluded);
+    for (const candidate of candidates) {
+      const offsetX = candidate.sheep.position.x - originX;
+      const offsetZ = candidate.sheep.position.z - originZ;
+      if (Math.hypot(offsetX, offsetZ) <= radius) {
+        discovered.set(candidate.sheep.id, candidate);
+      }
+    }
+    if (typeof ctx.log === 'function') {
+      ctx.log('剪羊搜索观察', `${stepsUsed}/${stepLimit}`, `候选羊 ${discovered.size}`);
+    }
+    const candidateCounts = new Map();
+    for (const candidate of discovered.values()) {
+      candidateCounts.set(candidate.color, (candidateCounts.get(candidate.color) || 0) + 1);
+    }
+    const searchedColors = color ? [color] : SHEEP_COLORS;
+    let colorCanMeetTarget = false;
+    for (const searchedColor of searchedColors) {
+      if (
+        ctx.countItem(`${searchedColor}_wool`) +
+          Math.min((candidateCounts.get(searchedColor) || 0) * 3, targetWoolCount) >= targetWoolCount
+      ) {
+        colorCanMeetTarget = true;
+        break;
+      }
+    }
+    if (
+      colorCanMeetTarget &&
+      (stepsUsed >= Math.min(stepLimit, minimumSearchSteps) || discovered.size >= targetWoolCount)
+    ) {
+      return { candidates: [...discovered.values()], stepsUsed };
     }
   }
-  return [...discovered.values()].sort((left, right) => left.distance - right.distance);
+  return {
+    candidates: [...discovered.values()].sort((left, right) => left.distance - right.distance),
+    stepsUsed,
+  };
+}
+
+function nextSheepSearchWaypoint(ctx, originX, originZ, currentX, currentZ, radius, visited, random) {
+  const bot = ctx.bot;
+  if (typeof bot.findBlocks !== 'function' || typeof bot.blockAt !== 'function') return null;
+  const randomValue = typeof random === 'function' ? random : Math.random;
+  const minStep = Math.min(10, radius * 0.45);
+  const maxStep = Math.min(18, Math.max(minStep, radius * 0.75));
+  let supports;
+  try {
+    supports = bot.findBlocks({
+      matching: (block) => {
+        if (!block || block.boundingBox !== 'block' || isSheepSearchHazard(block.name)) return false;
+        const position = block.position;
+        if (!position) return true;
+        const fromCurrent = Math.hypot(position.x - currentX, position.z - currentZ);
+        if (fromCurrent < minStep || fromCurrent > maxStep) return false;
+        if (Math.hypot(position.x - originX, position.z - originZ) > radius) return false;
+        const key = `${Math.round(position.x / 6)},${Math.round(position.z / 6)}`;
+        return !visited.has(key);
+      },
+      maxDistance: Math.min(radius, maxStep + 4),
+      count: 192,
+    });
+  } catch {
+    return null;
+  }
+  const candidates = [];
+  for (const support of supports || []) {
+    const position = support?.position || support;
+    if (!position) continue;
+    const x = position.x;
+    const y = position.y + 1;
+    const z = position.z;
+    const fromCurrent = Math.hypot(x - currentX, z - currentZ);
+    if (fromCurrent < minStep || fromCurrent > maxStep) continue;
+    if (Math.hypot(x - originX, z - originZ) > radius) continue;
+    const key = `${Math.round(x / 6)},${Math.round(z / 6)}`;
+    if (visited.has(key)) continue;
+    let feet;
+    let head;
+    try {
+      feet = bot.blockAt(sheepBlockPosition(bot.entity.position, x, y, z));
+      head = bot.blockAt(sheepBlockPosition(bot.entity.position, x, y + 1, z));
+    } catch {
+      continue;
+    }
+    if (!isSheepSearchAir(feet) || !isSheepSearchAir(head)) continue;
+    candidates.push({ x, y, z, key });
+  }
+  if (candidates.length === 0) {
+    if (typeof ctx.log === 'function') {
+      ctx.log('剪羊搜索没有安全路点', `已加载支撑方块 ${supports?.length || 0}`);
+    }
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const angle = randomValue() * Math.PI * 2;
+      const distance = minStep + randomValue() * (maxStep - minStep);
+      const x = Math.round(currentX + Math.cos(angle) * distance);
+      const z = Math.round(currentZ + Math.sin(angle) * distance);
+      if (Math.hypot(x - originX, z - originZ) > radius) continue;
+      const key = `${Math.round(x / 6)},${Math.round(z / 6)}`;
+      if (visited.has(key)) continue;
+      visited.add(key);
+      if (typeof ctx.log === 'function') {
+        ctx.log('剪羊搜索改用寻路探索点', `(${x}, ${Math.floor(bot.entity.position.y)}, ${z})`);
+      }
+      return { x, y: Math.floor(bot.entity.position.y), z, key };
+    }
+    return null;
+  }
+  const waypoint = candidates[Math.floor(randomValue() * candidates.length)];
+  visited.add(waypoint.key);
+  return waypoint;
+}
+
+function sheepBlockPosition(origin, x, y, z) {
+  if (typeof origin.offset === 'function') {
+    return origin.offset(x - origin.x, y - origin.y, z - origin.z);
+  }
+  return { x, y, z };
+}
+
+function isSheepSearchAir(block) {
+  return Boolean(block && block.boundingBox === 'empty' && !isSheepSearchHazard(block.name));
+}
+
+function isSheepSearchHazard(name) {
+  return /water|lava|fire|cactus|magma_block|sweet_berry_bush|powder_snow|wither_rose|campfire/i.test(String(name || ''));
+}
+
+async function walkSheepSearchWaypoint(ctx, waypoint) {
+  const movements = ctx.bot.pathfinder?.movements;
+  const previousLiquidCost = movements && Number.isFinite(movements.liquidCost)
+    ? movements.liquidCost
+    : null;
+  const avoidedWater = [];
+  const blocksToAvoid = movements?.blocksToAvoid;
+  const blocksByName = ctx.registry?.blocksByName || {};
+  let startingInWater = false;
+  try {
+    const feet = ctx.bot.blockAt(ctx.bot.entity.position);
+    startingInWater = Boolean(feet && /water/i.test(String(feet.name || '')));
+  } catch {
+    startingInWater = true;
+  }
+  if (!startingInWater && blocksToAvoid instanceof Set) {
+    for (const name of ['water', 'flowing_water', 'bubble_column']) {
+      const id = blocksByName[name]?.id;
+      if (id !== undefined && !blocksToAvoid.has(id)) {
+        blocksToAvoid.add(id);
+        avoidedWater.push(id);
+      }
+    }
+  }
+  if (previousLiquidCost !== null) movements.liquidCost = Math.max(previousLiquidCost, 32);
+  try {
+    return await ctx.walkOnce(
+      waypoint.x,
+      waypoint.y,
+      waypoint.z,
+      3,
+      SHEEP_SEARCH_STEP_TIMEOUT_MS,
+      true,
+    );
+  } finally {
+    if (previousLiquidCost !== null) movements.liquidCost = previousLiquidCost;
+    for (const id of avoidedWater) blocksToAvoid.delete(id);
+  }
 }
 
 function pickSheepColor(ctx, candidates, requestedColor, count) {
@@ -385,15 +546,20 @@ async function shearSheep(args, ctx) {
       status: 'succeeded',
     };
   }
+  let searchStepsUsed = 0;
   if (availableForColor < count) {
-    const exploredCandidates = await searchForSheep(
+    const explored = await searchForSheep(
       ctx,
       radius,
       requestedColor === 'auto' ? '' : requestedColor,
+      SHEEP_SEARCH_MAX_STEPS,
+      new Set(),
       count,
+      requestedColor === 'auto' ? Math.ceil(SHEEP_SEARCH_MAX_STEPS / 2) : 1,
     );
+    searchStepsUsed += explored.stepsUsed;
     const combined = new Map(initialCandidates.map((candidate) => [candidate.sheep.id, candidate]));
-    for (const candidate of exploredCandidates) combined.set(candidate.sheep.id, candidate);
+    for (const candidate of explored.candidates) combined.set(candidate.sheep.id, candidate);
     initialCandidates = [...combined.values()];
   }
   color = pickSheepColor(ctx, initialCandidates, requestedColor, count);
@@ -413,16 +579,47 @@ async function shearSheep(args, ctx) {
   if (typeof bot.activateEntity !== 'function') throw new Error('mineflayer 没有提供实体交互接口');
 
   const processed = new Set();
+  const discoveredCandidates = initialCandidates.filter((candidate) => candidate.color === color);
   const deadline = Date.now() + 180000;
   let shorn = 0;
   while (ctx.countItem(itemName) < count && Date.now() < deadline) {
     if (ctx.interrupted) throw new Error('被新的指令打断');
     if (Number(bot.health ?? 20) <= 8) throw new Error(`血量不足（血量 ${bot.health}），已中止剪羊毛`);
-    const candidates = sheepCandidates(ctx, radius, color, processed);
+    let candidates = sheepCandidates(ctx, radius, color, processed);
+    const nearbyIds = new Set(candidates.map((candidate) => candidate.sheep.id));
+    for (const candidate of discoveredCandidates) {
+      const sheep = candidate.sheep;
+      if (!sheep || sheep.isValid === false || processed.has(sheep.id) || nearbyIds.has(sheep.id)) continue;
+      const state = sheepWoolState(ctx, sheep);
+      if (!state || state.sheared || state.baby || state.color !== color) continue;
+      candidates.push({
+        sheep,
+        color: state.color,
+        distance: bot.entity.position.distanceTo(sheep.position),
+      });
+    }
+    candidates.sort((left, right) => left.distance - right.distance);
+    if (candidates.length === 0 && searchStepsUsed < SHEEP_SEARCH_MAX_STEPS) {
+      const explored = await searchForSheep(
+        ctx,
+        radius,
+        color,
+        SHEEP_SEARCH_MAX_STEPS - searchStepsUsed,
+        processed,
+        count - ctx.countItem(`${color}_wool`),
+      );
+      searchStepsUsed += explored.stepsUsed;
+      candidates = sheepCandidates(ctx, radius, color, processed);
+      if (candidates.length === 0 && explored.candidates.length > 0) {
+        candidates = explored.candidates
+          .filter((candidate) => !processed.has(candidate.sheep.id))
+          .sort((left, right) => left.distance - right.distance);
+      }
+    }
     const target = candidates[0]?.sheep;
     if (!target) {
-      if (shorn === 0) throw new Error(`附近 ${radius} 格内没有可剪的${color}羊`);
-      throw new Error(`羊毛不够，还差 ${count - ctx.countItem(itemName)} 个${ctx.itemLabel(itemName)}，附近已没有可剪的${color}羊`);
+      if (shorn === 0) throw new Error(`附近 ${radius} 格内没有可剪的${color}羊；安全随机搜索了 ${searchStepsUsed} 段`);
+      throw new Error(`羊毛不够，还差 ${count - ctx.countItem(itemName)} 个${ctx.itemLabel(itemName)}，附近已没有可剪的${color}羊；安全随机搜索了 ${searchStepsUsed} 段`);
     }
     await ctx.approach(target);
     if (ctx.interrupted) throw new Error('被新的指令打断');

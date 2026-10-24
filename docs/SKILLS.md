@@ -621,9 +621,9 @@ Core `ActionArbiter` 只把清单 `type` 为 `act` 或 `path` 的技能当成写
 | 真实服务器 | `docs/evidence/S0_NORMAL_20261022.md`：同一套环境，Normal 难度，怪物生成开启，`.\.venv\Scripts\python.exe scripts\run_stage.py --stage S0 --runs 10 --difficulty normal` 连续 10 次全部 5/5 通过，用时 34.3 到 38.5 秒，P50 36.4 秒。阶段计划是固定规则，没有调用 LLM。这两条证据覆盖 `collect_blocks` 与 `craft`。 |
 | 真实服务器 | `docs/evidence/S1_NORMAL_20261022.md`：同一评测世界接在 S0 后跑 S1，Paper 1.21.1-133、Normal、seed 20261022，5/5 步、78.9 秒；`mine_collect` 与 3 次 `craft` 均一次成功。阶段计划是固定规则，没有调用 LLM。 |
 | 真实服务器 | `docs/evidence/S1_NORMAL_20261022.md`：同一评测世界接在 S0 后跑 S1，Paper 1.21.1-133、Normal、seed 20261022；另有 3 轮白天 S0→S1 链式回归。`mine_collect` 与 `craft` 在这些特定计划步骤成功；固定计划没有调用 LLM。 |
-| 真实服务器 | `docs/evidence/S0_S6_CHAIN_20261024.md`：两次隔离服务器全链尝试均在 S2 中断；第二次 S0、S1 各 5/5，S2 在 `shear_sheep` 未找到羊、重试后桥接断开。S3–S6 没有运行。这是失败证据，不是技能通过结论。 |
+| 真实服务器 | `docs/evidence/S0_S6_CHAIN_20261024.md`：六次隔离链均未完成 S2。原两次 S0→S6 运行分别在 S2 死亡、剪羊搜索失败；两次旧版随机搜索在 S2 未找到羊/因敌对停止；两次最新路线复测分别在 S1 死亡、S2 第 3/16 步断桥，均未运行最新 `shear_sheep` 搜索。S3–S6 没有运行。这是失败/未覆盖证据，不是技能通过结论。 |
 | 真实模型 | `docs/BENCHMARK_RESULTS.md:93`：真实模型在游戏内聊天里返回 `collect_blocks` 调用，桥接执行并回报「挖到 3 个 泥土」。 |
-| 未验证 | 除证据文档明确覆盖的 S0/S1 计划操作外，其余技能没有真实服务器验收记录；2026-10-24 两次全链均在 S2 失败，S3–S6 未运行。`shear_sheep`、`collect_flint`、`prepare_bow_arrows` 等虽有模拟 bot 测试，但不能据此声称实机可用。技能实现、自动化/模拟测试、Minecraft 实机通过是三种不同状态。 |
+| 未验证 | 除证据文档明确覆盖的 S0/S1 计划操作外，其余技能没有真实服务器验收记录；2026-10-24 六次链式实测均未完成 S2，S3–S6 未运行。`shear_sheep` 最新安全随机路线、`collect_flint`、`prepare_bow_arrows` 等虽有模拟 bot 测试，但不能据此声称实机可用。技能实现、自动化/模拟测试、Minecraft 实机通过是三种不同状态。 |
 
 ### 7.3 文档与代码的偏差
 

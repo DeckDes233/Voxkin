@@ -34,6 +34,26 @@ function makeContext(sheep, { color = 'white', wool = 0, giveWool = true, woolPe
     health: 20,
     food: 20,
     entities: Object.fromEntries(sheep.map((entity) => [entity.id, entity])),
+    pathfinder: { movements: { liquidCost: 12, blocksToAvoid: new Set() } },
+    blockAt(position) {
+      if (position.y === 0) return { name: 'grass_block', boundingBox: 'block' };
+      return { name: 'air', boundingBox: 'empty' };
+    },
+    findBlocks({ matching, maxDistance }) {
+      const supports = [];
+      for (let index = 0; index < 48; index += 1) {
+        const angle = (Math.PI * 2 * index) / 48;
+        const distance = 12 + (index % 4);
+        const position = {
+          x: Math.round(botPosition.x + Math.cos(angle) * distance),
+          y: 0,
+          z: Math.round(botPosition.z + Math.sin(angle) * distance),
+        };
+        if (Math.hypot(position.x - botPosition.x, position.z - botPosition.z) > maxDistance) continue;
+        if (matching({ name: 'grass_block', boundingBox: 'block' })) supports.push(position);
+      }
+      return supports;
+    },
     inventory: {
       items: () => shears ? [{ name: 'shears' }] : [],
     },
@@ -45,6 +65,11 @@ function makeContext(sheep, { color = 'white', wool = 0, giveWool = true, woolPe
   return {
     bot,
     registry: {
+      blocksByName: {
+        water: { id: 8 },
+        flowing_water: { id: 9 },
+        bubble_column: { id: 10 },
+      },
       entitiesByName: {
         sheep: { metadataKeys: ['shared_flags', 'air_supply', 'custom_name', 'custom_name_visible', 'silent', 'no_gravity', 'pose', 'ticks_frozen', 'living_entity_flags', 'health', 'effect_particles', 'effect_ambience', 'arrow_count', 'stinger_count', 'sleeping_pos', 'mob_flags', 'baby', 'wool'] },
       },
@@ -191,13 +216,20 @@ test('shear_sheep succeeds from inventory without nearby sheep', async () => {
   assert.match(result.detail, /已经有 3 个/);
 });
 
-test('shear_sheep searches a bounded safe waypoint when no sheep are loaded nearby', async () => {
+test('shear_sheep explores random waypoints until it discovers a sheep', async () => {
   const ctx = makeContext([]);
   const sheep = makeSheep(1);
   let searches = 0;
-  ctx.walkOnce = async (x, y, z, radius, timeout) => {
+  let randomState = 42;
+  const waypoints = [];
+  ctx.random = () => {
+    randomState = (randomState * 1664525 + 1013904223) >>> 0;
+    return randomState / 0x100000000;
+  };
+  ctx.walkOnce = async (x, y, z, radius, timeout, horizontalOnly) => {
     searches += 1;
-    assert.deepEqual([y, radius, timeout], [1, 3, 4000]);
+    assert.deepEqual([y, radius, timeout, horizontalOnly], [1, 3, 10000, true]);
+    waypoints.push({ x, z });
     ctx.bot.entity.position.x = x;
     ctx.bot.entity.position.z = z;
     sheep.position.x = x;
@@ -212,22 +244,26 @@ test('shear_sheep searches a bounded safe waypoint when no sheep are loaded near
 
   const result = await skills.shear_sheep.handler({ count: 3, color: 'auto' }, ctx);
 
-  assert.equal(searches, 32);
+  assert.equal(searches, 6);
+  assert.equal(new Set(waypoints.map(({ x, z }) => `${x},${z}`)).size, waypoints.length);
+  assert.ok(waypoints.every(({ x, z }) => Math.hypot(x, z) <= 48));
   assert.equal(result.status, 'succeeded');
   assert.equal(ctx.countItem('white_wool'), 3);
 });
 
-test('shear_sheep searches out to the requested radius before failing', async () => {
+test('shear_sheep discovers sheep while exploring a random walk route', async () => {
   const ctx = makeContext([]);
-  let farSheepAdded = false;
-  const visitedDistances = [];
+  const waypoints = [];
+  let randomState = 7;
+  ctx.random = () => {
+    randomState = (randomState * 1664525 + 1013904223) >>> 0;
+    return randomState / 0x100000000;
+  };
   ctx.walkOnce = async (x, y, z) => {
-    const distance = Math.hypot(x, z);
-    visitedDistances.push(distance);
+    waypoints.push({ x, z });
     ctx.bot.entity.position.x = x;
     ctx.bot.entity.position.z = z;
-    if (distance >= 47 && !farSheepAdded) {
-      farSheepAdded = true;
+    if (waypoints.length === 3) {
       for (const id of [1, 2, 3]) {
         const sheep = makeSheep(id);
         sheep.position.x = x;
@@ -246,7 +282,194 @@ test('shear_sheep searches out to the requested radius before failing', async ()
 
   assert.equal(result.status, 'succeeded');
   assert.equal(ctx.countItem('white_wool'), 3);
-  assert.ok(Math.max(...visitedDistances) >= 47);
+  assert.equal(waypoints.length, 3);
+  for (let index = 0; index < waypoints.length; index += 1) {
+    const waypoint = waypoints[index];
+    assert.ok(Math.hypot(waypoint.x, waypoint.z) <= 48);
+    if (index > 0) {
+      const previous = waypoints[index - 1];
+      assert.ok(Math.hypot(waypoint.x - previous.x, waypoint.z - previous.z) >= 10);
+    }
+  }
+});
+
+test('shear_sheep revisits an eligible sheep discovered before walking farther away', async () => {
+  const ctx = makeContext([]);
+  const sheep = makeSheep(1);
+  ctx.bot.findBlocks = () => [];
+  const randomValues = [0, 0, 0.5, 1, 0.5, 1, 0.5, 1, 0, 1, 0.5, 1];
+  let randomIndex = 0;
+  ctx.random = () => randomValues[randomIndex++] ?? 0;
+  let searches = 0;
+  ctx.walkOnce = async (x, y, z) => {
+    searches += 1;
+    ctx.bot.entity.position.x = x;
+    ctx.bot.entity.position.z = z;
+    if (searches === 1) {
+      sheep.position.x = x;
+      sheep.position.z = z;
+      ctx.bot.entities[sheep.id] = sheep;
+    }
+    ctx.approach = async (target) => {
+      ctx.bot.entity.position.x = target.position.x;
+      ctx.bot.entity.position.z = target.position.z;
+    };
+    return 'reached';
+  };
+
+  const result = await skills.shear_sheep.handler({ count: 3, color: 'auto' }, ctx);
+
+  assert.equal(searches, 5);
+  assert.equal(result.status, 'succeeded');
+  assert.equal(ctx.countItem('white_wool'), 3);
+});
+
+test('shear_sheep auto samples beyond one rare-colored sheep before selecting a flock', async () => {
+  const ctx = makeContext([], { color: 'white' });
+  let searches = 0;
+  ctx.walkOnce = async (x, y, z) => {
+    searches += 1;
+    ctx.bot.entity.position.x = x;
+    ctx.bot.entity.position.z = z;
+    if (searches === 1) {
+      const sheep = makeSheep(1, 6);
+      sheep.position.x = x;
+      sheep.position.z = z;
+      ctx.bot.entities[sheep.id] = sheep;
+    }
+    if (searches === 4) {
+      for (const id of [2, 3, 4]) {
+        const sheep = makeSheep(id, 0);
+        sheep.position.x = x;
+        sheep.position.z = z;
+        ctx.bot.entities[sheep.id] = sheep;
+      }
+      ctx.approach = async (target) => {
+        ctx.bot.entity.position.x = target.position.x;
+        ctx.bot.entity.position.z = target.position.z;
+      };
+    }
+    return 'reached';
+  };
+
+  const result = await skills.shear_sheep.handler({ count: 3, color: 'auto' }, ctx);
+
+  assert.equal(searches, 4);
+  assert.equal(result.status, 'succeeded');
+  assert.equal(ctx.countItem('white_wool'), 3);
+  assert.equal(ctx.countItem('pink_wool'), 0);
+});
+
+test('shear_sheep chooses dry supported waypoints and restores pathfinding settings', async () => {
+  const ctx = makeContext([]);
+  let selectedWaypoint;
+  let liquidCostDuringSearch;
+  let avoidedBlocksDuringSearch;
+  ctx.bot.findBlocks = ({ matching }) => {
+    const wetGround = { x: 12, y: 0, z: 0 };
+    const dryGround = { x: 0, y: 0, z: 12 };
+    return [
+      ...(matching({ name: 'water', boundingBox: 'empty' }) ? [wetGround] : []),
+      ...(matching({ name: 'grass_block', boundingBox: 'block' }) ? [dryGround] : []),
+    ];
+  };
+  ctx.random = () => 0;
+  ctx.walkOnce = async (x, y, z) => {
+    selectedWaypoint = { x, y, z };
+    liquidCostDuringSearch = ctx.bot.pathfinder.movements.liquidCost;
+    avoidedBlocksDuringSearch = [...ctx.bot.pathfinder.movements.blocksToAvoid];
+    ctx.interrupted = true;
+    return 'reached';
+  };
+
+  await assert.rejects(
+    skills.shear_sheep.handler({ count: 3, radius: 48 }, ctx),
+    /被新的指令打断/,
+  );
+  assert.deepEqual(selectedWaypoint, { x: 0, y: 1, z: 12 });
+  assert.equal(liquidCostDuringSearch, 32);
+  assert.deepEqual(avoidedBlocksDuringSearch, [8, 9, 10]);
+  assert.equal(ctx.bot.pathfinder.movements.liquidCost, 12);
+  assert.deepEqual([...ctx.bot.pathfinder.movements.blocksToAvoid], []);
+});
+
+test('shear_sheep filters nearby supports before Mineflayer truncates block results', async () => {
+  const ctx = makeContext([]);
+  let selectedWaypoint;
+  ctx.bot.findBlocks = ({ matching, maxDistance, count }) => {
+    const supports = [];
+    for (let x = -20; x <= 20; x += 1) {
+      for (let z = -20; z <= 20; z += 1) {
+        const distance = Math.hypot(x, z);
+        const position = { x, y: 0, z };
+        if (distance <= maxDistance && matching({ name: 'grass_block', boundingBox: 'block', position })) {
+          supports.push(position);
+        }
+      }
+    }
+    return supports
+      .sort((left, right) => Math.hypot(left.x, left.z) - Math.hypot(right.x, right.z))
+      .slice(0, count);
+  };
+  ctx.random = () => 0;
+  ctx.walkOnce = async (x, y, z) => {
+    selectedWaypoint = { x, y, z };
+    ctx.interrupted = true;
+    return 'reached';
+  };
+
+  await assert.rejects(
+    skills.shear_sheep.handler({ count: 3, radius: 48 }, ctx),
+    /被新的指令打断/,
+  );
+  assert.ok(Math.hypot(selectedWaypoint.x, selectedWaypoint.z) >= 10);
+  assert.ok(Math.hypot(selectedWaypoint.x, selectedWaypoint.z) <= 18);
+});
+
+test('shear_sheep falls back to a bounded random pathfinding waypoint without safe support data', async () => {
+  const ctx = makeContext([]);
+  let selectedWaypoint;
+  const waypoints = [];
+  ctx.bot.findBlocks = () => [];
+  ctx.random = () => 0;
+  ctx.walkOnce = async (x, y, z) => {
+    selectedWaypoint = { x, y, z };
+    waypoints.push(selectedWaypoint);
+    ctx.bot.entity.position.x = x;
+    ctx.bot.entity.position.z = z;
+    ctx.interrupted = true;
+    return 'reached';
+  };
+
+  await assert.rejects(
+    skills.shear_sheep.handler({ count: 3, radius: 48 }, ctx),
+    /被新的指令打断/,
+  );
+  assert.deepEqual(selectedWaypoint, { x: 10, y: 0, z: 0 });
+  assert.ok(waypoints.every(({ x, z }) => Math.hypot(x, z) <= 48));
+});
+
+test('shear_sheep allows pathfinding to choose an exit when exploration starts in water', async () => {
+  const ctx = makeContext([]);
+  ctx.bot.blockAt = (position) => position.y === 0
+    ? { name: 'water', boundingBox: 'empty' }
+    : { name: 'air', boundingBox: 'empty' };
+  let liquidCostDuringSearch;
+  let avoidedBlocksDuringSearch;
+  ctx.walkOnce = async () => {
+    liquidCostDuringSearch = ctx.bot.pathfinder.movements.liquidCost;
+    avoidedBlocksDuringSearch = [...ctx.bot.pathfinder.movements.blocksToAvoid];
+    ctx.interrupted = true;
+    return 'reached';
+  };
+
+  await assert.rejects(
+    skills.shear_sheep.handler({ count: 3, radius: 48 }, ctx),
+    /被新的指令打断/,
+  );
+  assert.equal(liquidCostDuringSearch, 32);
+  assert.deepEqual(avoidedBlocksDuringSearch, []);
+  assert.equal(ctx.bot.pathfinder.movements.liquidCost, 12);
 });
 
 test('shear_sheep continues safe search when discovered sheep may not yield enough wool', async () => {
@@ -323,7 +546,23 @@ test('shear_sheep skips blocked waypoints and stops after the finite search', as
     skills.shear_sheep.handler({ count: 3, color: 'auto' }, ctx),
     /已尝试有限白天搜索/,
   );
-  assert.equal(attempts, 32);
+  assert.equal(attempts, 12);
+});
+
+test('shear_sheep stops random exploration when a hostile appears', async () => {
+  const ctx = makeContext([]);
+  let searches = 0;
+  ctx.walkOnce = async () => {
+    searches += 1;
+    ctx.nearbyHostiles = () => [{ name: 'zombie' }];
+    return 'reached';
+  };
+
+  await assert.rejects(
+    skills.shear_sheep.handler({ count: 3, color: 'auto' }, ctx),
+    /附近有敌对生物.*停止外出寻找羊/,
+  );
+  assert.equal(searches, 1);
 });
 
 test('shear_sheep does not search outside at night or near hostiles', async () => {

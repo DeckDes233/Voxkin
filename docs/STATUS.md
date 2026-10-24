@@ -16,7 +16,7 @@
 | 死亡恢复 | Bridge 本地封锁动作、清空队列并中断当前动作；death/respawn 事件带生命周期 ID，经 Core ACK 后移出待发队列，断线重连会重放；Core 取消仲裁动作并清空断桥世界状态；Minecraft bot 掉线会单独让世界状态失效；重生后仅当新鲜世界状态能证明检查点步骤完成才自动续跑 | WebSocket、Bridge 生命周期 helper、RunManager 与恢复 API 自动化测试；不可验证步骤 fail-closed；未做真实服务器死亡恢复与掉落物回收验收 |
 | 生存技能 | 庇护所搭建验收地板/墙顶结构并响应打断；离开庇护所确认已走到墙外；`sleep_safe` 等待 Mineflayer 入睡后再等醒来并核验时间推进，支持取消唤醒 | Node 模拟世界测试 19 项；没有 Minecraft 夜间实机验证 |
 | S0/S1 实机证据 | S0 空背包到木镐在 Normal 难度下连续 10 次 5/5；S1 白天固定计划有 3/3 次 S0→S1 链式记录；2026-10-24 两次全链尝试的 S0、S1 也各自完成 5/5 | 固定 seed 的 Paper 服务器运行与 JSONL 逐步判定；历史证据见 `docs/evidence/S0_NORMAL_20261022.md`、`docs/evidence/S1_NORMAL_20261022.md`，最近全链尝试见 `docs/evidence/S0_S6_CHAIN_20261024.md` |
-| S2–S6 实机进度 | 2026-10-24 两次隔离 S0→S6 链均在 S2 中断：一次死亡于 S2 第 6/16 步；另一次到第 10/16 步，`shear_sheep` 找不到羊并在重试后断桥。S3–S6 未运行 | 本机原始 JSON/JSONL 与 Paper 日志见 `work/mc/full_s0_s6_20261024/`、`work/mc/full_s0_s6_guarded8_20261024/`；汇总见 `docs/evidence/S0_S6_CHAIN_20261024.md`。后续扩大搜索范围只通过模拟测试，未补做实机验收 |
+| S2–S6 实机进度 | 2026-10-24 六次隔离链均未完成 S2：前两次 S0→S6 尝试分别在 S2 死亡、剪羊搜索失败；两次旧版随机搜索在 S2 第 10/16 步分别未找到粉羊、因敌对停止；两次最新安全落脚点复测分别在 S1 被僵尸击杀、S2 第 3/16 步断桥，均未执行最新剪羊路线。S3–S6 未运行 | 原始日志与汇总见 `docs/evidence/S0_S6_CHAIN_20261024.md` 和各 `work/mc/` 隔离目录。最新随机陆地搜索仅有模拟测试证据，未通过实机验收 |
 | 技能清单与阶段计划 | 清单有 64 项技能（21 个桥接内建 + 43 个模块技能），Core 暴露 63 个工具；模块技能可嵌套调用已注册技能；固定 S0–S6 共 63 步。技能代码存在不等于技能经测试或实机可用 | manifest/自动化测试覆盖代码和模拟行为；只有 S0/S1 证据明确覆盖的具体操作有实机证据。技能级证据边界见 `docs/SKILLS.md` |
 | 一键本地实机启动 | `scripts/eval_stack.ps1` 可启动 GPT-SoVITS（本地包存在时）、Studio 与独立模式 Bridge；不会启动或重置 Paper 世界 | 先手动启动 Minecraft 1.21.1 专用测试服务器，再运行 `scripts/eval_stack.ps1 -Action start -McPort 25566`；指引见 README |
 | 动作状态 | accepted/running/succeeded/partial/failed/cancelled/disconnected/blocked/dead 九档状态贯穿协议、派发、桥接与运行记录 | 每步记录 `status`、`skill_id`、`action_id`；`tests/test_action_status.py` 覆盖 |
@@ -38,7 +38,7 @@
 Python 全量测试：PowerShell 中先执行 `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = "1"`，再运行 `\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests -q` → 323 passed，54 warnings。本机默认 pytest 插件自动加载曾触发 CPython access violation；禁用自动插件后全量测试正常完成。语法检查、smoke test、模拟测试只说明对应软件路径/替身行为，不代表 Minecraft 实机通过。
 ```
 
-Bridge：`node --test bridge/tests/*.test.js` → 93 passed。Bridge 模拟 bot 测试不构成真实 Minecraft 实机证据。
+Bridge：`node --test bridge/tests/*.test.js` → 96 passed。Bridge 模拟 bot 测试不构成真实 Minecraft 实机证据。
 
 这些 pytest 与 Bridge 测试是本地自动化测试；Bridge 使用模拟 bot。即便 smoke test 或语法检查通过，也不代表 Minecraft 实机执行成功。本轮没有把这些测试作为任何未覆盖技能的实机结论。
 
@@ -58,7 +58,7 @@ Bridge：`node --test bridge/tests/*.test.js` → 93 passed。Bridge 模拟 bot 
 10. S0 在 Normal 难度下已连续 10 次 5/5、P50 36.4 秒；S1 已在 Node 24 上完成 3/3 轮 S0→S1 白天链式回归（S1 为 95.0、78.9、78.8 秒），但 3 夜生存、换种子与夜间怪物场景尚未回归。
 11. 真实服务器证据只覆盖 S0 的 `collect_blocks`/`craft` 与 S1 的 `mine_collect`/`craft`；2026-10-24 两次隔离全链都在 S2 停止，S3–S6 没有运行。不能据技能清单、语法检查、smoke test 或模拟测试宣称技能实机可用。
 12. 断桥已从 `cancelled` 拆成 `disconnected`，任务保留 checkpoint；Node 22.23.2 在采集阶段出现过 V8 原生崩溃，当前评测改用 Node 24.19.0，连续 3 轮没有复现。
-13. 新增的 `shear_sheep` 有模拟 bot 测试，S2 计划会制作剪刀并剪羊，羊毛与床的计划内判定读取背包。2026-10-24 的真实服务器运行未找到可剪羊，后续扩大搜索范围仅经模拟测试，仍需隔离服务器复验；铁矿采集依赖 `mine_collect` 找到可达矿石。
+13. 新增的 `shear_sheep` 有模拟 bot 测试，S2 计划会制作剪刀并剪羊，羊毛与床的计划内判定读取背包。2026-10-24 六次隔离链均未完成 S2；其中两次旧版随机搜索尝试了剪羊但没能取得羊毛，另两次最新安全落脚点路线未运行到剪羊步骤。新版搜索会从已加载区块筛选干燥安全落脚点并避水，但目前只有模拟验证，仍需隔离服务器实机复验；铁矿采集依赖 `mine_collect` 找到可达矿石。
 14. 新增的 `collect_flint` 只在模拟 bot 中验证背包燧石产出；S5/S6 仍是固定计划，烈焰棒、珍珠和末影之眼预算支持最多 12 次单次投眼搜索，另留 12 眼用于门框；投眼步骤不自动重跑，以免重复消耗并丢失单次搜索上下文。整段路线未实机验证。`throw_eye` 找到估算但未发现框架时返回 `partial`，Runner 的 `always` 验收不会把 `partial` 推进为成功。
 15. 本轮补入 `fill_water_bucket` 与 `collect_obsidian`：只识别静止水/岩浆源，先直接挖已生成黑曜石，再由上方放水将单个岩浆源浇铸，核实方块和桶库存后收回水源并采集；限制主世界、低血停止、附近敌对生物停止。模拟测试通过后仍需在隔离服务器验证水桶交互、不同地形与流体更新行为。
 16. 修正 S3 铁料核算：原版铁镐 3、铁剑 2、盾牌 1、桶 3，共 9 铁锭；盾牌配方此前误写为 6，现已修正。S3 结束条件将 `bucket`、`water_bucket`、`lava_bucket` 视为同一桶资源，避免装水后阶段状态倒退。
