@@ -21,3 +21,6 @@ mod/run/
 mod/.idea/
 runs/*
 !runs/README.md
+
+# 本地静态检查缓存
+.ruff_cache/

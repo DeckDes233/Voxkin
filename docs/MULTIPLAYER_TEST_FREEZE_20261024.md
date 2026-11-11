@@ -1,5 +1,7 @@
 # Voxkin 多人测试冻结候选（2026-10-24）
 
+> 这是 2026-10-24 的冻结候选快照，不是当前版本发布声明。现行接入步骤见 [Minecraft 接入](ENTER_MINECRAFT_CN.md)，后续阻塞与验证见 [STATUS](STATUS.md)。
+
 ## 冻结范围
 
 - 标签：`multiplayer-test-20261024`

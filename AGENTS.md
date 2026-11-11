@@ -2,6 +2,13 @@
 
 本文件约束后续接手 Voxkin 的代码 Agent。所有命令与路径都以仓库根目录为基准。
 
+## 产品目标与恢复原则
+
+- G1 是自主通关：角色围绕通关目标自行规划、执行和恢复，S0–S6 属于这条验收线。
+- G2 是玩家互动：理解玩家说的目标并执行，支持玩家修改、打断和取消，反馈实际进展与结果；不能用 G1 阶段脚本代替 G2 的指令理解与验收。
+- 局部找不到资源、寻路失败或遇水，应停止危险动作、保留当前目标，转入脱险、补给、换地点探索和重新规划。不得把局部候选耗尽直接等同于整个目标不可完成；也不得无变化地无限重试相同位置或伪造成功。
+- 实机测试暴露阻塞后，继续按 Wiki、日志和世界观察定位、修复、复测。测试运行器结束一轮和清理进程不代表修复任务已完成；不以关服和记录失败替代解决问题。
+
 ## 目录职责
 
 | 路径 | 职责 |
@@ -15,6 +22,11 @@
 | `src/voxkin/audio/` | 麦克风采集、音频输出（扬声器 / WAV / Minecraft 文件 / WebSocket） |
 | `src/voxkin/stt/` | faster-whisper 识别与能量端点检测 |
 | `src/voxkin/agent/actions.py` | 动作派发：转发给桥接并等待可验证结果 |
+| `src/voxkin/agent/goals.py` | 阶段目标与唯一验收条件声明 |
+| `src/voxkin/agent/goal_methods.py` | 阶段策略、资源选择与验收辅助；无外部 I/O，部分 helper 会更新传入的 `goal_state` 内存字典；由 `GoalSupervisor` 串行调用并统一负责派发、对账、SQLite 持久化与预算 |
+| `src/voxkin/agent/late_game_methods.py` | S5/S6 的库存、维度与生存前置规划；不做外部 I/O，沿用 `GoalSupervisor` 的派发与持久化所有权 |
+| `src/voxkin/agent/resource_policy.py` | 阶段储备软目标、村庄与铁傀儡机会补给；只规划和更新目标内存账本，执行与对账由 `GoalSupervisor` 负责 |
+| `src/voxkin/agent/goal_supervisor.py` | 标准阶段目标的调度、派发、对账、持久化与预算所有权 |
 | `src/voxkin/bridge/protocol.py` | 桥接消息结构 |
 | `src/voxkin/server.py` | Studio HTTP/WebSocket 服务与桥接入口 |
 | `src/voxkin/services.py` | 外部引擎进程的启停、重启与健康检查 |
@@ -56,6 +68,8 @@ Windows 下 pip 需要绕过系统代理：设置 `NO_PROXY=*`。
 
 ## 测试与证据
 
+- Minecraft 功能出现阻塞或与预期不符时，先查 Minecraft Wiki，并按项目使用的 Java 版本核对机制；再结合日志、实际依赖实现与世界观察定位原因，最后决定修复方案。记录来源，区分机制事实、已证实缺陷和待验证推断，不先凭直觉改逻辑。
+- 启动任何 Minecraft 实机运行前先读取 `work/refactor_validation_20261027/active_progress.json`。`cleanup_pending` 时不得另起运行；`runtime_blocked` 且没有新的环境恢复证据时，不重复相同失败条件或扩展临时 harness，保留证据和存档，可继续独立代码审查。环境恢复后进行一次有界验证并更新 marker 结果。
 - 任何延迟结论必须来自 `docs/BENCHMARK_RESULTS.md` 记录的真实运行，并注明 LLM 是本地测试服务还是真实 API。
 - 单元测试可以使用确定性测试替身（例如 `tests/support.py` 的 `ToneTTS`），但必须在文档中说明；不得用替身冒充真实引擎的测量结果。
 - 新增引擎时，先补 `docs/TECH_EVALUATION.md` 的证据，再写适配器。

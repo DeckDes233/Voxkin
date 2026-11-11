@@ -1,5 +1,51 @@
 # 变更记录
 
+## Unreleased — 2026-11-11 整理与复核
+
+- 整理中英文 README、安装与 Minecraft 接入流程；补充文档分类索引、开发指南及配置、脚本、工具目录说明。
+- 明确 G1/G2 的独立验收与历史证据边界，保留 2026-10-28 的恢复、资源补给和原生异常调查记录。
+- 提交前离线回归 Python 554 passed、Bridge 310 passed；本轮没有 Minecraft 实机或真实语音基准，见[复核记录](docs/evidence/PRE_PUSH_REVIEW_20261111.md)。
+
+## Unreleased — 2026-10-26–27
+
+### 目标监督与恢复
+
+- S5 已确认的过门回执可保存 source portal / arrival checkpoint 与 receipt 身份；换 Bridge session 后恢复为寻路线索，实际穿门必须重新读取 portal block。普通维度转换的 respawn 包保留 session/revision，死亡与断线继续切换生命周期；bare 原版维度与带命名空间 ID 精确对应，自定义维度不会被子串误认。新增 SQLite 重开恢复及事件路径回归；尚无 S5 实机验收。
+- 末地技能准入精确匹配 `the_end` / `minecraft:the_end`，拒绝名称中恰好包含 end 的自定义维度。重启后 root 完整自动化结果为 Python 451 passed、Bridge Node 24.19.0 `--jitless` 215 passed；不代表 S3–S6 实机通过。
+- 标准 S0–S6 接入 `GoalSupervisor`；`src/voxkin/agent/goals.py::GOALS` 成为阶段验收条件唯一来源，进度判断与 Studio 状态读取同一契约。
+- SQLite `goal_states` 保存 schema version 2 的目标快照，包括目标/方法位置、在途 action ID、观察会话与 revision、预算、计数、最近观察和恢复原因。旧 `TaskRunner` checkpoints 保留给兼容的线性评测任务。
+- S2 从固定步骤游标改为基于新鲜观察补齐生存依赖：白天可准备材料，夜晚/危险时优先建立封闭庇护所；食物、室内床、睡眠或安全守夜均纳入条件判断。S3 根据铁料/木料缺口有限选择采集和返地表方法；S4 钻石目标策略也已集成在 `goal_methods.py`。S6 部分使用眼球 overhead 证据选择有界 `safe_descend` 与框架扫描。S0/S1/S5 仍以预定义路线为主，不构成通用动态规划。R22 只实际派发过新的铁矿采集 action，未完成 S3。
+- 修正 S2 铁料需求核算：在两枚铁锭目标下，按现有 `iron_ingot` 数量计算 `mine_collect` 目标，已有两枚时不再安排额外采铁。`tests/test_goal_supervisor.py` 覆盖原矿、已炼铁锭与目标已满足三种库存状态。
+- Bridge 断开、死亡、未知结果或安全抢占后先按 action ID 与新鲜世界观察对账；只有可安全重选的方法才按当前净缺口重算。不可重放且缺乏可观察后置证据的动作会持久阻塞。
+- 完成状态与任务终态在同一 SQLite 事务提交。Studio、游戏聊天和语音停止入口持久化 `paused_by_user`；自动状态更新不恢复用户已停止的目标，明确续跑时先对账。
+
+### Bridge 执行与 Studio
+
+- 新增 Node `ExecutionController`，统一管理实际动作队列、动作账本、本地安全抢占以及跟随/闲逛/护甲维护行为。Core 动作派发要求当前 ready 状态、session 和 revision；旧观察不能覆盖新状态。
+- 修正床位朝向映射，依据 Mineflayer yaw 转换和原版四向方位计算，四向测试覆盖与 bot 同向的结果。`findNearbyBeds` 改为按注册表方块 ID 搜索后再读取新鲜 `blockAt`，不再用 predicate 遍历所有候选方块；该改动消除 r14 栈中出现的全量 predicate 搜索路径，但尚不能证明它是 Node 退出的根因。新动作启动时会停止并清除 Pathfinder 遗留目标，防止上一动作的 stop 状态影响首个 `GoalFollow`。床位 AABB 清位后，r16 受控库存任务 1 成功放置床并完成 40/40 sealed/inside 庇护所；这不是自然采矿或夜间验收。r16 新夜间任务没有通过 `sleep_confirmed` 验收，尽管之后观察到了白天；Node 22 在清理前以 `0xC0000005` 退出，stderr 无 fatal stack，根因未归因。`sleep_safe` 现在要求观察到睡眠回执、离床并在有限等待中确认世界时间前进；day/time 同时有效时按绝对 ticks 差判定推进，并拒绝 day 回退；Bridge 与 `sleep_safe` 共用此判定。Node 24.19.0 `--jitless` Bridge 模拟 bot 全套 175 项通过，根级 end.test 另有 14 项通过；这不证明实机 native exit 已解决。受控 r17 在 Node 24 下完成床/庇护所与入睡到天亮；r20 又在保存副本上通过一次自然夜间睡眠目标。R24 在 Node 24.19.0 `--jitless` 的两个实机进程均以 `0xC0000005` 清理前退出；自动化测试通过不排除该现象，且目前不能归因根因。这些结果不验证多夜生存或 S3–S6。
+- Studio 运行面板显示目标、状态、等待/阻塞/恢复原因、在途动作及动作预算；存在目标时不再用固定步骤游标表示目标完成度，无目标时保留旧式线性评测状态。
+- 增加显式 `engine: silent` 配置，用于无需外部 TTS 的动作/测试场景；状态报告如实显示静音引擎。
+
+### 本轮验证边界
+
+- r18b 在保持源时钟、天气与 gamerules，且阶段内无注入的条件下完成 S0/S1 和 S2 白天准备；剪羊后达到 white wool×3，并完成床与 40/40 sealed/inside 庇护所。之后 R20 从保存的世界和 SQLite 目标库副本继续，在未注入时间的昼夜周期中等待到夜晚后以新鲜观察启动 S2 task 4，`sleep_safe` 成功，目标 `night_required=true`、`sleep_confirmed=true`、`done/stage_complete=true`，观察到白天后结束。R20 与 r18b 是分开的运行，不构成多夜生存或 G1；189.8 秒阶段时间包含约 182 秒昼夜等待，不是性能基准。R21 的 S3 `strip_mine` 曾因无安全阶梯落点 blocked。R22 从保存副本恢复 task 5，迁移旧 blocked action 且未重放，随后派发 9 raw iron 目标的 `mine_collect`；存档 playerdata 有 raw_iron×3，但 R22 最后 observation 未同步库存，Node 24 清理前以 `0xC0000005` 退出。R23 用 `--jitless` 续跑同一 task 并确认 raw_iron×3，之后地下缺木、64 格内没有橡木，三次 `mine_collect(oak_log,count=1)` 后以 `budget_method_attempts` blocked，22.4 秒、`stage_complete=false`。R24 从 R23 副本继续但因启动器漏传 `PRESERVE_SOURCE_CLOCK`，fixture 执行 `time set day` 把源时间 9176 改成 1000，故只作为诊断，不算保留时钟实验；S3 `disconnected` 且未完成。Node 24.19.0 `--jitless` 两个进程均清理前 `0xC0000005`；runner 第一次重启成功，第二次退出后 QA 明确请求 API stop，不能据此判断未中断时 runner 会否继续重启。R25 从有效 R23 副本保留时钟续跑，三次 Bridge `0xC0000005` 均触发 runner restart，目标随后因 method-attempt budget 阻断并正常保存；R25 副本晋升为下轮 source。R16/R22/R24/R25 清理前退出已在 Node 22 与 Node 24 观察到，根因未归因。R26 Linux Minecraft 实机尚未启动。r14 是较早 S2 断连结果；标准 `run_stage.py` 启动时会设置 `time set day`，不能描述为全程无时间注入。完整运行证据与历史见 [GOAL_REFACTOR_20261026.md](docs/evidence/GOAL_REFACTOR_20261026.md)。
+
+- R25 从 R23 world/DB 副本继续 S3，初始观察时钟自然从 source 的 9176 推进到 9237，无新增库存、时间、天气或地形注入；goal 在 `s3:surface_route:shelter_anchor` 三次 method-attempt 后以 `budget_method_attempts` 阻断，40.5 秒、0/8、`stage_complete=false`。raw_iron×3、health=20、food=18 保存；三次 Bridge `0xC0000005` 均由 official runner 重启成功，最终 replacement 活到目标阻断后的清理。restart budget 未耗尽；Core 正在拆分 transport restart 与 method-attempt 预算记录，不据此归因 runner 故障、物理动作完成次数、Node 稳定性或 native 根因。R25 保存世界晋升为续跑源，R26 Linux Minecraft 实机尚未启动。
+- 最新 root 独立 Python 全量回归：`$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -B -m pytest -p pytest_asyncio.plugin --assert=plain --noconftest tests -q --tb=short`，444 passed、54 warnings、66.42 秒、exit 0，覆盖 S4 策略、部分 S6 搜索/下探、combat/Nether 路径与 transport/method 预算改动。Windows Node 24.19.0 `--jitless` Bridge 全套 210 passed、约 0.67 秒、exit 0；Ruff F821/F823 与 `git diff --check` 通过。仓库没有 `conftest.py`；`--noconftest` 跳过未使用的 conftest discovery，不代表已解决 Python 3.10 collection access violation 根因。此前 root 对 S4 candidate 的收集在 `pathlib.casefold_parts` / `_pytest.config._is_in_confcutdir` access violation、断言未执行；`-B --assert=plain` 不能称可靠规避。候选 agent 报告的 42 项未由 root 重复。候选方案已有部分进入生产（S4、部分 S6、combat 和 Nether 路径）；S4–S6 仍无实机阶段通过。较早的 425/414 全量与 66 项 S3 定向结果保留为历史快照。
+- 官方 Linux Node 24.19.0 便携包已按同目录 `SHASUMS256.txt` 验证 SHA-256；WSL Ubuntu 22.04 root 直接执行生产 Bridge 全套 175/175 通过，1430.905765 ms、exit 0。默认 WSL user 的 systemd/exec timeout 只记为未完成调用，不算测试失败或通过；该模拟 bot 回归不等于 Linux Minecraft 实机验收。
+- R26/R26b Linux 启动尝试均未启动 Paper 或执行游戏动作，R25 仍是最后有效的 S3 world/DB 保存来源。R26 因 startup variable 错误在游戏前结束；R26b Linux Node/helper 在 `/mnt/d` I/O 状态停留，TERM/KILL 后未观察自然退出码。R27 已获准使用独立 Linux ext4/fixed-hash bundle；QA 报告 profile/TCPrelay adapter 预检 10 项通过。首次 wrapper preflight 因误校验 release bundle 按设计不含的 `bridge/package-lock.json` 而退出；修正 source glob 后第二次通过本地 manifest/hash 与 WSL route，但 ext4 bootstrap Popen 在 45.034 秒超时、未收到 bundle event。对精确 v3 archive 的只读 Linux ext4 Python `tarfile` 流读取也在 1,792 个成员/70,227,142 bytes 后停滞；同一 archive 在 Windows 完整读取 6,640 entries/599,633,870 bytes、用时 1.83 秒。GNU `timeout` launcher 33.989 秒后 code 9、stderr 空；这不是 Node crash。之后 12 秒 `/proc` 只读探测亦超时。没有创建游戏 target/fixture，Paper/Game/Core/Bridge 均未启动。root 仅运行 `wsl.exe --terminate Ubuntu-22.04`（exit 0），随后确认三个 WSL 发行版均为 `Stopped`；没有全局 WSL shutdown、service/Windows 重启，也不是 Node/Python 自然 exit 0。当前会话非管理员且 `WslService` 正运行，需管理员恢复 WSL 环境后再从 R25 续跑。暂停 bootstrap 工具开发和相同条件重试，不诊断硬件或声称项目改动可修复宿主 AV；R27 无 Minecraft 阶段结果，S3 未完成、S4–S6 未实机验收。完整启动诊断与 archive 路径/hash 见本轮实机记录。
+
+本节所称“无阶段内注入”只描述各次阶段命令。R18b 源世界在复制前已包含三张彩色床与蜡铜平台；同一布局在 2026-10-22 最早留存的 `eval_server` 中也存在，初次放置命令未找到。R18b/R20 没有地形注入，行动记录未使用该地下布局，因此具体采集、庇护所和睡眠行为事实保留，但复制世界不作 clean vanilla G1 证据。
+
+### STT 流式候选评估
+
+- 新增 Paraformer 逐块回放研究：3 条有参考文本的 FLEURS 真人录音在 RTX 4060 Laptop 与 4 线程 CPU 上均完成三次测量；结果、误差、VAD 分离口径及限制见 [研究报告](docs/research/PARAFORMER_STREAMING_20261026.md) 与 [基准](docs/BENCHMARK_RESULTS.md)。该候选尚未接入正式适配器，三样本回放不代表真实麦克风/噪声验收。
+
+### Qwen3-TTS-GGUF 隔离探针
+
+- 在独立 Python 3.14 环境中，使用官方 Qwen 1.7B Base 原始权重按上游脚本导出 Talker Q5_K/Predictor Q8_0，并通过 llama.cpp Vulkan 生成 PCM/WAV。ONNX decoder 使用 CPU provider；DirectML 路径未通过初始化。
+- warmset 三条文本 RTF 均低于 1，但首次短句冷启动与后续新进程结果差异较大且原因未核实。本次结果不是 Voxkin 生产适配器、扬声器延迟或主观音质验收；集成限制和原始证据见 [研究报告](docs/research/QWEN3_TTS_GGUF_20261026.md) 与 [基准](docs/BENCHMARK_RESULTS.md)。
+
 ## Unreleased — 2026-10-22
 
 ### S2 羊毛采集

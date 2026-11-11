@@ -1,5 +1,7 @@
 # 通关 Agent：规划、执行、验证的循环
 
+> 本文保留规划方案，不能作为当前模块实现或实机通过的证明。现行阶段实现见 [架构](ARCHITECTURE.md)，目标与合同差异见 [MILESTONE](MILESTONE.md)。
+
 ## 结论
 
 值得做，但先做 **TaskRunner**，不要一上来做“模型训练”。让一个 Agent 按 Minecraft 的通关顺序推进，核心是三件事：
