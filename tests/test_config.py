@@ -36,6 +36,12 @@ def test_invalid_engine_is_rejected(tmp_path):
         load_config(path, with_local=False)
 
 
+def test_silent_engine_is_a_valid_explicit_configuration(tmp_path):
+    path = write_yaml(tmp_path / "voxkin.yaml", {"tts": {"engine": "silent"}})
+    config = load_config(path, with_local=False)
+    assert config.tts.engine == "silent"
+
+
 def test_minecraft_output_requires_directory(tmp_path):
     path = write_yaml(tmp_path / "voxkin.yaml", {"audio": {"output": "minecraft_file"}})
     with pytest.raises(ValueError):

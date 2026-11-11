@@ -107,6 +107,8 @@ def tool_schemas(manifest: dict[str, Any] | None = None) -> list[dict[str, Any]]
                 "description": str(parameter.get("description") or ""),
             }
             enum_values = parameter.get("enum")
+            if schema["type"] == "array":
+                schema["items"] = dict(parameter.get("items") or {})
             if enum_values is not None:
                 schema["enum"] = list(enum_values)
             minimum, maximum = parameter_bounds(parameter)

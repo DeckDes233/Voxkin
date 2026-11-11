@@ -1,4 +1,5 @@
 // 战斗技能模块：狩猎被动生物、与烈焰人交战、猎取末影人、破坏末地水晶、举盾格挡。
+import { assessCombatEncounter, combatEquipment } from '../combat_encounter.js';
 //
 // 约束（见 docs/plans/SKILL_MODULE_CONTRACT.md）：
 // - 只用 ctx 提供的能力，不 import 任何运行时依赖；bot 从 ctx.bot 取。
@@ -10,13 +11,18 @@
 // - 没有「格挡状态」的服务端回读，只能用副手槽位加 bot.usingHeldItem 判断盾有没有举起来。
 // - 没有「末影人瞬移落点」的额外信息，只能靠重新扫描 bot.entities 追踪。
 const HUNT_TIMEOUT_MS = 150000;
+const HUNT_SEARCH_MAX_STEPS = 8;
+const HUNT_SEARCH_STEP_TIMEOUT_MS = 12000;
 const BLAZE_TIMEOUT_MS = 180000;
 const ENDERMAN_TIMEOUT_MS = 180000;
 const CRYSTAL_TIMEOUT_MS = 180000;
+const ENDERMAN_SEARCH_MIN_HEALTH = 8;
 // 搜索不到目标时最多空等的时长，超过就按失败收尾。
 const SEARCH_WAIT_MS = 20000;
-const SHEEP_SEARCH_MAX_STEPS = 12;
-const SHEEP_SEARCH_STEP_TIMEOUT_MS = 10000;
+const SHEEP_SEARCH_MAX_STEPS = 48;
+const SHEEP_SEARCH_STEP_TIMEOUT_MS = 18000;
+const SHEEP_HOSTILE_RECOVERY_MAX_ATTEMPTS = 2;
+const SHEEP_HOSTILE_RECHECK_ATTEMPTS = 4;
 // 近战可命中的距离上限（格）。
 const MELEE_RANGE = 3.0;
 const MELEE_REACH = 3.6;
@@ -238,7 +244,7 @@ function sheepWoolState(ctx, sheep) {
   const babyIndex = keys.indexOf('baby');
   const metadata = sheep?.metadata;
   if (woolIndex < 0 || !metadata || typeof metadata !== 'object') return null;
-  const wool = Number(metadata[woolIndex]);
+  const wool = Number(metadata[woolIndex] ?? 0);
   if (!Number.isInteger(wool)) return null;
   return {
     color: SHEEP_COLORS[wool & 0x0f],
@@ -264,7 +270,7 @@ function sheepCandidates(ctx, radius, color, processed) {
   return candidates.sort((left, right) => left.distance - right.distance);
 }
 
-function assertSafeSheepSearch(ctx) {
+function assertSafeSheepSearchConditions(ctx) {
   const bot = ctx.bot;
   if (ctx.interrupted) throw new Error('寻找羊时被新的指令打断');
   const health = Number(bot.health);
@@ -285,10 +291,49 @@ function assertSafeSheepSearch(ctx) {
   if (!Number.isFinite(timeOfDay) || timeOfDay < 0 || timeOfDay >= 12000) {
     throw new Error('无法确认当前处于白天，停止外出寻找羊');
   }
-  const hostiles = typeof ctx.nearbyHostiles === 'function' ? ctx.nearbyHostiles(12) : null;
-  if (!hostiles || hostiles.length > 0) {
+}
+
+async function ensureSafeSheepSearch(ctx, recovery) {
+  assertSafeSheepSearchConditions(ctx);
+  if (typeof ctx.nearbyHostiles !== 'function') {
     throw new Error('附近有敌对生物或无法确认安全，停止外出寻找羊');
   }
+  const hostiles = ctx.nearbyHostiles(12);
+  if (!hostiles) throw new Error('附近有敌对生物或无法确认安全，停止外出寻找羊');
+  if (hostiles.length === 0) return;
+
+  if (
+    typeof ctx.findHostile !== 'function' ||
+    typeof ctx.retreatFrom !== 'function' ||
+    typeof ctx.sleep !== 'function'
+  ) {
+    throw new Error('附近有敌对生物或无法确认安全，停止外出寻找羊');
+  }
+
+  while (recovery.attempts < SHEEP_HOSTILE_RECOVERY_MAX_ATTEMPTS) {
+    assertSafeSheepSearchConditions(ctx);
+    const target = ctx.findHostile(16);
+    if (!target || !target.position) {
+      throw new Error('附近有敌对生物或无法确认安全，停止外出寻找羊');
+    }
+    recovery.attempts += 1;
+    if (typeof ctx.log === 'function') {
+      ctx.log('剪羊搜索遇到敌对生物', `${target.name || '未知'}；尝试撤离 ${recovery.attempts}/${SHEEP_HOSTILE_RECOVERY_MAX_ATTEMPTS}`);
+    }
+    await ctx.retreatFrom(target);
+    for (let check = 0; check < SHEEP_HOSTILE_RECHECK_ATTEMPTS; check += 1) {
+      if (ctx.interrupted) throw new Error('寻找羊时被新的指令打断');
+      await ctx.sleep(750);
+      assertSafeSheepSearchConditions(ctx);
+      const remainingHostiles = ctx.nearbyHostiles(12);
+      if (!remainingHostiles) {
+        throw new Error('附近有敌对生物或无法确认安全，停止外出寻找羊');
+      }
+      if (remainingHostiles.length === 0) return;
+    }
+  }
+
+  throw new Error('撤离后附近仍有敌对生物，停止外出寻找羊');
 }
 
 async function searchForSheep(
@@ -299,18 +344,21 @@ async function searchForSheep(
   excluded = new Set(),
   targetWoolCount = 1,
   minimumSearchSteps = 1,
+  safetyRecovery = { attempts: 0 },
 ) {
   if (typeof ctx.walkOnce !== 'function') return { candidates: [], stepsUsed: 0 };
   const origin = ctx.bot.entity.position;
   const originX = origin.x;
   const originZ = origin.z;
-  const searchRadius = Math.min(radius, 48);
+  const searchRadius = Math.min(radius, 96);
   const visited = new Set();
   const discovered = new Map();
   let stepsUsed = 0;
   const stepLimit = Math.min(SHEEP_SEARCH_MAX_STEPS, Math.max(0, maxSteps));
+  const randomValue = typeof ctx.random === 'function' ? ctx.random : Math.random;
+  const routeHeading = randomValue() * Math.PI * 2;
   for (let step = 0; step < stepLimit; step += 1) {
-    assertSafeSheepSearch(ctx);
+    await ensureSafeSheepSearch(ctx, safetyRecovery);
     const currentPosition = ctx.bot.entity.position;
     const waypoint = nextSheepSearchWaypoint(
       ctx,
@@ -319,8 +367,10 @@ async function searchForSheep(
       currentPosition.x,
       currentPosition.z,
       searchRadius,
+      step,
+      stepLimit,
+      routeHeading,
       visited,
-      ctx.random,
     );
     if (!waypoint) break;
     stepsUsed += 1;
@@ -332,7 +382,7 @@ async function searchForSheep(
       if (outcome === 'unreachable' || outcome === 'stopped') continue;
       throw new Error(`寻找羊时移动未完成（${outcome || '未知状态'}），停止探索`);
     }
-    assertSafeSheepSearch(ctx);
+    await ensureSafeSheepSearch(ctx, safetyRecovery);
     const candidates = sheepCandidates(ctx, radius, color, excluded);
     for (const candidate of candidates) {
       const offsetX = candidate.sheep.position.x - originX;
@@ -372,12 +422,47 @@ async function searchForSheep(
   };
 }
 
-function nextSheepSearchWaypoint(ctx, originX, originZ, currentX, currentZ, radius, visited, random) {
+function nextSheepSearchWaypoint(
+  ctx,
+  originX,
+  originZ,
+  currentX,
+  currentZ,
+  radius,
+  step,
+  stepLimit,
+  routeHeading,
+  visited,
+  forwardOnly = false,
+) {
   const bot = ctx.bot;
   if (typeof bot.findBlocks !== 'function' || typeof bot.blockAt !== 'function') return null;
-  const randomValue = typeof random === 'function' ? random : Math.random;
   const minStep = Math.min(10, radius * 0.45);
   const maxStep = Math.min(18, Math.max(minStep, radius * 0.75));
+  const hop = Math.min(13, (minStep + maxStep) / 2);
+  const firstRadius = Math.min(radius, hop);
+  const coverageRadius = Math.min(radius, firstRadius + hop * Math.max(0, stepLimit - 1) * 0.75);
+  const radialGrowth = stepLimit > 1
+    ? (coverageRadius - firstRadius) / (stepLimit - 1)
+    : 0;
+  const currentOffsetX = currentX - originX;
+  const currentOffsetZ = currentZ - originZ;
+  const currentRadius = Math.hypot(currentOffsetX, currentOffsetZ);
+  const nextRadius = Math.min(
+    radius,
+    Math.max(firstRadius, currentRadius) + (step === 0 ? 0 : radialGrowth),
+  );
+  const currentHeading = currentRadius > 0.001
+    ? Math.atan2(currentOffsetZ, currentOffsetX)
+    : routeHeading;
+  const cosine = currentRadius > 0.001 && nextRadius > 0.001
+    ? (currentRadius ** 2 + nextRadius ** 2 - hop ** 2) / (2 * currentRadius * nextRadius)
+    : 1;
+  const turn = Math.acos(Math.max(-1, Math.min(1, cosine)));
+  const target = {
+    x: forwardOnly ? currentX + Math.cos(routeHeading) * hop : originX + Math.cos(currentHeading + turn) * nextRadius,
+    z: forwardOnly ? currentZ + Math.sin(routeHeading) * hop : originZ + Math.sin(currentHeading + turn) * nextRadius,
+  };
   let supports;
   try {
     supports = bot.findBlocks({
@@ -388,7 +473,7 @@ function nextSheepSearchWaypoint(ctx, originX, originZ, currentX, currentZ, radi
         const fromCurrent = Math.hypot(position.x - currentX, position.z - currentZ);
         if (fromCurrent < minStep || fromCurrent > maxStep) return false;
         if (Math.hypot(position.x - originX, position.z - originZ) > radius) return false;
-        const key = `${Math.round(position.x / 6)},${Math.round(position.z / 6)}`;
+        const key = `${Math.round(position.x)},${Math.round(position.z)}`;
         return !visited.has(key);
       },
       maxDistance: Math.min(radius, maxStep + 4),
@@ -406,8 +491,9 @@ function nextSheepSearchWaypoint(ctx, originX, originZ, currentX, currentZ, radi
     const z = position.z;
     const fromCurrent = Math.hypot(x - currentX, z - currentZ);
     if (fromCurrent < minStep || fromCurrent > maxStep) continue;
+    if (forwardOnly && (x - currentX) * Math.cos(routeHeading) + (z - currentZ) * Math.sin(routeHeading) < minStep * 0.4) continue;
     if (Math.hypot(x - originX, z - originZ) > radius) continue;
-    const key = `${Math.round(x / 6)},${Math.round(z / 6)}`;
+    const key = `${Math.round(x)},${Math.round(z)}`;
     if (visited.has(key)) continue;
     let feet;
     let head;
@@ -424,13 +510,21 @@ function nextSheepSearchWaypoint(ctx, originX, originZ, currentX, currentZ, radi
     if (typeof ctx.log === 'function') {
       ctx.log('剪羊搜索没有安全路点', `已加载支撑方块 ${supports?.length || 0}`);
     }
-    for (let attempt = 0; attempt < 12; attempt += 1) {
-      const angle = randomValue() * Math.PI * 2;
-      const distance = minStep + randomValue() * (maxStep - minStep);
-      const x = Math.round(currentX + Math.cos(angle) * distance);
-      const z = Math.round(currentZ + Math.sin(angle) * distance);
+    const sideX = -Math.sin(currentHeading);
+    const sideZ = Math.cos(currentHeading);
+    const offsets = [
+      [0, 0], [2, 0], [-2, 0], [0, 2], [0, -2],
+      [3, 1], [-3, -1], [1, -3], [-1, 3],
+      [4, 0], [-4, 0], [0, 4], [0, -4],
+    ];
+    for (const [forward, lateral] of offsets) {
+      const x = Math.round(target.x + Math.cos(currentHeading) * forward + sideX * lateral);
+      const z = Math.round(target.z + Math.sin(currentHeading) * forward + sideZ * lateral);
+      const distance = Math.hypot(x - currentX, z - currentZ);
+      if (distance < minStep || distance > maxStep) continue;
+      if (forwardOnly && (x - currentX) * Math.cos(routeHeading) + (z - currentZ) * Math.sin(routeHeading) < minStep * 0.4) continue;
       if (Math.hypot(x - originX, z - originZ) > radius) continue;
-      const key = `${Math.round(x / 6)},${Math.round(z / 6)}`;
+      const key = `${Math.round(x)},${Math.round(z)}`;
       if (visited.has(key)) continue;
       visited.add(key);
       if (typeof ctx.log === 'function') {
@@ -440,7 +534,12 @@ function nextSheepSearchWaypoint(ctx, originX, originZ, currentX, currentZ, radi
     }
     return null;
   }
-  const waypoint = candidates[Math.floor(randomValue() * candidates.length)];
+  candidates.sort((left, right) => {
+    const leftDistance = Math.hypot(left.x - target.x, left.z - target.z);
+    const rightDistance = Math.hypot(right.x - target.x, right.z - target.z);
+    return leftDistance - rightDistance;
+  });
+  const waypoint = candidates[0];
   visited.add(waypoint.key);
   return waypoint;
 }
@@ -460,7 +559,7 @@ function isSheepSearchHazard(name) {
   return /water|lava|fire|cactus|magma_block|sweet_berry_bush|powder_snow|wither_rose|campfire/i.test(String(name || ''));
 }
 
-async function walkSheepSearchWaypoint(ctx, waypoint) {
+async function walkSheepSearchWaypoint(ctx, waypoint, timeoutMs = SHEEP_SEARCH_STEP_TIMEOUT_MS) {
   const movements = ctx.bot.pathfinder?.movements;
   const previousLiquidCost = movements && Number.isFinite(movements.liquidCost)
     ? movements.liquidCost
@@ -491,13 +590,82 @@ async function walkSheepSearchWaypoint(ctx, waypoint) {
       waypoint.y,
       waypoint.z,
       3,
-      SHEEP_SEARCH_STEP_TIMEOUT_MS,
+      timeoutMs,
       true,
     );
   } finally {
     if (previousLiquidCost !== null) movements.liquidCost = previousLiquidCost;
     for (const id of avoidedWater) blocksToAvoid.delete(id);
   }
+}
+
+function createCombatSearchState(ctx) {
+  const randomValue = typeof ctx.random === 'function' ? ctx.random : Math.random;
+  return {
+    routeHeading: randomValue() * Math.PI * 2,
+    visited: new Set(),
+    steps: 0,
+  };
+}
+
+function assertCombatSearchSafe(ctx, minHealth, action) {
+  assertCombatSearchHealth(ctx, minHealth, action);
+  if (typeof ctx.nearbyHostiles !== 'function') {
+    throw new Error(`附近有敌对生物或无法确认安全，停止${action}`);
+  }
+  const hostiles = ctx.nearbyHostiles(12);
+  if (!Array.isArray(hostiles) || hostiles.length > 0) {
+    throw new Error(`附近有敌对生物或无法确认安全，停止${action}`);
+  }
+}
+
+function assertCombatSearchHealth(ctx, minHealth, action) {
+  throwIfInterrupted(ctx, action);
+  const health = Number(ctx.bot.health);
+  if (!Number.isFinite(health) || health <= minHealth) {
+    throw new Error(`血量不足或未知（${Number.isFinite(health) ? health : '未知'}），停止${action}`);
+  }
+}
+
+async function moveCombatSearchWaypoint(ctx, state, radius, minHealth, action) {
+  if (state.steps >= HUNT_SEARCH_MAX_STEPS || typeof ctx.walkOnce !== 'function') {
+    state.steps = HUNT_SEARCH_MAX_STEPS;
+    return 'exhausted';
+  }
+  assertCombatSearchSafe(ctx, minHealth, action);
+  const position = ctx.bot.entity.position;
+  const waypoint = nextSheepSearchWaypoint(
+    ctx,
+    position.x,
+    position.z,
+    position.x,
+    position.z,
+    Math.min(radius, 96),
+    0,
+    HUNT_SEARCH_MAX_STEPS,
+    state.routeHeading,
+    state.visited,
+    true,
+  );
+  if (!waypoint) {
+    state.steps = HUNT_SEARCH_MAX_STEPS;
+    return 'exhausted';
+  }
+  state.steps += 1;
+  if (typeof ctx.log === 'function') {
+    ctx.log('战斗材料搜索路线', `${state.steps}/${HUNT_SEARCH_MAX_STEPS}`, `(${waypoint.x}, ${waypoint.y}, ${waypoint.z})`);
+  }
+  const outcome = await walkSheepSearchWaypoint(ctx, waypoint, HUNT_SEARCH_STEP_TIMEOUT_MS);
+  throwIfInterrupted(ctx, action);
+  if (outcome === 'stopped' || outcome === 'cancelled') {
+    throw new Error(`${action}移动被安全控制停止，结束搜索`);
+  }
+  assertCombatSearchSafe(ctx, minHealth, action);
+  if (outcome === 'unreachable') return outcome;
+  if (outcome !== 'reached') {
+    throw new Error(`${action}移动未完成（${outcome || '未知状态'}），结束搜索`);
+  }
+  return outcome;
 }
 
 function pickSheepColor(ctx, candidates, requestedColor, count) {
@@ -522,10 +690,24 @@ async function shearSheep(args, ctx) {
   const bot = ctx.bot;
   if (!bot || !bot.entity) throw new Error('bot 还没进入世界，没有办法剪羊毛');
   const count = Math.max(1, Math.min(Math.floor(Number(args.count) || 3), 16));
-  const radius = Math.max(4, Math.min(Number(args.radius) || 48, 64));
+  const radius = Math.max(4, Math.min(Number(args.radius) || 48, 96));
   const requestedColor = String(args.color || 'auto').trim().toLowerCase();
   if (requestedColor !== 'auto' && !SHEEP_COLORS.includes(requestedColor)) {
     throw new Error(`不知道羊毛颜色 ${requestedColor}`);
+  }
+
+  if (typeof ctx.log === 'function') {
+    const sheepEntities = Object.values(bot.entities || {}).filter((entity) => entity?.name === 'sheep' && entity.position);
+    const nearby = sheepEntities
+      .map((sheep) => ({ sheep, distance: bot.entity.position.distanceTo(sheep.position) }))
+      .filter(({ distance }) => distance <= radius)
+      .sort((left, right) => left.distance - right.distance)
+      .slice(0, 6)
+      .map(({ sheep, distance }) => {
+        const state = sheepWoolState(ctx, sheep);
+        return `${sheep.id}@${distance.toFixed(1)}(${sheep.position.x.toFixed(0)},${sheep.position.y.toFixed(0)},${sheep.position.z.toFixed(0)}) state=${state ? `${state.color}/${state.sheared ? 'shorn' : 'wool'}/${state.baby ? 'baby' : 'adult'}` : 'unknown'} metadata=${JSON.stringify(sheep.metadata)}`;
+      });
+    ctx.log('剪羊搜索初始羊实体', `加载 ${sheepEntities.length}，${radius} 格内 ${nearby.length}：${nearby.join(' | ') || '无'}`);
   }
 
   let initialCandidates = sheepCandidates(
@@ -547,6 +729,7 @@ async function shearSheep(args, ctx) {
     };
   }
   let searchStepsUsed = 0;
+  const safetyRecovery = { attempts: 0 };
   if (availableForColor < count) {
     const explored = await searchForSheep(
       ctx,
@@ -555,7 +738,8 @@ async function shearSheep(args, ctx) {
       SHEEP_SEARCH_MAX_STEPS,
       new Set(),
       count,
-      requestedColor === 'auto' ? Math.ceil(SHEEP_SEARCH_MAX_STEPS / 2) : 1,
+      requestedColor === 'auto' ? 4 : 1,
+      safetyRecovery,
     );
     searchStepsUsed += explored.stepsUsed;
     const combined = new Map(initialCandidates.map((candidate) => [candidate.sheep.id, candidate]));
@@ -607,6 +791,8 @@ async function shearSheep(args, ctx) {
         SHEEP_SEARCH_MAX_STEPS - searchStepsUsed,
         processed,
         count - ctx.countItem(`${color}_wool`),
+      requestedColor === 'auto' ? 4 : 1,
+        safetyRecovery,
       );
       searchStepsUsed += explored.stepsUsed;
       candidates = sheepCandidates(ctx, radius, color, processed);
@@ -716,72 +902,40 @@ function isBurning(ctx) {
   return false;
 }
 
-// 末影人是否站在水边：它在水里不会瞬移，可以放心贴脸砍。
-function nearWater(ctx, entity) {
+async function retreatIfGroupOverwhelms(ctx, target, action) {
   const bot = ctx.bot;
-  const position = entity.position;
-  const spots = [
-    position,
-    position.offset(1, 0, 0),
-    position.offset(-1, 0, 0),
-    position.offset(0, 0, 1),
-    position.offset(0, 0, -1),
-  ];
-  for (const spot of spots) {
-    let block = null;
-    try {
-      block = bot.blockAt(spot);
-    } catch (error) {
-      continue;
-    }
-    if (block && ctx.blockIsWater(block)) return true;
-  }
-  return false;
+  const encounter = assessCombatEncounter({
+    entities: bot.entities,
+    origin: bot.entity.position,
+    registry: bot.registry,
+    health: bot.health,
+    radius: 16,
+    currentTarget: target,
+    equipment: combatEquipment(bot),
+  });
+  if (!encounter.should_retreat) return false;
+
+  throwIfInterrupted(ctx, action);
+  const threat = encounter.urgent?.entity || encounter.primary?.entity || target;
+  let movedAway = false;
+  if (typeof ctx.retreatFrom === 'function') movedAway = Boolean(await ctx.retreatFrom(threat));
+  throwIfInterrupted(ctx, action);
+  const movement = movedAway ? '已拉开距离' : '后撤未确认';
+  throw new Error(`还差目标；${encounter.retreat_reason || '周围敌对生物威胁过高'}，${movement}，停止${action}`);
 }
 
-// 附近有没有水源，用来判断能不能把末影人引到水边打。
-function waterNearby(ctx, radius) {
-  const bot = ctx.bot;
-  const origin = bot.entity.position;
-  for (let distance = 2; distance <= radius; distance += 2) {
-    for (let step = 0; step < 8; step += 1) {
-      const angle = (Math.PI * 2 * step) / 8;
-      const x = Math.floor(origin.x + Math.cos(angle) * distance);
-      const z = Math.floor(origin.z + Math.sin(angle) * distance);
-      for (let dy = -3; dy <= 1; dy += 1) {
-        let block = null;
-        try {
-          block = bot.blockAt({ x, y: Math.floor(origin.y) + dy, z });
-        } catch (error) {
-          continue;
-        }
-        if (block && ctx.blockIsWater(block)) {
-          return { x, y: Math.floor(origin.y) + dy, z };
-        }
-      }
-    }
-  }
-  return null;
-}
-
-// 被末影人抓起：身体悬空且末影人就在旁边。
+// 原版没有末影人抓起玩家的机制；仅兼容服务器插件明确设置的乘载关系。
 function isGrabbedByEnderman(ctx, enderman) {
-  const bot = ctx.bot;
-  const position = bot.entity.position;
-  const target = enderman || findEntity(ctx, 'enderman', 3);
-  if (!target) return false;
-  let solidBelow = false;
-  let solidInside = false;
-  try {
-    const below = bot.blockAt(position.offset(0, -1, 0));
-    solidBelow = Boolean(below && below.boundingBox === 'block');
-    const inside = bot.blockAt(position);
-    solidInside = Boolean(inside && inside.boundingBox === 'block');
-  } catch (error) {
-    return false;
+  if (!enderman || enderman.id === undefined) return false;
+  if (typeof ctx.isGrabbedByEnderman === 'function') {
+    return Boolean(ctx.isGrabbedByEnderman(enderman));
   }
-  if (solidBelow || solidInside) return false;
-  return position.y >= target.position.y - 1;
+  const entity = ctx.bot.entity;
+  const vehicle = entity && entity.vehicle;
+  return Boolean(
+    vehicle && (vehicle === enderman || vehicle === enderman.id || vehicle.id === enderman.id) ||
+    entity && entity.vehicleId === enderman.id
+  );
 }
 
 // 血量恢复：等自然回血。ctx 没有 waitForHealth，这里自己等。
@@ -983,13 +1137,19 @@ async function collectItem(ctx, itemName, range = 6) {
 
 async function huntMaterial(args, ctx) {
   throwIfInterrupted(ctx, '收集战斗材料');
-  const itemName = String(args.item || '').trim().toLowerCase();
-  const species = COMBAT_MATERIAL_SOURCES[itemName];
-  if (!species) throw new Error(`不支持收集 ${itemName || '未知物品'}；可收集 string 或 feather`);
+  let itemName = String(args.item || '').trim().toLowerCase();
+  const wool = itemName === 'wool';
+  let woolColor = '';
+  const species = wool ? 'sheep' : COMBAT_MATERIAL_SOURCES[itemName];
+  if (!species) throw new Error(`不支持收集 ${itemName || '未知物品'}；可收集 wool、string 或 feather`);
 
   const wanted = Math.trunc(clamp(args.count, 1, 32, 1));
   const radius = clamp(args.radius, 4, 64, 48);
   const minHealth = clamp(args.min_health, 4, 20, 10);
+  if (wool) {
+    woolColor = pickSheepColor(ctx, sheepCandidates(ctx, radius, '', new Set()), 'auto', wanted);
+    itemName = woolColor ? `${woolColor}_wool` : 'wool';
+  }
   const initial = ctx.countItem(itemName);
   if (initial >= wanted) {
     return { detail: `背包里已经有 ${initial} 个${ctx.itemLabel(itemName)}，够 ${wanted} 个`, status: 'succeeded' };
@@ -999,22 +1159,32 @@ async function huntMaterial(args, ctx) {
   const maxKills = Math.max(6, Math.min(40, (wanted - initial) * 8));
   let kills = 0;
   let attempts = 0;
-  let searchedSince = Date.now();
+  const searchState = createCombatSearchState(ctx);
 
   while (Date.now() < deadline && kills < maxKills) {
-    throwIfInterrupted(ctx, '收集战斗材料');
-    const health = Number(ctx.bot.health);
-    if (!Number.isFinite(health) || health <= minHealth) {
-      throw new Error(`血量不足（${Number.isFinite(health) ? health : '未知'}），停止猎取${mobLabel(ctx, species)}`);
-    }
+    assertCombatSearchHealth(ctx, minHealth, `猎取${mobLabel(ctx, species)}`);
 
-    const target = findEntity(ctx, species, radius);
-    if (!target) {
-      if (Date.now() - searchedSince > SEARCH_WAIT_MS) break;
-      await ctx.sleep(1000);
-      continue;
+    let target;
+    if (wool) {
+      const candidates = sheepCandidates(ctx, radius, woolColor, new Set());
+      if (!woolColor) woolColor = pickSheepColor(ctx, candidates, 'auto', wanted);
+      if (woolColor) itemName = `${woolColor}_wool`;
+      target = candidates.find(candidate => candidate.color === woolColor)?.sheep;
+    } else {
+      target = findEntity(ctx, species, radius);
     }
-    searchedSince = Date.now();
+    if (!target) {
+      const moved = await moveCombatSearchWaypoint(
+        ctx,
+        searchState,
+        radius,
+        minHealth,
+        '收集战斗材料',
+      );
+      if (moved === 'reached' || moved === 'unreachable') continue;
+      break;
+    }
+    throwIfInterrupted(ctx, '收集战斗材料');
     attempts += 1;
     const chased = await chaseTarget(ctx, target, MELEE_RANGE, deadline);
     throwIfInterrupted(ctx, '收集战斗材料');
@@ -1024,6 +1194,7 @@ async function huntMaterial(args, ctx) {
       continue;
     }
 
+    assertCombatSearchHealth(ctx, minHealth, `获取${mobLabel(ctx, species)}`);
     await ctx.attackEntity(target);
     throwIfInterrupted(ctx, '收集战斗材料');
     if (target.isValid === false) {
@@ -1070,6 +1241,11 @@ async function huntAnimal(args, ctx) {
   const radius = clamp(args.radius, 4, 64, 32);
   const minHealth = clamp(args.min_health, 2, 20, 8);
   const species = String(args.species || '').trim().toLowerCase();
+  const excludedSpecies = new Set(
+    Array.isArray(args.exclude_species)
+      ? args.exclude_species.map((name) => String(name || '').trim().toLowerCase()).filter(Boolean)
+      : [],
+  );
   let speciesList = HUNTABLE;
   if (species) {
     if (!HUNTABLE.includes(species)) {
@@ -1077,6 +1253,8 @@ async function huntAnimal(args, ctx) {
     }
     speciesList = [species];
   }
+  speciesList = speciesList.filter((name) => !excludedSpecies.has(name));
+  if (speciesList.length === 0) throw new Error('狩猎目标被排除规则全部过滤');
 
   const start = countMeat(ctx, speciesList);
   if (wantedKills === 0 && start.value >= wanted) {
@@ -1092,8 +1270,14 @@ async function huntAnimal(args, ctx) {
   let found = 0;
   let searchedSince = Date.now();
   let note = '';
+  const visited = new Set();
+  const randomValue = typeof ctx.random === 'function' ? ctx.random : Math.random;
+  const routeHeading = randomValue() * Math.PI * 2;
+  const safetyRecovery = { attempts: 0 };
+  let searchSteps = 0;
 
   while (Date.now() < deadline) {
+    throwIfInterrupted(ctx, '狩猎动物');
     const daylight = daylightLeft(ctx.bot.time);
     if (daylight !== null && daylight < 2000) {
       note = `，天快黑了（第 ${ctx.bot.time.day ?? '?'} 天），先回去`;
@@ -1101,8 +1285,50 @@ async function huntAnimal(args, ctx) {
     }
     const target = findHuntable(ctx, speciesList, radius);
     if (!target) {
+      if (searchSteps < HUNT_SEARCH_MAX_STEPS && typeof ctx.walkOnce === 'function') {
+        await ensureSafeSheepSearch(ctx, safetyRecovery);
+        const position = ctx.bot.entity.position;
+        const waypoint = nextSheepSearchWaypoint(
+          ctx,
+          position.x,
+          position.z,
+          position.x,
+          position.z,
+          radius,
+          0,
+          HUNT_SEARCH_MAX_STEPS,
+          routeHeading,
+          visited,
+          true,
+        );
+        if (!waypoint) {
+          searchSteps = HUNT_SEARCH_MAX_STEPS;
+        } else {
+          searchSteps += 1;
+          if (typeof ctx.log === 'function') {
+            ctx.log('狩猎搜索路线', `${searchSteps}/${HUNT_SEARCH_MAX_STEPS}`, `(${waypoint.x}, ${waypoint.y}, ${waypoint.z})`);
+          }
+          const outcome = await walkSheepSearchWaypoint(
+            ctx,
+            waypoint,
+            HUNT_SEARCH_STEP_TIMEOUT_MS,
+          );
+          throwIfInterrupted(ctx, '搜索动物');
+          if (outcome === 'stopped' || outcome === 'cancelled') {
+            throw new Error(`搜索动物时移动已停止（${outcome}），停止搜索`);
+          }
+          if (outcome !== 'reached' && outcome !== 'unreachable') {
+            throw new Error(`搜索动物时移动未完成（${outcome || '未知状态'}），停止搜索`);
+          }
+          await ensureSafeSheepSearch(ctx, safetyRecovery);
+          if (outcome === 'reached') {
+            searchedSince = Date.now();
+            continue;
+          }
+        }
+      }
       if (Date.now() - searchedSince > SEARCH_WAIT_MS) {
-        note = '，附近没有可以狩猎的动物';
+        note = '有限搜索等待时间已结束';
         break;
       }
       await ctx.sleep(1000);
@@ -1114,6 +1340,7 @@ async function huntAnimal(args, ctx) {
     const meat = meatFor(target.name);
 
     const chased = await chaseTarget(ctx, target, MELEE_RANGE, deadline);
+    throwIfInterrupted(ctx, '狩猎动物');
     if (chased === 'gone') continue;
     if (chased === 'failed') {
       ctx.log('追不上目标', label);
@@ -1161,7 +1388,8 @@ async function huntAnimal(args, ctx) {
   }
   if (found === 0) {
     const names = speciesList.map((name) => mobLabel(ctx, name)).join('、');
-    throw new Error(`附近没有可以狩猎的${names}`);
+    const reason = note ? `${note.replace(/^，\s*/, '')}；` : '';
+    throw new Error(`${reason}有限安全搜索未能确认附近有可猎的${names}`);
   }
   if (wantedKills > 0) {
     throw new Error(`还差 ${wantedKills - killed} 只动物，只猎到 ${killed} 只${note || ''}`);
@@ -1252,6 +1480,7 @@ async function engageBlaze(ctx, blaze, minHealth, deadline) {
       outcome.interrupted = true;
       break;
     }
+    await retreatIfGroupOverwhelms(ctx, blaze, '打烈焰人');
     const incoming = findIncomingProjectile(ctx);
     if (incoming) {
       if (!shieldRaised) {
@@ -1294,6 +1523,7 @@ async function engageBlaze(ctx, blaze, minHealth, deadline) {
         outcome.interrupted = true;
         break;
       }
+      await retreatIfGroupOverwhelms(ctx, blaze, '打烈焰人');
       if (await ctx.shootAt(blaze)) outcome.hits += 1;
       await ctx.sleep(700);
       continue;
@@ -1309,6 +1539,7 @@ async function engageBlaze(ctx, blaze, minHealth, deadline) {
       outcome.interrupted = true;
       break;
     }
+    await retreatIfGroupOverwhelms(ctx, blaze, '打烈焰人');
     const reach = bot.entity.position.distanceTo(blaze.position);
     if (reach <= MELEE_REACH) {
       await bot.lookAt(blaze.position.offset(0, entityHeight(blaze) * 0.7, 0), true);
@@ -1316,6 +1547,7 @@ async function engageBlaze(ctx, blaze, minHealth, deadline) {
         outcome.interrupted = true;
         break;
       }
+      await retreatIfGroupOverwhelms(ctx, blaze, '打烈焰人');
       bot.attack(blaze);
       outcome.hits += 1;
       stuck = 0;
@@ -1332,8 +1564,9 @@ async function engageBlaze(ctx, blaze, minHealth, deadline) {
   return outcome;
 }
 
-// 猎末影人：贴身补刀拿珍珠，被抓住先脱身。
+// 猎末影人：只用近战；只兼容服务器插件明确记录的乘载状态。
 async function huntEnderman(args, ctx) {
+  throwIfInterrupted(ctx, '猎末影人');
   const wanted = clamp(args.count, 1, 64, 1);
   const radius = clamp(args.radius, 4, 64, 48);
   const deadline = Date.now() + ENDERMAN_TIMEOUT_MS;
@@ -1343,34 +1576,39 @@ async function huntEnderman(args, ctx) {
     return { detail: `背包里已经有 ${pearls} 颗末影珍珠，够 ${wanted} 颗`, status: 'succeeded' };
   }
 
-  const water = waterNearby(ctx, 16);
+  const searchState = createCombatSearchState(ctx);
   let killed = 0;
   let grabbed = 0;
   let engagements = 0;
   let found = 0;
-  let searchedSince = Date.now();
   let note = '';
 
   while (pearls < wanted && Date.now() < deadline) {
+    assertCombatSearchHealth(ctx, ENDERMAN_SEARCH_MIN_HEALTH, '猎末影人');
     const enderman = findEntity(ctx, 'enderman', radius);
     if (!enderman) {
-      if (Date.now() - searchedSince > SEARCH_WAIT_MS) {
-        note = '，附近没有末影人';
-        break;
-      }
-      await ctx.sleep(1000);
-      continue;
+      const moved = await moveCombatSearchWaypoint(
+        ctx,
+        searchState,
+        radius,
+        ENDERMAN_SEARCH_MIN_HEALTH,
+        '猎末影人',
+      );
+      if (moved === 'reached' || moved === 'unreachable') continue;
+      note = '有限安全搜索路线耗尽';
+      break;
     }
-    searchedSince = Date.now();
     found += 1;
 
-    const outcome = await engageEnderman(ctx, enderman, water, deadline);
+    const outcome = await engageEnderman(ctx, enderman, deadline);
+    throwIfInterrupted(ctx, '猎末影人');
     engagements += 1;
     if (outcome.grabbed) grabbed += 1;
     if (outcome.killed) {
       killed += 1;
       ctx.log('打死一只末影人');
       await collectItem(ctx, 'ender_pearl');
+      throwIfInterrupted(ctx, '收集末影珍珠');
     }
     pearls = ctx.countItem('ender_pearl');
     if (!outcome.killed && engagements >= MAX_ENGAGEMENTS) {
@@ -1382,63 +1620,54 @@ async function huntEnderman(args, ctx) {
   pearls = ctx.countItem('ender_pearl');
   if (pearls >= wanted) {
     return {
-      detail: `猎到 ${killed} 只末影人，末影珍珠一共 ${pearls} 颗${grabbed ? '，被抓起来过' : ''}`,
+      detail: `猎到 ${killed} 只末影人，末影珍珠一共 ${pearls} 颗${grabbed ? '，服务器曾报告末影人乘载状态' : ''}`,
       status: 'succeeded',
     };
   }
   if (found === 0) {
-    throw new Error(`附近 ${radius} 格内没有末影人`);
+    const reason = note ? `（${note.replace(/^，\s*/, '')}）` : '';
+    throw new Error(`有限安全搜索未能确认附近有末影人${reason}`);
   }
-  const extra = grabbed ? '，被末影人抓起来过' : water ? '' : '，附近没有水源，只能硬追';
+  const extra = grabbed ? '，服务器曾报告末影人乘载状态' : '';
   throw new Error(`还差 ${wanted - pearls} 颗末影珍珠，只拿到 ${pearls} 颗${note}${extra}`);
 }
 
-// 一次末影人交战。它在水里不会瞬移，此时可以放心连砍。
-async function engageEnderman(ctx, enderman, waterEdge, deadline) {
+// 一次末影人交战。投射物会被末影人瞬移躲开，因此只用近战。
+async function engageEnderman(ctx, enderman, deadline) {
   const bot = ctx.bot;
-  const outcome = { killed: false, grabbed: false, hits: 0, shots: 0 };
-  const ranged = ctx.findRangedWeapon();
-  let waited = 0;
+  const outcome = { killed: false, grabbed: false, hits: 0 };
   let stuck = 0;
 
   while (Date.now() < deadline && enderman.isValid !== false) {
+    assertCombatSearchHealth(ctx, ENDERMAN_SEARCH_MIN_HEALTH, '猎末影人');
+    await retreatIfGroupOverwhelms(ctx, enderman, '猎末影人');
     if (isGrabbedByEnderman(ctx, enderman)) {
       outcome.grabbed = true;
-      ctx.log('被末影人抓起来了，先打它脱身');
+      ctx.log('服务器报告末影人乘载状态，先尝试脱离');
       await releaseFromEnderman(ctx, enderman);
+      throwIfInterrupted(ctx, '猎末影人');
       continue;
     }
     const distance = bot.entity.position.distanceTo(enderman.position);
-    const inWater = nearWater(ctx, enderman);
 
-    // 有水源就守在水边，等它靠近；它进水里就不会瞬移。
-    if (waterEdge && !inWater && distance > MELEE_RANGE + 2 && waited < 20) {
-      const edgeDistance = Math.hypot(
-        bot.entity.position.x - waterEdge.x,
-        bot.entity.position.z - waterEdge.z
-      );
-      if (edgeDistance > 3) await moveTo(ctx, waterEdge, 2);
-      waited += 1;
-      await ctx.sleep(500);
-      continue;
+    if (distance > MELEE_RANGE) {
+      await ctx.approach(enderman);
+      throwIfInterrupted(ctx, '猎末影人');
+      assertCombatSearchHealth(ctx, ENDERMAN_SEARCH_MIN_HEALTH, '猎末影人');
+      await retreatIfGroupOverwhelms(ctx, enderman, '猎末影人');
     }
-
-    // 够不着又追不上时用弓压制，但不让它把箭全耗光。
-    if (ranged && !inWater && distance > 8 && outcome.shots < 6) {
-      if (await ctx.shootAt(enderman)) outcome.shots += 1;
-      await ctx.sleep(500);
-      continue;
-    }
-
-    if (distance > MELEE_RANGE) await ctx.approach(enderman);
     const reach = bot.entity.position.distanceTo(enderman.position);
     if (reach <= MELEE_REACH) {
       await bot.lookAt(enderman.position.offset(0, entityHeight(enderman) * 0.7, 0), true);
+      throwIfInterrupted(ctx, '猎末影人');
+      assertCombatSearchHealth(ctx, ENDERMAN_SEARCH_MIN_HEALTH, '猎末影人');
+      await retreatIfGroupOverwhelms(ctx, enderman, '猎末影人');
       bot.attack(enderman);
       outcome.hits += 1;
       if (outcome.hits >= MAX_ENDERMAN_ATTACKS) break;
       stuck = 0;
       await ctx.sleep(400);
+      throwIfInterrupted(ctx, '猎末影人');
       continue;
     }
     stuck += 1;
@@ -1453,22 +1682,32 @@ async function engageEnderman(ctx, enderman, waterEdge, deadline) {
 async function releaseFromEnderman(ctx, enderman) {
   const bot = ctx.bot;
   for (let attempt = 0; attempt < 6; attempt += 1) {
+    throwIfInterrupted(ctx, '打末影人脱身');
     if (enderman.isValid === false) return true;
     if (!isGrabbedByEnderman(ctx, enderman)) return true;
+    await retreatIfGroupOverwhelms(ctx, enderman, '打末影人脱身');
     try {
       await bot.lookAt(enderman.position.offset(0, entityHeight(enderman) * 0.7, 0), true);
+      throwIfInterrupted(ctx, '打末影人脱身');
       bot.attack(enderman);
     } catch (error) {
+      throwIfInterrupted(ctx, '打末影人脱身');
       ctx.log('打末影人脱身失败', error.message);
     }
     await ctx.sleep(350);
+    throwIfInterrupted(ctx, '打末影人脱身');
   }
+  let movementStarted = false;
   try {
     bot.setControlState('forward', true);
+    movementStarted = true;
     await ctx.sleep(600);
-    bot.setControlState('forward', false);
+    throwIfInterrupted(ctx, '打末影人脱身');
   } catch (error) {
+    throwIfInterrupted(ctx, '打末影人脱身');
     ctx.log('走动脱身失败', error.message);
+  } finally {
+    if (movementStarted) bot.setControlState('forward', false);
   }
   return !isGrabbedByEnderman(ctx, enderman);
 }
@@ -1631,7 +1870,7 @@ export const skills = {
       '用剪刀从成年且未剪过的羊身上剪取同色羊毛；逐只验证背包增量，按需靠近并跳过幼羊和已剪过的羊。',
     parameters: [
       { name: 'count', type: 'number', required: false, default: 3, description: '目标颜色羊毛总数，范围 1-16。' },
-      { name: 'radius', type: 'number', required: false, default: 48, description: '搜索羊的半径，范围 4-64 格。' },
+      { name: 'radius', type: 'number', required: false, default: 48, minimum: 4, maximum: 96, description: '搜索羊的半径，范围 4-96 格。' },
       { name: 'color', type: 'string', required: false, default: 'auto', description: '羊毛颜色；auto 会优先补齐背包已有颜色，否则选择附近数量最多的颜色。' },
     ],
     handler: shearSheep,
@@ -1643,6 +1882,7 @@ export const skills = {
       { name: 'count', type: 'number', required: false, default: 1, description: '需要多少块生肉。' },
       { name: 'min_kills', type: 'number', required: false, default: 0, description: '至少击杀多少只目标动物；大于 0 时按击杀数收手。' },
       { name: 'species', type: 'string', required: false, default: null, description: '指定生物，例如 cow、pig、sheep。' },
+      { name: 'exclude_species', type: 'array', required: false, default: [], description: '排除的生物名称，避免猎取羊等保留资源。' },
       { name: 'radius', type: 'number', required: false, default: 32, description: '搜索半径。' },
       { name: 'min_health', type: 'number', required: false, default: 8, description: '血量低于这个值就撤退。' },
     ],
@@ -1650,9 +1890,9 @@ export const skills = {
   },
   hunt_material: {
     description:
-      '有限猎取鸡或蜘蛛来收集羽毛或线；会逐次拾取并核对背包数量，血量不足时停止。',
+      '有限猎取成年羊、鸡或蜘蛛来收集同色羊毛、羽毛或线；会移动搜索、拾取并核对背包。',
     parameters: [
-      { name: 'item', type: 'string', required: true, description: '目标材料：feather（鸡）或 string（蜘蛛）。' },
+      { name: 'item', type: 'string', required: true, enum: ['wool', 'feather', 'string'], description: '目标材料：wool（成年未剪毛羊，同色）、feather（鸡）或 string（蜘蛛）。' },
       { name: 'count', type: 'number', required: false, default: 1, description: '需要的材料数量，范围 1-32。' },
       { name: 'radius', type: 'number', required: false, default: 48, description: '目标生物搜索半径，范围 4-64 格。' },
       { name: 'min_health', type: 'number', required: false, default: 10, description: '血量不高于此值时停止猎取。' },
@@ -1671,7 +1911,7 @@ export const skills = {
   },
   hunt_enderman: {
     description:
-      '猎取末影人拿末影珍珠：末影人会瞬移，被抓住就先打它脱身，在水边或下雨时贴脸快砍，优先近战补最后一刀。',
+      '猎取末影人拿末影珍珠：使用近战攻击，逐轮评估周围威胁并在压力过高时撤退；投射物会被末影人瞬移躲开，结束后核验背包数量。',
     parameters: [
       { name: 'count', type: 'number', required: false, default: 1, description: '需要多少颗末影珍珠。' },
       { name: 'radius', type: 'number', required: false, default: 48, description: '搜索半径。' },

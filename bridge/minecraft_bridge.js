@@ -1,6 +1,9 @@
+import { escapeWater, reachShore, waterLike, breathable, avoidWaterScaffolding, allowedDuringWaterEscape } from './water_escape.js';
+import { FUEL_BURN, selectFuel } from './fuel.js';
 // 沃心 Minecraft 桥接进程：mineflayer 负责游戏内身份，WebSocket 负责与 Voxkin Core 通信。
 // 部分动作与自主行为参考 MindCraft（MIT，https://github.com/mindcraft-bots/mindcraft）。
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import mineflayer from 'mineflayer';
 import pathfinderPkg from 'mineflayer-pathfinder';
 import WebSocket from 'ws';
@@ -8,13 +11,39 @@ import { Vec3 } from 'vec3';
 import armorManager from 'mineflayer-armor-manager';
 import toolModule from 'mineflayer-tool';
 import { loadSkills } from './skills/registry.js';
+import { timeAdvanced } from './skills/survival.js';
 import { createSkillInvoker } from './skill_invoker.js';
+import { ExecutionController } from './execution_controller.js';
+import { LocalReflexScheduler, canRunLocalSafety, shouldInterruptForHunger } from './local_reflex.js';
+import { buildActionResult, mergeActionErrorData, validateActionState } from './action_response.js';
+import { createObservation } from './world_observation.js';
+import { inspectResourceSites } from './resource_sites.js';
+import { syncWindowWithLease, writeWindowClickWithLease } from './window_sync.js';
+import { placeBedAt } from './bed_placement.js';
+import { installArmorManagerApi } from './armor_manager.js';
+import { cleanupCraftWindowForSafety, isUrgentSafetyPreemption } from './craft_window_cleanup.js';
+import { createRetreatTrail, retreatAlongTrail } from './retreat_route.js';
+import { retainTemporaryTable, shouldRecoverTemporaryTable, ownedTableNearby } from './workstation_lifecycle.js';
+import { pickCraftingRecipe } from './recipe_selection.js';
+import { approachEntity } from './entity_approach.js';
+import { stopPathfinderAndClearGoal, gotoWithTimeout } from './pathfinder_control.js';
 import { BLOCK_NAMES } from './skills/labels.js';
-import { placementHeightOffsets, placementOffsets } from './placement.js';
+import { inspectSupportedPlacementTargets } from './placement.js';
+import { inspectPositionTerrain } from './world_readiness.js';
+import { installBridgeSessionLifecycle } from './session_lifecycle.js';
+import {
+  assessCombatEncounter,
+  bestMeleeWeapon,
+  chooseRetreatDestination,
+  combatEquipment,
+  evaluateEncounterStep,
+  HOSTILE_MOBS,
+  isAutomaticCombatTarget,
+  retreatSafetyScore,
+} from './combat_encounter.js';
 import {
   acknowledgeLifecycleEvent as removeLifecycleEvent,
   closeWindowAndSyncInventory,
-  drainActions,
   inventoryItemType,
   queueLifecycleEvent as storeLifecycleEvent,
   rejectBlockedAction,
@@ -34,14 +63,6 @@ const config = {
   auth: process.env.MC_AUTH || 'offline',
   ws: process.env.VOXKIN_WS || 'ws://127.0.0.1:8765/ws/bridge',
 };
-
-const HOSTILE_MOBS = new Set([
-  'zombie', 'skeleton', 'spider', 'creeper', 'witch', 'enderman', 'slime',
-  'magma_cube', 'pillager', 'vindicator', 'drowned', 'husk', 'stray',
-  'phantom', 'blaze', 'ghast', 'zoglin', 'hoglin', 'piglin_brute', 'warden',
-  'guardian', 'elder_guardian', 'shulker', 'silverfish', 'endermite', 'vex',
-  'ravager', 'evoker', 'illusioner',
-]);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -152,8 +173,11 @@ const FINAL_ACTION_STATUSES = new Set([
   'partial',
   'failed',
   'cancelled',
+  'preempted',
+  'dead',
   'disconnected',
   'blocked',
+  'unknown',
 ]);
 
 // 动作的中文名，用于进度回报。
@@ -169,7 +193,7 @@ const ACTION_LABELS = {
   come_to_player: '走到玩家身边',
   stop: '停止当前动作',
   eat: '进食',
-  attack_nearest: '攻击最近的敌人',
+  attack_nearest: '按威胁攻击敌人',
   attack_target: '攻击指定目标',
   collect_blocks: '采集方块',
   break_block: '破坏方块',
@@ -195,6 +219,8 @@ const ACTION_LABELS = {
   flee_low_health: '低血量逃生',
   hunt_animal: '狩猎动物',
   hunt_enderman: '狩猎末影人',
+  harvest_iron_golem: '搭柱击打铁傀儡取铁',
+  loot_village: '收集村庄物资',
   leave_shelter: '离开庇护所',
   list_chest: '列出箱子内容',
   make_nether_portal: '建造下界传送门',
@@ -226,31 +252,73 @@ let respawnReady = false;
 let actionBlockStatus = '';
 const pendingLifecycleEvents = [];
 let botReady = false;
+let terrainReady = false;
+let terrainReadinessGeneration = 0;
 let deathLifecycleId = '';
-const actionQueue = [];
-let actionRunning = false;
 let currentTool = '';
 let currentActionId = '';
-let currentActionPriority = 3;
-let currentCancellable = false;
+let currentGoalId = '';
+let temporaryCraftingTable = null;
+const retreatTrail = createRetreatTrail();
 let interrupted = false;
-let cancelReason = '';
-let currentInterruptStatus = '';
-let followTimer = null;
 let followSession = null;
 let actionBusy = false;
 let lastActivity = Date.now();
 let lastPlayerChatAt = 0;
 let lastDistanceAsk = 0;
 let wanderActive = false;
-let wanderToken = 0;
 let combatBusy = false;
 let lastCombatAt = 0;
+let retreatActive = false;
 let lastEatAt = 0;
 let lastHurtAt = 0;
 let lastHealth = null;
 let escapeBusy = false;
 let lastCreeperWarnAt = 0;
+let wanderActionId = '';
+let armorTimer = null;
+let sessionId = randomUUID();
+let stateRevision = 0;
+let rememberedShelter = null;
+const reflexSentAt = new Map();
+
+const executor = new ExecutionController({
+  onChange: ({ reason } = {}) => {
+    if (reason === 'started' && executor.active) {
+      interrupted = false;
+      currentTool = executor.active.tool || '';
+      currentActionId = executor.active.id;
+    } else if (reason === 'finished') {
+      interrupted = false;
+      currentTool = '';
+      currentActionId = '';
+    }
+    sendState();
+    if (reason === 'finished') finishRespawnIfIdle();
+  },
+  ledgerLimit: 256,
+});
+const actionQueue = executor.queue;
+const reflexScheduler = new LocalReflexScheduler({
+  executor,
+  isReady: () => canRunLocalSafety({
+    botPresent: Boolean(bot?.entity),
+    botReady,
+    health: bot?.health,
+    deathPending,
+    respawnReady,
+  }),
+  idFactory: (event) => `reflex-${event}-${randomUUID()}`,
+  onCancel: (reason, status, token) => cancelActiveWorldWork(reason, status, token),
+  run: async (event, data, token) => {
+    try {
+      await runLocalSafety(event, data, token);
+      return { status: 'succeeded', detail: `本地安全策略完成：${event}`, data: { event } };
+    } catch (error) {
+      return { status: token.cancelled ? token.cancelStatus : 'partial', detail: error.message, data: { event } };
+    }
+  },
+});
 
 const IDLE_WANDER_MS = 20000;
 const FAR_DISTANCE = Number(process.env.VOXKIN_FAR_DISTANCE || 128);
@@ -282,15 +350,18 @@ function connectCore() {
       enqueueAction(message);
     } else if (message.type === 'action_cancel') {
       handleActionCancel(message);
+    } else if (message.type === 'action_status') {
+      sendActionStatus(message.action_id);
+    } else if (message.type === 'state_request') {
+      rememberRequestedShelter(message.shelter);
+      sendState();
     } else if (message.type === 'lifecycle_ack') {
       acknowledgeLifecycleEvent(message);
     } else if (message.type === 'welcome') {
       log('Core 握手完成', message.name);
       flushLifecycleEvents();
       finishRespawnIfIdle();
-      if (botReady && !deathPending && pendingLifecycleEvents.length === 0) {
-        actionBlockStatus = '';
-      }
+      unblockExecutorIfReady();
       sendState();
     } else if (message.type === 'error') {
       log('Core 返回错误', message.error);
@@ -300,8 +371,8 @@ function connectCore() {
   socket.on('close', () => {
     log('与 Core 的连接断开，3 秒后重连');
     actionBlockStatus = 'disconnected';
-    drainActions(actionQueue, reply, 'Core connection lost', 'disconnected');
-    interruptAction('Core connection lost', '', 'disconnected');
+    executor.block('disconnected', 'Core connection lost');
+    stopResidentMovement();
     socket = null;
     clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connectCore, 3000);
@@ -344,9 +415,14 @@ function actionLabel(tool) {
   return ACTION_LABELS[tool] || tool;
 }
 
-function sendProgress(message, phase, detail, progress) {
+function sendProgress(message, phase, detail, progress, data = {}) {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   const value = Math.min(Math.max(Number(progress) || 0, 0), 1);
+  if (executor.active?.id === message.action_id) {
+    executor.active.token.phase = phase;
+    executor.active.token.progress = value;
+    executor.active.token.progressData = { ...data, phase, progress: value };
+  }
   socket.send(
     JSON.stringify({
       type: 'action_progress',
@@ -355,106 +431,112 @@ function sendProgress(message, phase, detail, progress) {
       phase,
       detail: String(detail).slice(0, 200),
       progress: value,
+      session_id: sessionId,
+      state_revision: stateRevision,
+      executor_epoch: executor.epoch,
+      data,
     })
   );
-}
-
-// 打断动作。actionId 为空表示无条件打断；给了 id 且与当前动作不一致时不动手，
-// 避免过期的取消请求误伤新动作。
-function interruptAction(reason, actionId, status = 'cancelled') {
-  if (!currentTool) return false;
-  const target = String(actionId || '');
-  if (target && target !== currentActionId) {
-    log('取消请求与当前动作不匹配，忽略', target, '当前', currentActionId, currentTool);
-    return false;
-  }
-  log('打断当前动作', currentTool, target || '无条件', reason);
-  interrupted = true;
-  cancelReason = reason;
-  currentInterruptStatus = status;
-  if (bot) {
-    bot.pathfinder.stop();
-    bot.stopDigging();
-    bot.clearControlStates();
-  }
-  if (followSession) stopFollow();
-  return true;
 }
 
 // 处理 Core 的取消请求：可以按 action_id 取消单个动作，也可以清空整个队列。
 function handleActionCancel(message) {
   const reason = String(message.reason || '收到取消请求');
   const actionId = String(message.action_id || '');
+  const requestedStatus = ['cancelled', 'preempted'].includes(message.interrupt_status)
+    ? message.interrupt_status
+    : 'cancelled';
   if (message.scope === 'all') {
-    const dropped = actionQueue.splice(0, actionQueue.length);
-    for (const item of dropped) {
-      reply(item, false, `已取消：${reason}`, 'cancelled');
-    }
-    log('清空动作队列', dropped.length, reason);
-    interruptAction(reason, '');
+    stopResidentMovement();
+    const dropped = executor.stop(reason, requestedStatus);
+    log('清空动作队列', dropped, reason);
     return;
   }
   if (!actionId) {
     log('取消请求缺少 action_id，忽略');
     return;
   }
-  const index = actionQueue.findIndex((item) => String(item.action_id || '') === actionId);
-  if (index >= 0) {
-    const [removed] = actionQueue.splice(index, 1);
-    reply(removed, false, `已取消：${reason}`, 'cancelled');
-    log('已从队列移除动作', actionId, reason);
-    return;
-  }
-  if (actionId === currentActionId) {
-    interruptAction(reason, actionId);
-    return;
-  }
+  if (executor.cancel(actionId, reason, requestedStatus)) return;
   log('取消请求没有匹配的动作', actionId, '当前', currentActionId);
 }
 
-// 抢占条件：优先级严格更高，且当前动作在清单里允许被取消。
-function shouldPreempt(message) {
-  if (!actionRunning || !currentTool || !currentCancellable) return false;
-  return actionPriority(message) < currentActionPriority;
-}
-
-// 按优先级排队，数值小的先跑；V8 的 sort 是稳定的，同优先级保持先来先到。
-function sortQueue() {
-  actionQueue.sort((left, right) => actionPriority(left) - actionPriority(right));
-}
-
 function enqueueAction(message) {
-  if (rejectBlockedAction(actionBlockStatus, message, reply)) return;
-  if (message.tool === 'stop') {
-    const dropped = actionQueue.splice(0, actionQueue.length);
-    for (const item of dropped) {
-      reply(item, false, '被停止指令取消', 'cancelled');
-    }
-    interruptAction('收到停止指令', '');
-  } else if (shouldPreempt(message)) {
-    interruptAction('被更高优先级的动作抢占', currentActionId, 'cancelled');
+  if (message.action_id && executor.status(message.action_id)) {
+    sendActionStatus(message.action_id);
+    return;
   }
-  actionQueue.push(message);
-  sortQueue();
-  pumpActions();
+  if (message.tool === 'stop') {
+    stopResidentMovement();
+    executor.stop('收到停止指令');
+    enqueueActionTask(message);
+    return;
+  }
+  if (rejectBlockedAction(actionBlockStatus, message, reply)) return;
+  const validation = validateActionState(message, {
+    sessionId,
+    revision: stateRevision,
+    ready: ordinaryActionReady(allowedDuringWaterEscape(message.tool)),
+    reason: !botReady || !bot?.entity
+      ? 'Minecraft 世界尚未完成生命周期确认'
+      : executor.safetyActive
+        ? '本地安全动作正在执行，普通动作暂不接收'
+        : 'Bridge 尚未准备好接收普通动作',
+  });
+  if (validation) {
+    reply(message, false, validation.detail, validation.status, validation.data);
+    return;
+  }
+  stopResidentMovement();
+  enqueueActionTask(message);
 }
 
-async function pumpActions() {
-  if (actionRunning) return;
-  actionRunning = true;
-  try {
-    while (actionQueue.length > 0) {
-      const message = actionQueue.shift();
-      await runAction(message);
-    }
-  } finally {
-    actionRunning = false;
+function enqueueActionTask(message) {
+  const actionId = String(message.action_id || `action-${randomUUID()}`);
+  message.action_id = actionId;
+  const result = executor.enqueue({
+    id: actionId,
+    tool: message.tool,
+    priority: actionPriority(message),
+    kind: SAFETY_REFLEX_SKILLS.has(message.tool) ? 'safety' : 'action',
+    cancellable: metaForAction(message)?.cancellable !== false,
+    deadlineAt: Date.now() + Math.min(Math.max(Number(message.timeout_s) || 120, 5), 300) * 1000,
+    onCancel: (reason, status, token) => cancelActiveWorldWork(reason, status, token),
+    run: (token) => runAction(message, token),
+    onResult: (outcome) => reply(
+      message,
+      outcome.status === 'succeeded',
+      outcome.detail || '',
+      outcome.status,
+      outcome.data || {},
+    ),
+  });
+  if (result.duplicate) {
+    sendActionStatus(actionId);
+    return false;
   }
+  if (!result.accepted) {
+    reply(message, false, result.record.detail || result.record.status, result.record.status);
+    return false;
+  }
+  return true;
+}
+
+function sendActionStatus(actionId) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  const record = executor.status(actionId);
+  const status = record?.status || 'unknown';
+  socket.send(JSON.stringify({
+    type: 'action_status_result',
+    action_id: String(actionId || ''),
+    status,
+    detail: record?.detail || '',
+    data: record?.data ? { ...record.data } : {},
+  }));
 }
 
 // 技能模块上下文：把桥接内部已有的能力按稳定接口暴露出去。
 // 每次动作都重新构造，保证 bot 重连后拿到的是最新实例。
-function buildSkillContext(runSkill) {
+function buildSkillContext(runSkill, token = null, actionMessage = null) {
   return {
     bot,
     log,
@@ -464,29 +546,37 @@ function buildSkillContext(runSkill) {
     travelTo,
     travelToBlock,
     walkOnce,
+    exploreResource,
     collectDrops,
     nearbyHostiles,
     countItem,
-    syncInventory,
+    syncInventory: (window) => syncInventory(window, token),
+    syncWindow: (window, timeoutMs) => syncWindow(window, timeoutMs, token),
     nearbyBlock,
     equipToolFor,
     equipWeapon,
     breakBlock,
     placeBlock,
     placeBlockWithFacing,
+    placeBedAt: (target, name) => placeBedAt(bot, target, name, {
+      createVector: (x, y, z) => vec(x, y, z),
+      wait: sleep,
+      moveTo: ({ x, y, z }) => travelTo(x + 0.5, y, z + 0.5, 0),
+      token,
+    }),
     pickupItems,
     placeInventoryBlock,
     placeCraftingTable,
     recoverPlacedTable,
-    clickWindowSlot,
-    craftWithWindow,
+    clickWindowSlot: (window, slot, mouseButton, mode) => clickWindowSlot(window, slot, mouseButton, mode, token),
+    craftWithWindow: (recipe, window, width, height, times) => craftWithWindow(recipe, window, width, height, times, token),
     pickRecipe,
     materialsShortage,
     recipeRequirements,
     missingMaterials,
     findFuelItem,
-    craftItem,
-    smeltItem,
+    craftItem: (args) => craftItem(args, token),
+    smeltItem: (args) => smeltItem(args, token),
     findFoodForEating,
     findFood,
     eatFood,
@@ -515,13 +605,29 @@ function buildSkillContext(runSkill) {
     isNearDanger,
     escapeEnvironment,
     blockIsWater,
-    findShore,
-    swimToShore,
+    swimToShore: (reason, timeoutMs, radius) => swimToShore(reason, token, timeoutMs, radius),
     describeEntity,
     runSkill,
+    reportProgress(phase, detail, progress, data = {}) {
+      if (token) token.progressData = { ...data, phase, progress };
+      if (actionMessage) sendProgress(actionMessage, phase, detail, progress, data);
+    },
+    rememberShelter(shelter) {
+      return rememberRequestedShelter(shelter);
+    },
+    getRememberedShelter() {
+      return rememberedShelter?.dimension === String(bot.game?.dimension || '') ? rememberedShelter : null;
+    },
+    getResourceSites() {
+      const shelter = rememberedShelter?.dimension === String(bot.game?.dimension || '') ? rememberedShelter : null;
+      return inspectResourceSites(bot, shelter);
+    },
     INDEPENDENT,
     get interrupted() {
-      return interrupted;
+      return Boolean(token?.cancelled || interrupted);
+    },
+    get actionToken() {
+      return token;
     },
     get registry() {
       return bot.registry;
@@ -529,50 +635,42 @@ function buildSkillContext(runSkill) {
   };
 }
 
-async function runAction(message) {
+async function runAction(message, token) {
+  if (waterEscapeRequired && !allowedDuringWaterEscape(message.tool)) {
+    return { status: 'blocked', detail: '水中呼吸尚未恢复，普通动作暂不执行' };
+  }
   if (!bot || !bot.entity) {
-    reply(message, false, 'bot 尚未进入世界', 'blocked');
-    return;
+    return { status: actionBlockStatus || 'blocked', detail: 'bot 尚未进入世界' };
+  }
+  if (message.tool !== 'follow_player' && bot.pathfinder) {
+    stopPathfinding();
   }
   const args = message.arguments || {};
   interrupted = false;
-  cancelReason = '';
-  currentInterruptStatus = '';
   currentTool = message.tool;
   currentActionId = message.action_id || '';
-  currentActionPriority = actionPriority(message);
-  currentCancellable = Boolean(metaForAction(message)?.cancellable);
+  currentGoalId = String(message.goal_id || '');
   actionBusy = true;
   lastActivity = Date.now();
   const timeoutMs = Math.min(Math.max(Number(message.timeout_s) || 120, 5), 300) * 1000;
-  let timedOut = false;
   const deadline = setTimeout(() => {
     log('动作超时', message.tool, `${Math.round(timeoutMs / 1000)}s`);
-    timedOut = true;
-    interrupted = true;
-    currentInterruptStatus = 'failed';
-    if (bot) {
-      bot.pathfinder.stop();
-      bot.stopDigging();
-      bot.clearControlStates();
-    }
+    executor.cancel(message.action_id, `动作超时（${Math.round(timeoutMs / 1000)}s）`, 'failed');
   }, timeoutMs);
   if (progressEnabled(message.tool)) {
     sendProgress(message, 'running', `开始执行 ${actionLabel(message.tool)}`, 0);
   }
   let outcomeStatus = 'succeeded';
   let outcomeData = {};
+  let outcomeDetail = '';
+  let result = null;
   try {
-    if (
-      ['goto', 'come_to_player', 'collect_blocks', 'attack_nearest', 'attack_target', 'stop', 'break_block', 'place_block', 'goto_block', 'pickup_items', 'craft', 'smelt', 'eat', 'sleep'].includes(
-        message.tool
-      )
-    ) {
-      if (followSession) stopFollow();
-      if (wanderActive) {
-        wanderToken += 1;
-        wanderActive = false;
-        bot.pathfinder.stop();
+    if (temporaryCraftingTable && shouldRecoverTemporaryTable(message.tool) && !token?.cancelled) {
+      const ownedTable = ownedTableNearby(bot, temporaryCraftingTable);
+      if (ownedTable) {
+        await recoverPlacedTable(ownedTable);
+        if (token?.cancelled) throw new Error(token.cancelReason || '动作已取消');
+        if (bot.blockAt(temporaryCraftingTable.position)?.name !== 'crafting_table') temporaryCraftingTable = null;
       }
     }
     let detail = '';
@@ -589,8 +687,8 @@ async function runAction(message) {
         if (INDEPENDENT) throw new Error('独立模式不跟随玩家');
         const player = resolvePlayer(args.player);
         const distance = Math.min(Math.max(Number(args.distance) || 2, 1), 6);
-        startFollow(player, distance);
-        detail = `正在跟随 ${player.username}，保持 ${distance} 格`;
+        await runFollow(player, distance, token);
+        detail = `已停止跟随 ${player.username}`;
         break;
       }
       case 'come_to_player': {
@@ -611,6 +709,10 @@ async function runAction(message) {
         break;
       }
       case 'observe':
+        if (args.shelter) rememberRequestedShelter(args.shelter);
+        if (args.shelter_position) {
+          rememberRequestedShelter({ position: args.shelter_position, size: args.shelter_size });
+        }
         detail = observeSurroundings(args);
         break;
       case 'eat':
@@ -620,43 +722,18 @@ async function runAction(message) {
         const range = Math.min(Math.max(Number(args.range) || 16, 3), 32);
         const target = findHostile(range);
         if (!target) throw new Error(`附近 ${range} 格内没有敌对生物`);
-        if (target.name === 'creeper') {
-          await retreatFrom(target);
-          detail = '苦力怕太近，先退到安全距离';
-          break;
-        }
-        detail = await attackEntity(target);
+        detail = await attackEntity(target, { allowTargetSwitch: true, encounterRadius: Math.max(16, range) });
         break;
       }
       case 'attack_target': {
         const target = findAttackTarget(args);
         if (!target) throw new Error('没有找到符合条件的实体');
         if (target.type === 'player') throw new Error('不攻击玩家');
-        if (target.name === 'creeper') {
-          await retreatFrom(target);
-          detail = '苦力怕太近，先退到安全距离';
-          break;
-        }
         detail = await attackEntity(target);
         break;
       }
       case 'goto':
         detail = await goTo(Number(args.x), Number(args.y), Number(args.z));
-        break;
-      case 'collect_blocks':
-        detail = await collectBlocks(
-          String(args.block),
-          Number(args.count || 1),
-          Number(args.range) || 32,
-          (gained, total, label) => {
-            sendProgress(
-              message,
-              'running',
-              `已采集 ${gained}/${total} ${label}`,
-              total > 0 ? gained / total : 0
-            );
-          }
-        );
         break;
       case 'break_block':
         detail = await breakBlock(args);
@@ -689,16 +766,20 @@ async function runAction(message) {
         detail = '已看向玩家';
         break;
       }
-      case 'sleep':
-        detail = await sleepInBed();
+      case 'sleep': {
+        const result = await sleepInBed();
+        detail = result.detail;
         break;
+      }
+      case 'collect_blocks':
       default: {
-        const skill = skillRegistry[message.tool];
+        const skillId = message.tool === 'collect_blocks' ? 'mine_collect' : message.tool;
+        const skill = skillRegistry[skillId];
         if (!skill) throw new Error(`未知动作 ${message.tool}`);
         const skillInvoker = createSkillInvoker(
           skillRegistry,
-          (runSkill) => buildSkillContext(runSkill),
-          [message.tool],
+          (runSkill) => buildSkillContext(runSkill, token, message),
+          [skillId],
         );
         const outcome = await skill.handler(args, skillInvoker.context);
         detail = outcome && outcome.detail ? outcome.detail : '已完成';
@@ -706,52 +787,37 @@ async function runAction(message) {
         outcomeData = outcome && outcome.data && typeof outcome.data === 'object'
           ? outcome.data
           : {};
+        outcomeData = { ...(token.progressData || {}), ...outcomeData };
+        if (outcomeData.shelter) rememberRequestedShelter(outcomeData.shelter);
         outcomeStatus = FINAL_ACTION_STATUSES.has(reportedStatus)
           ? reportedStatus
           : 'failed';
         break;
       }
     }
-    if (currentInterruptStatus) {
-      reply(message, false, cancelReason || 'Action interrupted', currentInterruptStatus);
-    } else if (cancelReason) {
-      reply(message, false, `已取消：${cancelReason}`, 'cancelled');
-    } else if (timedOut) {
-      reply(message, false, `动作超时（${Math.round(timeoutMs / 1000)}s）`, 'failed');
-    } else {
-      reply(
-        message,
-        outcomeStatus === 'succeeded',
-        detail,
-        outcomeStatus,
-        outcomeData
-      );
-    }
+    outcomeDetail = detail;
+    result = { status: outcomeStatus, detail: outcomeDetail, data: outcomeData };
   } catch (error) {
-    if (currentInterruptStatus) {
-      reply(message, false, cancelReason || error.message, currentInterruptStatus);
-    } else if (cancelReason) {
-      reply(message, false, `已取消：${cancelReason}`, 'cancelled');
-    } else if (timedOut) {
-      reply(message, false, `动作超时（${Math.round(timeoutMs / 1000)}s）`, 'failed');
-    } else {
-      reply(message, false, error.message, statusForError(error));
-    }
+    result = {
+      status: statusForError(error),
+      detail: error.message || String(error),
+      data: mergeActionErrorData(error, token.progressData || {}, outcomeData),
+    };
   } finally {
     clearTimeout(deadline);
     actionBusy = false;
     currentTool = '';
     currentActionId = '';
+    currentGoalId = '';
     interrupted = false;
-    cancelReason = '';
-    currentInterruptStatus = '';
     lastActivity = Date.now();
     finishRespawnIfIdle();
   }
+  return result || { status: 'failed', detail: '动作未返回结果', data: outcomeData };
 }
 
 function finishRespawnIfIdle() {
-  if (!deathPending || !respawnReady || actionBusy || !bot?.entity) return;
+  if (!deathPending || !respawnReady || !terrainReady || executor.active || !bot?.entity) return;
   if (!queueLifecycleEvent('respawn')) return;
   deathPending = false;
   respawnReady = false;
@@ -760,6 +826,7 @@ function finishRespawnIfIdle() {
 // 把异常映射成结构化状态：取消、部分完成、被环境阻塞、失败。
 function statusForError(error) {
   const text = String((error && error.message) || error || '');
+  if (['UNKNOWN_WINDOW_STATE', 'UNKNOWN_TERRAIN'].includes(error?.code)) return 'unknown';
   if (text.includes('还差') || text.includes('只拿到')) return 'partial';
   if (text.includes('断开') || text.includes('连接结束')) return 'disconnected';
   if (text.includes('打断') || text.includes('取消')) return 'cancelled';
@@ -768,21 +835,17 @@ function statusForError(error) {
 }
 
 function reply(message, ok, detail, status, data = {}) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  // 先把动作后的世界状态推给 Core，再回结果；否则 TaskRunner 可能拿到 5 秒前的旧背包。
-  sendState();
   const finalStatus = status || (ok ? 'succeeded' : 'failed');
-  socket.send(
-    JSON.stringify({
-      type: 'action_result',
-      action_id: message.action_id,
-      skill_id: message.skill_id || message.tool,
-      ok,
-      status: finalStatus,
-      detail: String(detail).slice(0, 500),
-      data,
-    })
-  );
+  const observation = buildStateObservation();
+  const payload = buildActionResult(message, { ok, detail, status: finalStatus, data }, observation);
+  executor.updateRecord(message.action_id, {
+    status: finalStatus,
+    detail: payload.detail,
+    data: payload.data,
+  });
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  if (observation) socket.send(JSON.stringify({ type: 'state', data: observation }));
+  socket.send(JSON.stringify(payload));
   log(ok ? '动作完成' : '动作失败', message.tool, `${finalStatus} ${detail}`);
 }
 
@@ -801,7 +864,7 @@ async function travelTo(x, y, z, radius = 2) {
     const waypointX = Math.floor(position.x + ((x - position.x) / horizontal) * step);
     const waypointZ = Math.floor(position.z + ((z - position.z) / horizontal) * step);
     try {
-      await bot.pathfinder.goto(new goals.GoalXZ(waypointX, waypointZ));
+      await gotoWithDeadline(new goals.GoalXZ(waypointX, waypointZ));
     } catch (error) {
       log('分段寻路失败，改为直接尝试目标', error.message);
       break;
@@ -813,7 +876,7 @@ async function travelTo(x, y, z, radius = 2) {
   for (const goal of attempts) {
     if (interrupted) throw new Error('被新的指令打断');
     try {
-      await bot.pathfinder.goto(goal);
+      await gotoWithDeadline(goal);
       return {
         distance: bot.entity.position.distanceTo(vec(x, y, z)),
         vertical: Math.abs(bot.entity.position.y - y),
@@ -855,8 +918,7 @@ function resetPathfinderGoal() {
 // 超时后必须同时置停止标志并清目标，否则旧 goto 会和新 goto 叠在一起。
 function stopPathfinding() {
   if (!bot || !bot.pathfinder) return;
-  bot.pathfinder.stop();
-  resetPathfinderGoal();
+  stopPathfinderAndClearGoal(bot.pathfinder);
 }
 
 // goto 的错误名见 mineflayer-pathfinder/lib/goto.js：
@@ -868,17 +930,11 @@ function classifyPathFailure(error) {
   return 'unknown';
 }
 
-function withTimeout(promise, ms, message, onTimeout = null) {
-  let timer = null;
-  const expired = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      if (onTimeout) onTimeout();
-      const error = new Error(message);
-      error.name = 'CollectTimeout';
-      reject(error);
-    }, ms);
-  });
-  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+async function gotoWithDeadline(goal, timeoutMs = 30000, message = '寻路超时') {
+  if (!bot?.pathfinder) throw new Error('当前没有寻路能力');
+  const result = await gotoWithTimeout(bot.pathfinder, goal, timeoutMs, message);
+  if (interrupted) throw new Error('被新的指令打断');
+  return result;
 }
 
 // 外部取消的三个来源：新的动作或停止指令、动作超时、与服务器断开。
@@ -967,12 +1023,7 @@ async function collectDrops(range = COLLECT_DROP_RANGE, expectName = '') {
       }
       try {
         resetPathfinderGoal();
-        await withTimeout(
-          bot.pathfinder.goto(new goals.GoalNear(position.x, position.y, position.z, 1)),
-          5000,
-          '走到掉落物超时',
-          stopPathfinding,
-        );
+        await gotoWithDeadline(new goals.GoalNear(position.x, position.y, position.z, 1), 5000, '走到掉落物超时');
       } catch (error) {
         const cancel = externalCancelReason();
         if (cancel) {
@@ -1047,15 +1098,12 @@ async function walkOnce(x, y, z, radius, timeoutMs, horizontalOnly = false) {
   }
   resetPathfinderGoal();
   try {
-    await withTimeout(
-      bot.pathfinder.goto(
-        horizontalOnly
-          ? new goals.GoalNearXZ(x, z, radius)
-          : new goals.GoalNear(x, y, z, radius)
-      ),
+    await gotoWithDeadline(
+      horizontalOnly
+        ? new goals.GoalNearXZ(x, z, radius)
+        : new goals.GoalNear(x, y, z, radius),
       timeoutMs,
       '走到目标超时',
-      stopPathfinding,
     );
     return 'reached';
   } catch (error) {
@@ -1121,119 +1169,6 @@ async function travelToBlock(position, timeoutMs = COLLECT_WALK_TIMEOUT_MS) {
   return 'unreachable';
 }
 
-async function collectBlocks(blockName, count, range = 32, onProgress = null) {
-  const radius = Math.min(Math.max(Number(range) || 32, 8), 64);
-  const blockIds = bot.registry.blocksByName[blockName];
-  if (!blockIds) throw new Error(`未知方块 ${blockName}`);
-  const owned = countItem(blockName);
-  const need = Math.max(0, count - owned);
-  if (need === 0) {
-    return `背包里已经有 ${owned} 个 ${blockLabel(blockName)}，不需要再挖`;
-  }
-  // 世界刚重置时区块还没加载完，直接搜会得到空结果；先等区块再搜。
-  let positions = [];
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    positions = bot.findBlocks({
-      matching: blockIds.id,
-      maxDistance: radius,
-      count: Math.max(need * 4, 8),
-    });
-    if (positions.length > 0) break;
-    log('附近没有目标方块，等区块加载', `${blockLabel(blockName)} ${radius} 格`);
-    try {
-      await Promise.race([
-        bot.waitForChunksToLoad().catch(() => {}),
-        sleep(5000),
-      ]);
-    } catch {
-      // 等待失败就继续轮询
-    }
-    await sleep(1500);
-  }
-  if (positions.length === 0) throw new Error(`附近 ${radius} 格内没有 ${blockLabel(blockName)}`);
-  // 同一棵树的原木按“先树干底、再往上”排序；只走到树根的水平坐标，
-  // 不再用 GoalNear 要求站在原木同一高度（那会让 pathfinder 试图爬树，极慢）。
-  const origin = bot.entity.position;
-  positions.sort((left, right) => {
-    const leftDistance = Math.hypot(left.x - origin.x, left.z - origin.z);
-    const rightDistance = Math.hypot(right.x - origin.x, right.z - origin.z);
-    return leftDistance - rightDistance || left.y - right.y;
-  });
-  let tried = 0;
-  let mined = 0;
-  let lost = 0;
-  let reported = 0;
-  for (const position of positions) {
-    if (interrupted) throw new Error('被新的指令打断');
-    if (countItem(blockName) - owned >= need) break;
-    const target = bot.blockAt(position);
-    if (!target || target.name !== blockName) continue;
-    tried += 1;
-    const distance = bot.entity.position.distanceTo(position);
-    log('采集目标', `${blockName} (${position.x}, ${position.y}, ${position.z}) 距离 ${distance.toFixed(1)}`);
-    if (distance > 4) {
-      const outcome = await travelToBlock(position, COLLECT_WALK_TIMEOUT_MS);
-      if (outcome === 'cancelled') throw new Error('采集被取消：收到新的指令或连接断开');
-      if (outcome === 'low_health') {
-        throw new Error(`血量不足，撤退中止采集（血量 ${bot.health}）`);
-      }
-      if (outcome !== 'reached') continue;
-    }
-    // 走过去了也要重新读一次方块，走的过程中可能已经被别人挖掉。
-    const block = bot.blockAt(position);
-    if (!block || block.name !== blockName) {
-      log('采集目标不见了，换一个', `${blockName} (${position.x}, ${position.y}, ${position.z})`);
-      continue;
-    }
-    if (!bot.canDigBlock(block)) {
-      log('这个原木现在不能挖', `${blockName} (${position.x}, ${position.y}, ${position.z})`);
-      continue;
-    }
-    try {
-      await equipToolFor(block);
-      await bot.dig(block);
-      mined += 1;
-    } catch (error) {
-      log('挖原木失败', error.message);
-      continue;
-    }
-    // 掉落物实体要等服务器下一 tick 才生成，collectDrops 会等到它出现再捡。
-    const drops = await collectDrops(COLLECT_DROP_RANGE, blockName);
-    const picked = drops.picked[blockName] || 0;
-    if (picked > 0) {
-      log('捡到掉落物', `${blockLabel(blockName)} x${picked}`);
-    } else {
-      lost += 1;
-      log(
-        '掉落物没捡到',
-        blockLabel(blockName),
-        drops.missed.length > 0 ? `丢失 ${drops.missed.join('、')}` : '附近没有掉落物实体'
-      );
-    }
-    // 只有真的采到手才汇报进度，避免把挖到但没捡到的东西算进去。
-    const collected = countItem(blockName) - owned;
-    if (onProgress && collected > reported) {
-      reported = collected;
-      onProgress(collected, need, blockLabel(blockName));
-    }
-  }
-  if (countItem(blockName) - owned < need) {
-    // 最后再扫一遍地上还剩下的掉落物。
-    await collectDrops(COLLECT_DROP_RANGE, blockName);
-  }
-  const gained = countItem(blockName) - owned;
-  if (gained <= 0) {
-    const detail = mined > 0 ? `，挖了 ${mined} 个但掉落物没捡到` : '';
-    throw new Error(`试了 ${tried} 个目标，没有捡到 ${blockLabel(blockName)}${detail}`);
-  }
-  if (gained < need) {
-    throw new Error(
-      `只拿到 ${gained} 个 ${blockLabel(blockName)}，还差 ${need - gained} 个（挖了 ${mined} 个，丢了 ${lost} 个掉落物）`
-    );
-  }
-  return `获得 ${gained} 个 ${blockLabel(blockName)}，背包共 ${countItem(blockName)} 个`;
-}
-
 async function equipToolFor(block) {
   if (!bot.tool || typeof bot.tool.equipForBlock !== 'function') return;
   try {
@@ -1256,7 +1191,7 @@ async function breakBlock(args) {
   const block = bot.blockAt(position);
   if (!block || block.name === 'air') throw new Error('目标位置没有方块');
   if (bot.entity.position.distanceTo(position) > 4) {
-    await bot.pathfinder.goto(new goals.GoalNear(position.x, position.y, position.z, 1));
+    await gotoWithDeadline(new goals.GoalNear(position.x, position.y, position.z, 1));
   }
   await equipToolFor(block);
   if (!bot.canDigBlock(block)) throw new Error(`现在不能挖 ${blockLabel(block.name)}`);
@@ -1270,10 +1205,22 @@ async function placeBlock(args) {
   const target = vec(args.x, args.y, args.z);
   const existing = bot.blockAt(target);
   if (existing && existing.boundingBox !== 'empty') throw new Error('目标位置已经有方块');
+  if (/_bed$/.test(name)) {
+    if (bot.entity.position.distanceTo(target) > 4) {
+      await gotoWithDeadline(new goals.GoalNear(target.x, target.y, target.z, 2));
+    }
+    const placed = await placeBedAt(bot, target, name, {
+      createVector: (x, y, z) => vec(x, y, z),
+      wait: sleep,
+      moveTo: ({ x, y, z }) => travelTo(x + 0.5, y, z + 0.5, 0),
+      token: executor.active?.token,
+    });
+    return `放置床于 (${placed.foot.x}, ${placed.foot.y}, ${placed.foot.z})，床头在 (${placed.head.x}, ${placed.head.y}, ${placed.head.z})`;
+  }
   const item = bot.inventory.items().find((entry) => entry.name === name);
   if (!item) throw new Error(`背包里没有 ${blockLabel(name)}`);
   if (bot.entity.position.distanceTo(target) > 4) {
-    await bot.pathfinder.goto(new goals.GoalNear(target.x, target.y, target.z, 2));
+    await gotoWithDeadline(new goals.GoalNear(target.x, target.y, target.z, 2));
   }
   await bot.equip(item, 'hand');
   const faces = [
@@ -1312,7 +1259,7 @@ async function placeBlockWithFacing(name, target, yaw) {
   const item = bot.inventory.items().find((entry) => entry.name === name);
   if (!item) throw new Error(`背包里没有 ${blockLabel(name)}`);
   if (bot.entity.position.distanceTo(target) > 4) {
-    await bot.pathfinder.goto(new goals.GoalNear(target.x, target.y, target.z, 2));
+    await gotoWithDeadline(new goals.GoalNear(target.x, target.y, target.z, 2));
   }
   const support = bot.blockAt(target.offset(0, -1, 0));
   if (!support || support.boundingBox !== 'block') {
@@ -1323,7 +1270,11 @@ async function placeBlockWithFacing(name, target, yaw) {
     await bot.look(yaw, 0, true);
     await sleep(120);
   }
-  await bot.placeBlock(support, vec(0, 1, 0));
+  if (typeof bot._placeBlockWithOptions === 'function') {
+    await bot._placeBlockWithOptions(support, vec(0, 1, 0), { swingArm: 'right', forceLook: 'ignore' });
+  } else {
+    await bot.placeBlock(support, vec(0, 1, 0));
+  }
   for (let attempt = 0; attempt < 10; attempt += 1) {
     const placed = bot.blockAt(target);
     if (placed && placed.name === name) {
@@ -1355,7 +1306,7 @@ async function pickupItems(args) {
   const dropped = item.getDroppedItem ? item.getDroppedItem() : null;
   const name = dropped?.name || '';
   const before = name ? countItem(name) : 0;
-  await bot.pathfinder.goto(
+  await gotoWithDeadline(
     new goals.GoalNear(item.position.x, item.position.y, item.position.z, 1)
   );
   await sleep(500);
@@ -1373,14 +1324,19 @@ function countItem(name) {
     .reduce((total, item) => total + item.count, 0);
 }
 
-async function syncInventory(window = bot?.currentWindow || bot?.inventory) {
+async function syncInventory(window = bot?.currentWindow || bot?.inventory, token = executor.active?.token) {
   // mineflayer 在合成/快速拾取后偶尔会漏掉 set_slot，主动要一次完整背包。
-  if (!bot || typeof bot._syncWindow !== 'function') return;
-  // 服务器不回应时不能卡 20 秒；正常时 1 秒内就能拿到完整背包。
-  await Promise.race([
-    bot._syncWindow(window).catch(() => {}),
-    sleep(1000),
-  ]);
+  await syncWindow(window, 2000, token);
+}
+
+async function syncWindow(window = bot?.currentWindow || bot?.inventory, timeoutMs = 2000, token = executor.active?.token) {
+  if (!bot || !window) return true;
+  const synchronized = await syncWindowWithLease(bot, window, token, toNotchSlot, timeoutMs);
+  if (synchronized) return true;
+  if (token?.cancelled) throw new Error(token.cancelReason || '容器同步被取消');
+  const error = new Error(`窗口 ${window.id} 同步超时，容器状态未知`);
+  error.code = 'UNKNOWN_WINDOW_STATE';
+  throw error;
 }
 
 function nearbyBlock(name, range) {
@@ -1394,8 +1350,6 @@ function nearbyBlock(name, range) {
 const CRAFT_CLICK_GAP = 80;
 // 等服务端算出产物的时间上限。
 const CRAFT_RESULT_TIMEOUT = 5000;
-// 让服务端重发窗口状态的时间上限。
-const CRAFT_SYNC_TIMEOUT = 2000;
 
 // bot.recipesAll 的第三个参数只当作「有没有工作台」的真假标记：
 // 传 null 只列出 2×2 背包格能做的配方，传真值才会把需要工作台的配方也列出来。
@@ -1497,117 +1451,124 @@ function toNotchSlot(item) {
 // once 的默认超时是 20000 毫秒（lib/promise_utils.js），所以摆第一个材料就会卡满 20 秒。
 // 这里改成自己发包、自己跟踪窗口状态：本地按 prismarine-windows 的规则推演这次点击，
 // 把要上报的槽位变化和鼠标物品一起发给服务端，之后只按固定间隔等待。
-async function clickWindowSlot(window, slot, mouseButton, mode) {
-  const click = {
+function assertActionToken(token, cleanup = false) {
+  if (cleanup) {
+    if (token?.cleanupDeadlineAt && Date.now() >= token.cleanupDeadlineAt) {
+      throw new Error('合成窗口清理超过时间上限');
+    }
+    return;
+  }
+  if (token?.cancelled) throw new Error(token.cancelReason || '合成动作被取消');
+}
+
+async function clickWindowSlot(window, slot, mouseButton, mode, token = executor.active?.token, cleanup = false) {
+  await writeWindowClickWithLease(bot, window, {
     slot,
     mouseButton,
     mode,
-    item: slot === -999 ? null : window.slots[slot] ?? null,
-  };
-  const changed = window.acceptClick(click) || [];
-  const changedSlots = changed.map((location) => ({
-    location,
-    item: toNotchSlot(window.slots[location]),
-  }));
-  bot._client.write('window_click', {
-    windowId: window.id,
     stateId: craftStateId,
-    slot,
-    mouseButton,
-    mode,
-    changedSlots,
-    cursorItem: toNotchSlot(window.selectedItem),
+    toNotchSlot,
+    token,
+    cleanup,
+    wait: () => sleep(CRAFT_CLICK_GAP),
   });
-  await sleep(CRAFT_CLICK_GAP);
 }
 
 // 让服务端把整个窗口重发一遍：既刷新本地模型，也拿到最新的状态编号。
-async function refreshWindowState(window, timeoutMs = CRAFT_SYNC_TIMEOUT) {
-  if (!bot || typeof bot._syncWindow !== 'function') return;
-  await Promise.race([
-    bot._syncWindow(window).catch(() => {}),
-    sleep(timeoutMs),
-  ]);
+async function refreshWindowState(window, token = executor.active?.token) {
+  await syncWindow(window, 2000, token);
 }
 
 // 把合成格清空：先拿起格里的东西，再放进背包空位，材料不会被弄丢。
-async function clearCraftGrid(window, width, height) {
+async function clearCraftGrid(window, width, height, token) {
+  assertActionToken(token);
   for (let gridSlot = 1; gridSlot <= width * height; gridSlot += 1) {
+    assertActionToken(token);
     if (!window.slots[gridSlot]) continue;
-    await clickWindowSlot(window, gridSlot, 0, 0);
+    await clickWindowSlot(window, gridSlot, 0, 0, token);
     const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
     if (empty === null) throw new Error('背包满了，无法清空合成格');
-    await clickWindowSlot(window, empty, 0, 0);
+    await clickWindowSlot(window, empty, 0, 0, token);
   }
 }
 
 // 按配方把材料摆进合成格：一次拿一叠，右键一个一个放进去，剩下的放回背包。
-async function placeIngredient(window, ingredient, destSlot) {
+async function placeIngredient(window, ingredient, destSlot, token) {
   const need = Math.max(1, Number(ingredient.count) || 1);
   let placed = 0;
   while (placed < need) {
+    assertActionToken(token);
     const source = window.findInventoryItem(ingredient.id, ingredient.metadata ?? null);
     if (!source) {
       throw new Error(
         `材料不够，还缺 ${need - placed} 个 ${itemLabelById(ingredient.id)}`
       );
     }
-    await clickWindowSlot(window, source.slot, 0, 0);
+    await clickWindowSlot(window, source.slot, 0, 0, token);
     const held = window.selectedItem;
     if (!held) throw new Error(`材料 ${itemLabelById(ingredient.id)} 拿不到手上`);
     const take = Math.min(need - placed, held.count);
     for (let index = 0; index < take; index += 1) {
-      await clickWindowSlot(window, destSlot, 1, 0);
+      assertActionToken(token);
+      await clickWindowSlot(window, destSlot, 1, 0, token);
     }
     placed += take;
     if (window.selectedItem) {
       const back = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
       if (back === null) throw new Error('背包满了，无法放回剩余材料');
-      await clickWindowSlot(window, back, 0, 0);
+      await clickWindowSlot(window, back, 0, 0, token);
     }
   }
 }
 
 // 等服务端算出产物：结果槽位的内容只有服务端会下发，本地推演算不出来。
-async function waitForCraftResult(window, expectedId, timeoutMs) {
+async function waitForCraftResult(window, expectedId, timeoutMs, token) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    assertActionToken(token);
     const output = window.slots[0];
     if (output && (expectedId == null || output.type === expectedId)) return output;
     await sleep(100);
   }
+  assertActionToken(token);
   return null;
 }
 
 // 取走产物：先点结果槽把产物拿到鼠标上，再放进背包空位。
-async function takeCraftResult(window) {
+async function takeCraftResult(window, token) {
+  assertActionToken(token);
   const output = window.slots[0];
   if (!output) return null;
-  await clickWindowSlot(window, window.craftingResultSlot, 0, 0);
+  await clickWindowSlot(window, window.craftingResultSlot, 0, 0, token);
   const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
   if (empty === null) throw new Error('背包满了，无法取走产物');
-  await clickWindowSlot(window, empty, 0, 0);
+  await clickWindowSlot(window, empty, 0, 0, token);
   return output;
 }
 
 // 失败时把鼠标上的东西和合成格里的东西退回背包，别让材料卡在窗口里。
-async function restoreCraftWindow(window, width, height) {
+async function restoreCraftWindow(window, width, height, token, { cursorOnly = false } = {}) {
+  assertActionToken(token, true);
   if (window.selectedItem) {
     const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
-    if (empty !== null) await clickWindowSlot(window, empty, 0, 0);
+    if (empty === null) throw new Error('合成取消后背包没有空位归还手持物品');
+    await clickWindowSlot(window, empty, 0, 0, token, true);
   }
+  if (cursorOnly) return;
   for (let gridSlot = 1; gridSlot <= width * height; gridSlot += 1) {
+    assertActionToken(token, true);
     if (!window.slots[gridSlot]) continue;
-    await clickWindowSlot(window, gridSlot, 0, 0);
+    await clickWindowSlot(window, gridSlot, 0, 0, token, true);
     const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
-    if (empty === null) return;
-    await clickWindowSlot(window, empty, 0, 0);
+    if (empty === null) throw new Error('合成取消后背包没有空位归还合成材料');
+    await clickWindowSlot(window, empty, 0, 0, token, true);
   }
 }
 
-async function craftWithWindow(recipe, window, width, height, times) {
+async function craftWithWindow(recipe, window, width, height, times, token = executor.active?.token) {
   // 自己点合成格：mineflayer 的 bot.craft 在 1.21.1 上偶尔只点第一排材料就取产物。
   for (let round = 0; round < times; round += 1) {
+    assertActionToken(token);
     const inventorySlots = window.slots
       .slice(window.inventoryStart, window.inventoryEnd)
       .filter(Boolean);
@@ -1615,80 +1576,138 @@ async function craftWithWindow(recipe, window, width, height, times) {
       throw new Error('合成窗口里看不到背包内容');
     }
     try {
-      await clearCraftGrid(window, width, height);
+      await clearCraftGrid(window, width, height, token);
       if (recipe.inShape) {
         for (let y = 0; y < recipe.inShape.length; y += 1) {
           const row = recipe.inShape[y];
           for (let x = 0; x < row.length; x += 1) {
             const ingredient = row[x];
             if (!ingredient || ingredient.id === -1) continue;
-            await placeIngredient(window, ingredient, 1 + x + width * y);
+            await placeIngredient(window, ingredient, 1 + x + width * y, token);
           }
         }
       } else if (recipe.ingredients) {
         let gridSlot = 1;
         for (const ingredient of recipe.ingredients) {
-          await placeIngredient(window, ingredient, gridSlot);
+          await placeIngredient(window, ingredient, gridSlot, token);
           gridSlot += 1;
         }
       } else {
         throw new Error('不认识的合成配方');
       }
-      const output = await waitForCraftResult(window, recipe.result?.id, CRAFT_RESULT_TIMEOUT);
+      const output = await waitForCraftResult(window, recipe.result?.id, CRAFT_RESULT_TIMEOUT, token);
       if (!output) throw new Error('合成格摆好后没有产物');
-      await takeCraftResult(window);
+      await takeCraftResult(window, token);
       log('合成产出', `${output.name}x${output.count}`);
       // 产物被取走后材料会被服务端消耗掉，本地模型要同步清空合成格。
       for (let gridSlot = 1; gridSlot <= width * height; gridSlot += 1) {
         window.updateSlot(gridSlot, null);
       }
     } catch (error) {
-      await restoreCraftWindow(window, width, height);
+      if (['dead', 'disconnected'].includes(token?.cancelStatus)) throw error;
+      if (isUrgentSafetyPreemption(token)) {
+        const cleanup = await cleanupCraftWindowForSafety({
+          token,
+          window,
+          inventoryWindow: bot.inventory,
+          restoreCursor: () => restoreCraftWindow(window, width, height, token, { cursorOnly: true }),
+          closeContainer: () => bot.closeWindow(window),
+          synchronize: async (targetWindow, timeoutMs) => {
+            const cleanupToken = { cancelled: false, cancelHooks: new Set() };
+            return syncWindowWithLease(bot, targetWindow, cleanupToken, toNotchSlot, timeoutMs);
+          },
+        });
+        if (cleanup.handled) {
+          token.progressData = {
+            ...(token.progressData || {}),
+            phase: 'safety_craft_cleanup',
+            window_cleanup: cleanup.mode,
+            crafting_grid_residue: cleanup.mode === 'cursor_only'
+              ? window.slots.slice(1, window.craftingResultSlot).filter(Boolean).map((item) => ({ name: item.name, count: item.count }))
+              : [],
+          };
+          throw error;
+        }
+      }
+      try {
+        if (token) token.cleanupDeadlineAt = Date.now() + 5000;
+        await restoreCraftWindow(window, width, height, token);
+        const cleanupToken = { cancelled: false, cancelHooks: new Set() };
+        const synchronized = await syncWindowWithLease(bot, window, cleanupToken, toNotchSlot, 2000);
+        if (!synchronized) throw new Error('合成窗口清理后的状态同步超时');
+      } catch (cleanupError) {
+        const unknown = new Error(`合成已停止，但窗口清理状态未知：${cleanupError.message}`);
+        unknown.code = 'UNKNOWN_WINDOW_STATE';
+        if (token?.cancelled) {
+          token.cancelStatus = 'unknown';
+          token.cancelReason = unknown.message;
+          token.progressData = { ...(token.progressData || {}), phase: 'window_cleanup_unknown', window_state_unknown: true };
+        } else {
+          throw unknown;
+        }
+      } finally {
+        if (token) delete token.cleanupDeadlineAt;
+      }
       throw error;
     }
   }
-  await refreshWindowState(window);
+  await refreshWindowState(window, token);
 }
 
 async function placeInventoryBlock(name, label, searchRadius = 1) {
   const base = bot.entity.position;
-  const offsets = placementOffsets(searchRadius);
-  const heights = placementHeightOffsets();
-  let supported = 0;
+  const scan = inspectSupportedPlacementTargets({
+    base,
+    searchRadius,
+    getBlock: ({ x, y, z }) => bot.blockAt(vec(x, y, z)),
+  });
+  const spots = scan.targets;
+  const supported = spots.length;
   let openSpots = 0;
-  for (const [dx, dz] of offsets) {
-    const x = Math.floor(base.x) + dx;
-    const z = Math.floor(base.z) + dz;
-    for (const dy of heights) {
-      const ground = bot.blockAt(vec(x, Math.floor(base.y) + dy, z));
-      if (!ground || ground.boundingBox !== 'block') continue;
-      const above = bot.blockAt(ground.position.offset(0, 1, 0));
-      const above2 = bot.blockAt(ground.position.offset(0, 2, 0));
-      if (above?.boundingBox === 'empty' && above2?.boundingBox === 'empty') {
-        supported += 1;
-        const target = above.position;
-        try {
-          const distance = bot.entity.position.distanceTo(target);
-          if (distance > 4) await travelTo(target.x, target.y, target.z, 2);
-          if (interrupted) throw new Error('被新的指令打断');
-          openSpots += 1;
-          await placeBlock({ block: name, x: target.x, y: target.y, z: target.z });
-          const placed = bot.blockAt(target);
-          if (placed?.name === name) return placed;
-          log('放置后没看到方块', `${label} (${target.x}, ${target.y}, ${target.z})`);
-        } catch (error) {
-          if (interrupted) throw error;
-          log('这个位置放不下', `${label} (${target.x}, ${target.y}, ${target.z}): ${error.message}`);
-        }
-      }
+  for (const { target } of spots) {
+    const targetPosition = vec(target.x, target.y, target.z);
+    try {
+      const distance = bot.entity.position.distanceTo(targetPosition);
+      if (distance > 4) await travelTo(target.x, target.y, target.z, 2);
+      if (interrupted) throw new Error('被新的指令打断');
+      openSpots += 1;
+      await placeBlock({ block: name, x: target.x, y: target.y, z: target.z });
+      const placed = bot.blockAt(targetPosition);
+      if (placed?.name === name) return placed;
+      log('放置后没看到方块', `${label} (${target.x}, ${target.y}, ${target.z})`);
+    } catch (error) {
+      if (interrupted) throw error;
+      log('这个位置放不下', `${label} (${target.x}, ${target.y}, ${target.z}): ${error.message}`);
     }
   }
+  const token = executor.active?.token;
+  const diagnostic = {
+    ...scan.diagnostics,
+    bot_position: { x: base.x, y: base.y, z: base.z },
+    supported_targets: supported,
+    placement_attempts: openSpots,
+  };
+  if (token) {
+    token.progressData = {
+      ...(token.progressData || {}),
+      phase: scan.diagnostics.unknown_count > 0 ? 'placement_terrain_unknown' : 'placement_no_target',
+      placement_diagnostics: diagnostic,
+    };
+  }
+  log('放置点地形诊断', label, JSON.stringify(diagnostic));
   log('放置点搜索失败', label, `半径 ${searchRadius}，有支撑且上方空 ${supported} 个，尝试放置 ${openSpots} 个`);
+  if (scan.diagnostics.unknown_count > 0) {
+    const error = new Error(
+      `放置${label}附近有 ${scan.diagnostics.unknown_count} 个方块状态未知，无法判断有效落点`
+    );
+    error.code = 'UNKNOWN_TERRAIN';
+    throw error;
+  }
   throw new Error(`附近没有地方放${label}`);
 }
 
 async function placeCraftingTable() {
-  return placeInventoryBlock('crafting_table', '工作台');
+  return placeInventoryBlock('crafting_table', '工作台', 4);
 }
 
 async function recoverPlacedTable(table) {
@@ -1764,37 +1783,20 @@ function materialsShortage(item, recipes, count) {
   return parts.join('；');
 }
 
-async function craftItem(args) {
+async function craftItem(args, token = executor.active?.token) {
   const name = String(args.item || '');
   const count = Math.max(1, Math.min(Number(args.count) || 1, 64));
   const item = bot.registry.itemsByName[name];
   if (!item) throw new Error(`未知物品 ${name}`);
   trackCraftStateId();
-  // bot.recipesFor(item.id, null, 1, null) 的第四个参数是工作台：
-  // 传 null 时只有 2×2 背包格能完成的配方会被留下（requiresTable 为真的会被过滤掉），
-  // 所以这里先用它判断这种物品是不是必须借工作台。
-  // 它同时还按「材料够合成一次」过滤，返回空数组也可能是材料不够，
-  // 因此另外用 bot.recipesAll 把候选配方完整列出来，把这两种情况分开。
-  let recipes = bot.recipesFor(item.id, null, 1, null);
-  const packRecipes = bot.recipesAll(item.id, null, null);
+  const recipes = bot.recipesAll(item.id, null, HAS_TABLE);
+  const picked = pickCraftingRecipe(recipes, (candidate) => Boolean(pickRecipe([candidate], count)));
+  if (!picked) throw new Error(materialsShortage(item, recipes, count));
   let table = null;
   let placed = false;
-  let recipe = null;
-  let operations = 1;
-  if (recipes.length === 0) {
-    if (packRecipes.length > 0) {
-      // 2×2 背包格就能做，只是材料不够：直接报缺什么，不消耗任何物品。
-      throw new Error(materialsShortage(item, packRecipes, count));
-    }
-    // 这种物品只能借助工作台。先按工作台配方核对材料，材料不够就不放工作台。
-    const tableRecipes = bot.recipesAll(item.id, null, HAS_TABLE).filter(
-      (entry) => entry.requiresTable
-    );
-    if (tableRecipes.length === 0) throw new Error(`没有 ${blockLabel(name)} 的配方`);
-    const picked = pickRecipe(tableRecipes, count);
-    if (!picked) throw new Error(materialsShortage(item, tableRecipes, count));
-    recipe = picked.recipe;
-    operations = picked.operations;
+  const { recipe, requiresTable } = picked;
+  const operations = pickRecipe([recipe], count).operations;
+  if (requiresTable) {
     // 先找已经放下的工作台；空闲闲逛会把 bot 带离上一轮放下的工作台。
     table = nearbyBlock('crafting_table', 32);
     if (!table) {
@@ -1803,16 +1805,8 @@ async function craftItem(args) {
       }
       table = await placeCraftingTable();
       placed = true;
+      temporaryCraftingTable = { position: table.position.clone(), dimension: String(bot.game?.dimension || '') };
     }
-    recipes = bot.recipesFor(item.id, null, 1, table);
-    if (recipes.length === 0) {
-      throw new Error(`没有 ${blockLabel(name)} 的配方或材料不够`);
-    }
-  } else {
-    const picked = pickRecipe(packRecipes, count);
-    if (!picked) throw new Error(materialsShortage(item, packRecipes, count));
-    recipe = picked.recipe;
-    operations = picked.operations;
   }
   if (table && bot.entity.position.distanceTo(table.position) > 3) {
     await travelTo(table.position.x, table.position.y, table.position.z, 2);
@@ -1829,17 +1823,21 @@ async function craftItem(args) {
     if (table) {
       const window = await bot.openBlock(table);
       try {
-        await craftWithWindow(recipe, window, 3, 3, operations);
+        await craftWithWindow(recipe, window, 3, 3, operations, token);
       } finally {
-        try {
-          await bot.closeWindow(window);
-        } catch {
-          // 关窗失败不影响已取走的产物
+        if (!token?.craftWindowClosed) {
+          try {
+            await bot.closeWindow(window);
+          } catch {
+            // 关窗失败不影响已取走的产物
+          }
         }
-        await sleep(200);
+        if (token) delete token.craftWindowClosed;
+        if (!token?.safetyWindowCleanup) await sleep(200);
+        await syncInventoryAfterWindowClose(token, token?.safetyWindowCleanup ? 300 : 2000);
       }
     } else {
-      await craftWithWindow(recipe, bot.inventory, 2, 2, operations);
+      await craftWithWindow(recipe, bot.inventory, 2, 2, operations, token);
     }
     const after = countItem(name);
     log(
@@ -1866,10 +1864,28 @@ async function craftItem(args) {
     }
     return `合成 ${after - before} 个 ${blockLabel(name)}`;
   } finally {
-    if (placed && table) {
+    if (placed && table && !token?.cancelled && !retainTemporaryTable(currentGoalId)) {
       await recoverPlacedTable(table);
+      if (bot.blockAt(temporaryCraftingTable.position)?.name !== 'crafting_table') temporaryCraftingTable = null;
     }
   }
+}
+
+async function syncInventoryAfterWindowClose(token, timeoutMs = 2000) {
+  if (['dead', 'disconnected'].includes(token?.cancelStatus)) return false;
+  const cleanupToken = { cancelled: false, cancelHooks: new Set() };
+  const synchronized = await syncWindowWithLease(bot, bot.inventory, cleanupToken, toNotchSlot, timeoutMs);
+  if (synchronized) return true;
+  const message = '工作台关闭后背包状态同步超时';
+  if (token?.cancelled) {
+    token.cancelStatus = 'unknown';
+    token.cancelReason = message;
+    token.progressData = { ...(token.progressData || {}), phase: 'window_cleanup_unknown', window_state_unknown: true };
+    return false;
+  }
+  const error = new Error(message);
+  error.code = 'UNKNOWN_WINDOW_STATE';
+  throw error;
 }
 
 const SMELT_OUTPUTS = {
@@ -1888,12 +1904,8 @@ const SMELT_OUTPUTS = {
   potato: 'baked_potato',
 };
 
-function findFuelItem() {
-  for (const name of ['coal', 'charcoal', 'oak_planks', 'birch_planks', 'stick']) {
-    const item = bot.inventory.items().find((entry) => entry.name === name);
-    if (item) return item;
-  }
-  return null;
+function findFuelItem(count = 1, preferred = '') {
+  return selectFuel(bot.inventory.items(), [count], preferred);
 }
 
 async function smeltItem(args) {
@@ -1919,16 +1931,13 @@ async function smeltItem(args) {
   const furnace = await bot.openFurnace(furnaceBlock);
   let furnaceClosed = false;
   try {
-    await furnace.putInput(item.id, null, count);
-    const fuel = findFuelItem();
+    const fuel = findFuelItem(count, String(args.fuel || ''));
     if (!fuel) throw new Error('没有燃料（煤、木炭或木板）');
     const fuelType = inventoryItemType(fuel);
     if (fuelType === null) throw new Error('燃料物品 ID 无效，无法放入熔炉');
-    const fuelCount =
-      fuel.name === 'coal' || fuel.name === 'charcoal'
-        ? Math.max(1, Math.ceil(count / 8))
-        : Math.max(1, Math.ceil(count / 1.5));
-    await furnace.putFuel(fuelType, null, Math.min(fuelCount, fuel.count));
+    const fuelCount = Math.ceil(count / FUEL_BURN[fuel.name]);
+    await furnace.putInput(item.id, null, count);
+    await furnace.putFuel(fuelType, null, fuelCount);
     let waited = 0;
     while (waited < 90 && (furnace.outputItem()?.count || 0) < count) {
       if (interrupted) throw new Error('被新的指令打断');
@@ -2141,21 +2150,15 @@ function nearbyPlayers(radius, limit = 4) {
 }
 
 function nearbyHostiles(radius, limit = 4) {
-  const origin = bot.entity.position;
-  return Object.values(bot.entities)
-    .filter(
-      (entity) =>
-        entity !== bot.entity &&
-        entity.position &&
-        HOSTILE_MOBS.has(entity.name) &&
-        (entity.type === 'hostile' || entity.type === 'mob')
-    )
-    .map((entity) => ({
-      name: blockLabel(entity.name),
-      distance: entity.position.distanceTo(origin),
-    }))
-    .filter((entry) => entry.distance <= radius)
-    .sort((left, right) => left.distance - right.distance)
+  return assessCombatEncounter({
+    entities: bot.entities,
+    origin: bot.entity.position,
+    registry: bot.registry,
+    health: bot.health,
+    radius,
+    equipment: combatEquipment(bot),
+  }).threats
+    .map((entry) => ({ name: blockLabel(entry.name), distance: entry.distance }))
     .slice(0, limit);
 }
 
@@ -2376,8 +2379,7 @@ function sleepErrorText(message) {
 }
 
 function sleepAdvancedTime(beforeTime, beforeDay) {
-  if (bot.time.day !== beforeDay) return true;
-  return Math.abs(Number(bot.time.timeOfDay) - Number(beforeTime)) >= 1000;
+  return timeAdvanced(beforeTime, beforeDay, bot);
 }
 
 async function sleepInBed() {
@@ -2418,62 +2420,101 @@ async function sleepInBed() {
   if (!isSleepTime() && !isThunderstorm()) {
     throw new Error(`走到床边时天已经亮了，现在是 ${clockLabel(bot.time.timeOfDay)}，不能睡觉`);
   }
-  const beforeTime = Number(bot.time.timeOfDay);
-  const beforeDay = bot.time.day;
   try {
     await bot.sleep(bed);
   } catch (error) {
     throw new Error(`没能睡到床上：${sleepErrorText(error.message)}`);
   }
-  if (bot.isSleeping) {
-    return `已经躺在床上睡着了，床在 ${bedPosition}`;
-  }
-  await sleep(500);
-  if (sleepAdvancedTime(beforeTime, beforeDay)) {
-    const now = clockLabel(bot.time.timeOfDay);
-    if (bot.time.isDay) {
-      return `天亮了，现在是第 ${bot.time.day} 天 ${now}，床在 ${bedPosition}`;
-    }
-    return `睡了一会儿，时间到了第 ${bot.time.day} 天 ${now}，床在 ${bedPosition}`;
-  }
-  throw new Error('躺下后没有进入睡眠，可能床被占用或被服务器拒绝');
+  return {
+    detail: bot.isSleeping
+      ? `已经躺在床上睡着了，床在 ${bedPosition}`
+      : `已收到床睡眠确认，正在等世界时间更新，床在 ${bedPosition}`,
+    bedSleepAcknowledged: true,
+  };
 }
 
 async function approach(target) {
   if (!target || !target.position) return;
-  if (bot.entity.position.distanceTo(target.position) <= 3) return;
   try {
-    await withTimeout(
-      bot.pathfinder.goto(
-        new goals.GoalNear(target.position.x, target.position.y, target.position.z, 2)
-      ),
-      10000,
-      '接近目标超时',
-      stopPathfinding
-    );
+    return await approachEntity(bot, target, goals.GoalFollow);
   } catch (error) {
     log('接近目标失败', error.message);
+    return false;
   }
 }
 
 async function retreatFrom(target) {
-  if (!target || !target.position) return;
+  if (!target || !target.position || retreatActive) return false;
+  retreatActive = true;
   const position = bot.entity.position;
-  const dx = position.x - target.position.x;
-  const dz = position.z - target.position.z;
-  const length = Math.hypot(dx, dz) || 1;
-  const x = Math.floor(position.x + (dx / length) * 12);
-  const z = Math.floor(position.z + (dz / length) * 12);
+  const origin = { x: position.x, y: position.y, z: position.z };
+  const encounter = assessCombatEncounter({
+    entities: bot.entities,
+    origin,
+    registry: bot.registry,
+    health: bot.health,
+    radius: 24,
+    currentTarget: target,
+    equipment: combatEquipment(bot),
+  });
+  const threats = [...encounter.threats];
+  if (!threats.some((entry) => entry.entity === target)) {
+    threats.push({
+      entity: target,
+      name: String(target.name || '').toLowerCase(),
+      distance: position.distanceTo(target.position),
+      closing_speed: 0,
+      fusing: false,
+      score: 0,
+    });
+  }
+  const destination = chooseRetreatDestination(origin, threats, { stepDistance: 12 });
+  const safetyBefore = retreatSafetyScore(origin, threats);
+  let movedAway = false;
   try {
-    await Promise.race([
-      bot.pathfinder.goto(new goals.GoalXZ(x, z)),
-      sleep(4000),
-    ]);
+    const trailed = await retreatAlongTrail({
+      trail: retreatTrail.snapshot(bot.game?.dimension),
+      currentPosition: () => bot?.entity?.position,
+      makeGoal: (point) => new goals.GoalNear(point.x, point.y, point.z, 1),
+      gotoWaypoint: (goal, timeout) => gotoWithTimeout(bot.pathfinder, goal, timeout, '沿来路撤退超时'),
+      safetyScore: (point) => retreatSafetyScore(point, threats),
+      isSafe: (point) => {
+        if (executor.active?.token?.cancelled || !bot?.entity) return false;
+        const position = vec(point.x, point.y, point.z);
+        const floor = bot.blockAt(position.offset(0, -1, 0));
+        const feet = bot.blockAt(position);
+        const head = bot.blockAt(position.offset(0, 1, 0));
+        if (!floor || floor.boundingBox !== 'block' || waterLike(floor)
+            || !feet || feet.boundingBox !== 'empty' || waterLike(feet)
+            || !head || head.boundingBox !== 'empty' || waterLike(head)) return false;
+        if (/lava|fire|magma|cactus|campfire|powder_snow|berry_bush/.test(floor.name)) return false;
+        return !threats.some((entry) => entry.entity?.isValid !== false && entry.entity?.position?.distanceTo(position) < 3);
+      },
+      timeoutMs: 3000,
+      maxWaypoints: 4,
+    });
+    if (trailed) {
+      log('已沿来路撤退');
+      return true;
+    }
+    if (!destination || executor.active?.token?.cancelled) return false;
+    await gotoWithTimeout(bot.pathfinder, new goals.GoalXZ(destination.x, destination.z), 4000, '后撤超时');
+    const current = bot.entity.position;
+    const actuallyMoved = current.distanceTo(origin) > 0.5;
+    const safetyAfter = retreatSafetyScore(current, threats);
+    movedAway = Boolean(
+      actuallyMoved &&
+      Number.isFinite(safetyBefore) &&
+      safetyAfter > safetyBefore + 0.5
+    );
   } catch (error) {
     log('后撤失败', error.message);
   } finally {
-    bot.pathfinder.stop();
+    // stop() 单独调用会把 stopPathing 留给下一个 setGoal/resetPath；同步清目标，避免下一条 goto 被 path_stop 打断。
+    if (!interrupted) stopPathfinding();
+    retreatActive = false;
   }
+  return movedAway;
 }
 
 function findRangedWeapon() {
@@ -2512,25 +2553,61 @@ async function shootAt(target) {
   }
 }
 
-async function attackEntity(target) {
+async function attackEntity(target, { allowTargetSwitch = false, encounterRadius = 16 } = {}) {
   await equipWeapon();
-  const name = blockLabel(target.name);
+  const requestedTarget = target;
+  let activeTarget = target;
+  let switchedTargets = false;
   let hits = 0;
   let meleeReady = true;
-  for (let index = 0; index < 20 && target.isValid !== false && bot.health > 4; index += 1) {
+
+  const updateEncounter = async () => {
+    const decision = await evaluateEncounterStep({
+      entities: bot.entities,
+      origin: bot.entity.position,
+      registry: bot.registry,
+      health: bot.health,
+      radius: encounterRadius,
+      requestedTarget,
+      currentTarget: activeTarget,
+      allowTargetSwitch,
+      equipment: combatEquipment(bot),
+      retreat: retreatFrom,
+    });
+    if (decision.status === 'retreated') {
+      if (interrupted) throw new Error('被新的指令打断');
+      const requestedName = blockLabel(requestedTarget.name);
+      const movement = decision.moved_away ? '已拉开距离' : '后撤未确认';
+      throw new Error(
+        `还差指定目标 ${requestedName}；${decision.encounter.retreat_reason}，${movement}，未完成目标`,
+      );
+    }
+    if (!decision.switched || !decision.target) return false;
+    const previousName = blockLabel(activeTarget.name);
+    activeTarget = decision.target;
+    switchedTargets = true;
+    log('群怪威胁变化，切换目标', `${previousName} → ${blockLabel(activeTarget.name)}`);
+    return true;
+  };
+
+  for (let index = 0; index < 20 && activeTarget.isValid !== false && bot.health > 4; index += 1) {
     if (interrupted) throw new Error('被新的指令打断');
-    const distance = target.position
-      ? bot.entity.position.distanceTo(target.position)
+    await updateEncounter();
+    let distance = activeTarget.position
+      ? bot.entity.position.distanceTo(activeTarget.position)
       : 0;
+    const isEnderman = String(activeTarget.name || '').toLowerCase() === 'enderman';
     const flying =
-      target.name === 'phantom' ||
-      (target.position && target.position.y - bot.entity.position.y > 2.5);
+      activeTarget.name === 'phantom' ||
+      (!isEnderman && activeTarget.position && activeTarget.position.y - bot.entity.position.y > 2.5);
     if (flying) {
-      await bot.lookAt(target.position.offset(0, target.height * 0.7, 0), true);
-      if (findRangedWeapon() && distance > 3.5) {
-        if (await shootAt(target)) {
+      await bot.lookAt(activeTarget.position.offset(0, activeTarget.height * 0.7, 0), true);
+      if (await updateEncounter()) continue;
+      if (!isEnderman && findRangedWeapon() && distance > 3.5) {
+        if (await shootAt(activeTarget)) {
           hits += 1;
           meleeReady = false;
+          await updateEncounter();
           await sleep(700);
           continue;
         }
@@ -2540,15 +2617,16 @@ async function attackEntity(target) {
           await equipWeapon();
           meleeReady = true;
         }
-        bot.attack(target);
+        bot.attack(activeTarget);
         hits += 1;
       }
       await sleep(500);
       continue;
     }
-    if (findRangedWeapon() && distance > 6 && await shootAt(target)) {
+    if (!isEnderman && findRangedWeapon() && distance > 6 && await shootAt(activeTarget)) {
       hits += 1;
       meleeReady = false;
+      await updateEncounter();
       await sleep(700);
       continue;
     }
@@ -2557,17 +2635,31 @@ async function attackEntity(target) {
       meleeReady = true;
     }
     if (distance > 3) {
-      await approach(target);
+      await approach(activeTarget);
+      if (interrupted) throw new Error('被新的指令打断');
+      if (await updateEncounter()) continue;
     }
-    await bot.lookAt(target.position.offset(0, target.height * 0.8, 0), true);
-    bot.attack(target);
+    distance = activeTarget.position
+      ? bot.entity.position.distanceTo(activeTarget.position)
+      : 0;
+    await bot.lookAt(activeTarget.position.offset(0, activeTarget.height * 0.8, 0), true);
+    if (await updateEncounter()) continue;
+    bot.attack(activeTarget);
     hits += 1;
     await sleep(600);
   }
-  if (target.isValid === false) {
-    return hits === 0 ? `目标消失了，没有打中` : `击败了 ${name}，${hits} 次攻击`;
+  if (activeTarget.isValid === false) {
+    const name = blockLabel(activeTarget.name);
+    const switched = switchedTargets && activeTarget !== requestedTarget
+      ? `，已按威胁优先级切换目标`
+      : '';
+    return hits === 0 ? `目标消失了，没有打中${switched}` : `击败了 ${name}，${hits} 次攻击${switched}`;
   }
-  return `攻击了 ${name} ${hits} 次，它还在`;
+  const name = blockLabel(activeTarget.name);
+  const requested = activeTarget !== requestedTarget
+    ? `；原指定的${blockLabel(requestedTarget.name)}仍在`
+    : '';
+  return `攻击了 ${name} ${hits} 次，它还在${requested}`;
 }
 
 async function defendAgainst(target) {
@@ -2575,9 +2667,9 @@ async function defendAgainst(target) {
   combatBusy = true;
   lastCombatAt = Date.now();
   try {
-    wanderToken += 1;
     wanderActive = false;
-    bot.pathfinder.stop();
+    // 清除上一条路径和 stop() 的延迟标志，再让撤退/接近逻辑创建新 goto。
+    stopPathfinding();
     if (followSession) stopFollow();
     if (target.name === 'creeper') {
       log('苦力怕靠近，先后撤');
@@ -2590,8 +2682,7 @@ async function defendAgainst(target) {
       if (findFood()) await eatIfPossible();
       return;
     }
-    await approach(target);
-    const detail = await attackEntity(target);
+    const detail = await attackEntity(target, { allowTargetSwitch: true, encounterRadius: 16 });
     log('反击结束', detail);
   } catch (error) {
     log('反击失败', error.message);
@@ -2670,7 +2761,7 @@ async function escapeEnvironment() {
     const target = pickWanderTarget();
     if (target) {
       bot.pathfinder.movements.allowSprinting = true;
-      await bot.pathfinder.goto(new goals.GoalNear(target.x, target.y, target.z, 1));
+      await gotoWithDeadline(new goals.GoalNear(target.x, target.y, target.z, 1));
       log('离开了危险位置');
     }
   } catch (error) {
@@ -2682,57 +2773,23 @@ async function escapeEnvironment() {
 }
 
 function blockIsWater(block) {
-  return Boolean(block && block.name && block.name.includes('water'));
-}
-
-function findShore(radius = 12) {
-  const base = bot.entity.position;
-  for (let distance = 3; distance <= radius; distance += 2) {
-    for (let step = 0; step < 8; step += 1) {
-      const angle = (Math.PI * 2 * step) / 8;
-      const x = Math.floor(base.x + Math.cos(angle) * distance);
-      const z = Math.floor(base.z + Math.sin(angle) * distance);
-      for (let dy = -1; dy <= 2; dy += 1) {
-        const ground = bot.blockAt(vec(x, Math.floor(base.y) + dy, z));
-        if (!ground || ground.boundingBox !== 'block') continue;
-        if (blockIsWater(ground) || /lava/.test(ground.name)) continue;
-        const above = bot.blockAt(ground.position.offset(0, 1, 0));
-        const above2 = bot.blockAt(ground.position.offset(0, 2, 0));
-        if (above?.boundingBox === 'empty' && above2?.boundingBox === 'empty') {
-          return { position: ground.position.offset(0, 1, 0), angle };
-        }
-      }
-    }
-  }
-  return null;
+  return waterLike(block);
 }
 
 let waterEscapeBusy = false;
-let lastDrownLogAt = 0;
-
-async function swimToShore(reason) {
-  if (waterEscapeBusy) return;
+let waterEscapeRequired = false;
+async function swimToShore(reason, token = null, timeoutMs = 25000, radius = 12) {
+  if (waterEscapeBusy) return false;
   waterEscapeBusy = true;
-  const oxygen = bot.oxygenLevel ?? 20;
-  if (Date.now() - lastDrownLogAt > 5000) {
-    lastDrownLogAt = Date.now();
-    log('水里氧气不足，游向岸边', `oxygen=${oxygen} ${reason}`);
-  }
   try {
-    const shore = findShore(12);
-    if (shore) {
-      const base = bot.entity.position;
-      const dx = shore.position.x - base.x;
-      const dz = shore.position.z - base.z;
-      await bot.look(Math.atan2(-dx, dz), 0, true);
-    }
-    bot.setControlState('jump', true);
-    bot.setControlState('forward', true);
-    await sleep(1800);
-  } catch (error) {
-    log('游向岸边失败', error.message);
+    log('水中自救', reason);
+    const started = Date.now();
+    if (!await escapeWater(bot, { token, timeoutMs, radius })) return false;
+    const remaining = Math.max(0, timeoutMs - (Date.now() - started));
+    const landed = await reachShore(bot, { token, timeoutMs: remaining, radius });
+    log(landed ? '水中自救已靠岸' : '已恢复呼吸但未找到安全岸边');
+    return landed;
   } finally {
-    bot.setControlState('forward', false);
     waterEscapeBusy = false;
   }
 }
@@ -2741,16 +2798,112 @@ function waterTick() {
   if (!bot || !bot.entity) return;
   const feet = bot.blockAt(bot.entity.position);
   const head = bot.blockAt(bot.entity.position.offset(0, 1, 0));
-  const inWater = blockIsWater(feet) || blockIsWater(head);
-  if (!inWater) {
-    if (bot.getControlState('jump')) bot.setControlState('jump', false);
+  const eye = bot.blockAt(bot.entity.position.offset(0, bot.entity.eyeHeight ?? 1.62, 0));
+  const oxygen = bot.oxygenLevel;
+  if (breathable(eye) && eye.name !== 'bubble_column' && Number.isFinite(oxygen) && oxygen >= 19) waterEscapeRequired = false;
+  const inWater = blockIsWater(feet) || blockIsWater(head) || blockIsWater(eye);
+  if (!inWater) return;
+  if (Number.isFinite(oxygen) && (oxygen <= 8 || waterEscapeRequired)) {
+    waterEscapeRequired = true;
+    reportReflexEvent('low_oxygen', { oxygen, health: bot.health, food: bot.food });
+  }
+}
+
+function reportReflexEvent(event, data, cooldownMs = 3000) {
+  if (bot?.entity?.position) data = { ...data, position: { x: bot.entity.position.x, y: bot.entity.position.y, z: bot.entity.position.z } };
+  const now = Date.now();
+  const key = `${event}:${data?.source_id ?? data?.entity_id ?? ''}`;
+  if (now - (reflexSentAt.get(key) || 0) < cooldownMs) return false;
+  reflexSentAt.set(key, now);
+  if (reflexSentAt.size > 128) {
+    for (const [entry, at] of reflexSentAt) {
+      if (now - at > 30000) reflexSentAt.delete(entry);
+    }
+  }
+  const interruptedAction = executor.active;
+  const safetyActionId = enqueueLocalSafety(event, data);
+  if (!socket || socket.readyState !== WebSocket.OPEN) return Boolean(safetyActionId);
+  const action = interruptedAction ? {
+    action_id: interruptedAction.id,
+    skill_id: interruptedAction.tool || '',
+    phase: interruptedAction.token?.phase || 'running',
+  } : null;
+  const phase = interruptedAction?.token?.phase || 'detected';
+  const eventData = {
+    ...data,
+    session_id: sessionId,
+    state_revision: stateRevision,
+    action_id: interruptedAction?.id || null,
+    action,
+    phase,
+    safety_action_id: safetyActionId,
+    executor_epoch: executor.epoch,
+  };
+  socket.send(JSON.stringify({
+    type: 'reflex_event',
+    event,
+    data: eventData,
+    session_id: sessionId,
+    state_revision: stateRevision,
+    action_id: interruptedAction?.id || null,
+    action,
+    safety_action_id: safetyActionId,
+    phase,
+    executor_epoch: executor.epoch,
+    executor: executor.snapshot(),
+  }));
+  return true;
+}
+
+function enqueueLocalSafety(event, data) {
+  return reflexScheduler.dispatch(event, data);
+}
+
+async function runLocalSafety(event, data, token) {
+  if (token.cancelled) throw new Error(token.cancelReason || '安全动作已取消');
+  if (event === 'low_oxygen') {
+    if (await swimToShore(`本地避险 oxygen=${data.oxygen}`, token, 30000)) return;
+    throw new Error('水中自救超时，未确认抵达安全岸边');
+  }
+  if (event === 'critical_hunger') {
+    if (Number(bot.food ?? 20) <= 8 && findFood()) await eatIfPossible();
     return;
   }
-  bot.setControlState('jump', true);
-  const oxygen = bot.oxygenLevel ?? 20;
-  if (oxygen <= 8) {
-    swimToShore(`oxygen=${oxygen}`);
+  const source = Number.isInteger(data.source_id) ? bot.entities[String(data.source_id)] : null;
+  const hostile = source && ((source.type === 'mob' || source.type === 'hostile') || HOSTILE_MOBS.has(source.name))
+    ? source
+    : findHostile(event === 'hostile_nearby' ? 12 : 8);
+  if (hostile) {
+    if (bot.health <= 8 || hostile.name === 'creeper') {
+      await retreatFrom(hostile);
+      if (bot.health <= 10 && findFood()) await eatIfPossible();
+    } else {
+      await defendAgainst(hostile);
+    }
+    return;
   }
+  if (data.source_type === 'player' && source) {
+    await retreatFrom(source);
+  } else {
+    await escapeEnvironment();
+    if (bot.health <= 10 && findFood()) await eatIfPossible();
+  }
+}
+
+function queueArmorMaintenance() {
+  if (!bot?.armorManager || !botReady || !terrainReady) return;
+  if (executor.active?.tool === 'armor_maintenance' || actionQueue.some((task) => task.tool === 'armor_maintenance')) return;
+  executor.enqueue({
+    id: `armor-${randomUUID()}`,
+    tool: 'armor_maintenance',
+    kind: 'maintenance',
+    priority: 8,
+    onCancel: (reason, status, token) => cancelActiveWorldWork(reason, status, token),
+    run: async () => {
+      await bot.armorManager.equipAll();
+      return { status: 'succeeded', detail: '护甲整理完成' };
+    },
+  });
 }
 
 function onDamaged(source) {
@@ -2760,16 +2913,6 @@ function onDamaged(source) {
   lastActivity = now;
   if (source && source.id !== undefined) {
     log('伤害来源', describeEntity(source), source.type || 'unknown');
-    if (source.type === 'player') {
-      log('被玩家攻击，先退开');
-      retreatFrom(source);
-      return;
-    }
-    if (source.type === 'mob' || HOSTILE_MOBS.has(source.name)) {
-      log('受到伤害，反击', source.name);
-      defendAgainst(source);
-      return;
-    }
   }
   const position = bot.entity.position;
   const nearby = Object.values(bot.entities)
@@ -2788,48 +2931,45 @@ function onDamaged(source) {
     '受伤时状态',
     `health=${bot.health} food=${bot.food} pos=(${position.x.toFixed(1)}, ${position.y.toFixed(1)}, ${position.z.toFixed(1)}) 附近=${nearby.join(' | ') || '无'}`
   );
-  const attacker = findHostile(12);
-  if (attacker) {
-    log('受到伤害，反击', attacker.name);
-    defendAgainst(attacker);
-    return;
-  }
-  log('受到环境伤害，尝试离开');
-  escapeEnvironment();
+  reportReflexEvent('damage', {
+    source_id: Number.isInteger(source?.id) ? source.id : null,
+    source_type: String(source?.type || ''),
+    source_name: String(source?.name || ''),
+    health: bot.health,
+    food: bot.food,
+    position: {
+      x: bot.entity.position.x,
+      y: bot.entity.position.y,
+      z: bot.entity.position.z,
+    },
+  }, 1000);
 }
 
 function survivalTick() {
-  if (!bot || !bot.entity || bot.isSleeping || combatBusy || actionBusy) return;
-  if (bot.health <= 8) return;
-  if (bot.health <= 12 && findFood() && Date.now() - lastEatAt > 8000) {
-    eatIfPossible();
-    return;
+  if (!bot || !bot.entity || bot.isSleeping) return;
+  if (bot.health <= 8) {
+    reportReflexEvent('low_health', { health: bot.health, food: bot.food, position: { x: bot.entity.position.x, y: bot.entity.position.y, z: bot.entity.position.z } }, 5000);
+  }
+  if (shouldInterruptForHunger(bot.food, findFood())) {
+    reportReflexEvent('critical_hunger', { health: bot.health, food: bot.food }, 8000);
   }
   const hostile = findHostile(16);
-  if (hostile && Date.now() - lastCombatAt > 5000) {
-    lastActivity = Date.now();
-    if (hostile.name === 'creeper') {
-      const distance = bot.entity.position.distanceTo(hostile.position);
-      if (distance <= 8) {
-        defendAgainst(hostile);
-        return;
-      }
-      if (Date.now() - lastCreeperWarnAt > 10000) {
-        lastCreeperWarnAt = Date.now();
-        log('附近有苦力怕，保持距离', distance.toFixed(1));
-      }
-      return;
+  if (hostile) {
+    const distance = bot.entity.position.distanceTo(hostile.position);
+    if (distance <= 8 && Date.now() - lastCreeperWarnAt > 10000) {
+      lastCreeperWarnAt = Date.now();
+      reportReflexEvent(
+        'hostile_nearby',
+        {
+          entity_id: Number.isInteger(hostile.id) ? hostile.id : null,
+          entity_name: String(hostile.name || ''),
+          distance,
+          health: bot.health,
+          food: bot.food,
+        },
+        8000,
+      );
     }
-    log(
-      '发现敌对生物，主动接近',
-      hostile.name,
-      bot.entity.position.distanceTo(hostile.position).toFixed(1)
-    );
-    defendAgainst(hostile);
-    return;
-  }
-  if (bot.food <= 14 && Date.now() - lastEatAt > 10000) {
-    eatIfPossible();
   }
 }
 
@@ -2849,13 +2989,17 @@ function findAttackTarget(args) {
       if (label !== name) return false;
     }
     if (type === 'hostile') {
-      return (entity.type === 'hostile' || entity.type === 'mob') && HOSTILE_MOBS.has(entity.name);
+      return (entity.type === 'hostile' || entity.type === 'mob') &&
+        HOSTILE_MOBS.has(entity.name) &&
+        (Boolean(name) || isAutomaticCombatTarget(entity, bot.registry));
     }
     if (type === 'player') return entity.type === 'player';
     if (type) {
       return String(entity.type || '').toLowerCase() === type || String(entity.name || '').toLowerCase() === type;
     }
-    return (entity.type === 'hostile' || entity.type === 'mob') && HOSTILE_MOBS.has(entity.name);
+    return (entity.type === 'hostile' || entity.type === 'mob') &&
+      HOSTILE_MOBS.has(entity.name) &&
+      (Boolean(name) || isAutomaticCombatTarget(entity, bot.registry));
   });
 }
 
@@ -2877,18 +3021,18 @@ function resolvePlayer(name) {
 }
 
 function findHostile(range) {
-  return bot.nearestEntity(
-    (entity) =>
-      (entity.type === 'hostile' || entity.type === 'mob') &&
-      HOSTILE_MOBS.has(entity.name) &&
-      entity.position.distanceTo(bot.entity.position) <= range
-  );
+  return assessCombatEncounter({
+    entities: bot.entities,
+    origin: bot.entity.position,
+    registry: bot.registry,
+    health: bot.health,
+    radius: range,
+    equipment: combatEquipment(bot),
+  }).primary?.entity || null;
 }
 
 async function equipWeapon() {
-  const weapon = bot.inventory
-    .items()
-    .find((item) => item.name.endsWith('_sword') || item.name.endsWith('_axe'));
+  const weapon = bestMeleeWeapon(bot);
   if (weapon) {
     await bot.equip(weapon, 'hand');
   }
@@ -2911,13 +3055,14 @@ function nearestPlayer(maxDistance = 128) {
   return { username: entry.username, entity };
 }
 
-function pickWanderTarget() {
+function pickWanderTarget(heading = null, visited = new Set()) {
   const base = bot.entity.position;
   for (let attempt = 0; attempt < 12; attempt += 1) {
-    const angle = Math.random() * Math.PI * 2;
-    const radius = 5 + Math.random() * 5;
+    const angle = heading === null ? Math.random() * Math.PI * 2 : heading + (Math.random() - 0.5) * Math.PI;
+    const radius = heading === null ? 5 + Math.random() * 5 : 10 + Math.random() * 6;
     const x = Math.floor(base.x + Math.cos(angle) * radius);
     const z = Math.floor(base.z + Math.sin(angle) * radius);
+    if (visited.has(`${x},${z}`)) continue;
     for (let dy = 2; dy >= -4; dy -= 1) {
       const ground = bot.blockAt(vec(x, Math.floor(base.y) + dy, z));
       if (!ground || ground.boundingBox !== 'block') continue;
@@ -2933,50 +3078,79 @@ function pickWanderTarget() {
   return null;
 }
 
-async function startWander() {
-  if (!bot || !bot.entity || wanderActive) return;
-  wanderActive = true;
-  const token = ++wanderToken;
-  const target = pickWanderTarget();
-  if (!target) {
-    wanderActive = false;
-    return;
+async function exploreResource(step, heading, search = { visited: new Set() }) {
+  if (externalCancelReason()) return 'cancelled';
+  if (Number.isFinite(bot.health) && bot.health <= COLLECT_LOW_HEALTH) {
+    throw new Error(`血量不足（血量 ${bot.health}），停止资源探索`);
   }
-  log('开始闲逛', `目标 (${target.x}, ${target.y}, ${target.z})`);
-  bot.pathfinder.movements.allowSprinting = false;
-  const origin = bot.entity.position.clone();
+  if (nearbyHostiles(10).length) throw new Error('附近有敌对生物，停止资源探索');
+  const target = pickWanderTarget(heading, search.visited);
+  if (!target) return 'no_target';
+  search.visited.add(`${target.x},${target.z}`);
+  log('资源未找到，移动后继续搜索', `${step + 1}/5`, `(${target.x}, ${target.y}, ${target.z})`);
+  const movements = bot.pathfinder?.movements;
+  const previous = movements && {
+    canDig: movements.canDig,
+    allow1by1towers: movements.allow1by1towers,
+    allowParkour: movements.allowParkour,
+  };
+  let outcome;
   try {
-    const result = await Promise.race([
-      bot.pathfinder
-        .goto(new goals.GoalNear(target.x, target.y, target.z, 1))
-        .then(() => 'ok'),
-      sleep(12000).then(() => 'timeout'),
-    ]);
-    if (token !== wanderToken) return;
-    if (result === 'timeout') {
-      bot.pathfinder.stop();
-      return;
+    if (movements) {
+      movements.canDig = false;
+      movements.allow1by1towers = false;
+      movements.allowParkour = false;
     }
-    const yaw = bot.entity.yaw + (Math.random() - 0.5) * 1.4;
-    await bot.look(yaw, 0, true);
-  } catch {
-    // 走不过去就放弃这次闲逛
+    outcome = await walkOnce(target.x, target.y, target.z, 1, 12000);
   } finally {
-    if (token === wanderToken) {
-      wanderActive = false;
-      lastActivity = Date.now();
-      if (!followSession) {
-        bot.pathfinder.movements.allowSprinting = true;
-      }
-      if (bot && bot.entity) {
-        const position = bot.entity.position;
-        log(
-          '闲逛结束',
-          `走了 ${position.distanceTo(origin).toFixed(1)} 格，位置 (${position.x.toFixed(1)}, ${position.y.toFixed(1)}, ${position.z.toFixed(1)})`
-        );
-      }
-    }
+    if (movements) Object.assign(movements, previous);
   }
+  if (externalCancelReason()) return 'cancelled';
+  if (Number.isFinite(bot.health) && bot.health <= COLLECT_LOW_HEALTH) {
+    throw new Error(`血量不足（血量 ${bot.health}），停止资源探索`);
+  }
+  if (nearbyHostiles(10).length) throw new Error('移动后发现敌对生物，停止资源探索');
+  return outcome;
+}
+
+function startWander() {
+  if (!bot || !bot.entity || wanderActive || !bot.pathfinder) return false;
+  const target = pickWanderTarget();
+  if (!target) return false;
+  wanderActive = true;
+  const id = `wander-${randomUUID()}`;
+  wanderActionId = id;
+  const origin = bot.entity.position.clone();
+  executor.enqueue({
+    id,
+    tool: 'idle_wander',
+    kind: 'resident',
+    priority: 9,
+    onCancel: (reason, status, token) => cancelActiveWorldWork(reason, status, token),
+    run: async () => {
+      log('开始闲逛', `目标 (${target.x}, ${target.y}, ${target.z})`);
+      bot.pathfinder.movements.allowSprinting = false;
+      try {
+        await gotoWithDeadline(new goals.GoalNear(target.x, target.y, target.z, 1), 12000, '闲逛超时');
+        if (!interrupted) await bot.look(bot.entity.yaw + (Math.random() - 0.5) * 1.4, 0, true);
+        return { status: 'succeeded', detail: '闲逛完成' };
+      } catch (error) {
+        return { status: interrupted ? 'cancelled' : 'partial', detail: error.message };
+      } finally {
+        lastActivity = Date.now();
+        if (bot?.pathfinder?.movements) bot.pathfinder.movements.allowSprinting = true;
+        if (bot?.entity) {
+          const position = bot.entity.position;
+          log('闲逛结束', `走了 ${position.distanceTo(origin).toFixed(1)} 格，位置 (${position.x}, ${position.y}, ${position.z})`);
+        }
+      }
+    },
+    onResult: () => {
+      wanderActive = false;
+      if (wanderActionId === id) wanderActionId = '';
+    },
+  });
+  return true;
 }
 
 function idleTick() {
@@ -3055,78 +3229,50 @@ class LiveFollowGoal {
 }
 
 function startFollow(player, distance) {
-  wanderToken += 1;
-  wanderActive = false;
-  stopFollow();
   followSession = {
     name: player.username,
     distance,
-    paused: false,
-    sprinting: false,
-    lastLook: 0,
+    actionId: currentActionId,
     startedAt: Date.now(),
-    goal: new LiveFollowGoal(player.entity, distance),
   };
-  bot.pathfinder.setGoal(followSession.goal, true);
-  tickFollow();
-  followTimer = setInterval(tickFollow, 250);
 }
 
-function tickFollow() {
+async function runFollow(player, distance, token) {
+  startFollow(player, distance);
   const session = followSession;
-  if (!bot || !bot.entity || !session) return;
-  if (Date.now() - session.startedAt > 5 * 60 * 1000) {
-    log('跟随超时，自动停止');
-    stopFollow();
-    return;
-  }
-  const entity = bot.players[session.name] && bot.players[session.name].entity;
-  if (!entity) {
-    stopFollow();
-    return;
-  }
-  const gap = bot.entity.position.distanceTo(entity.position);
-  const pauseAt = session.distance + 0.2;
-  const resumeAt = session.distance + 1.2;
-  if (!session.paused && gap <= pauseAt) {
-    session.paused = true;
-    bot.pathfinder.setGoal(null);
-    bot.pathfinder.stop();
-    bot.setControlState('sprint', false);
-  } else if (session.paused && gap > resumeAt) {
-    session.paused = false;
-    session.goal = new LiveFollowGoal(entity, session.distance);
-    bot.pathfinder.setGoal(session.goal, true);
-  }
-  if (!session.paused) {
-    const sprintOn = session.distance + 8;
-    const sprintOff = session.distance + 4;
-    let sprint = session.sprinting;
-    if (!sprint && gap > sprintOn) sprint = true;
-    else if (sprint && gap < sprintOff) sprint = false;
-    if (sprint !== session.sprinting) {
-      session.sprinting = sprint;
-      bot.pathfinder.movements.allowSprinting = sprint;
-      log(sprint ? '距离较远，开始小跑' : '距离拉近，改为走路', gap.toFixed(1));
-      session.goal = new LiveFollowGoal(entity, session.distance);
-    bot.pathfinder.setGoal(session.goal, true);
+  const startedAt = Date.now();
+  log('开始跟随', player.username, `距离 ${distance}`);
+  try {
+    while (!token.cancelled && Date.now() - startedAt < 5 * 60 * 1000) {
+      const target = bot.players[session.name]?.entity;
+      if (!target || target.isValid === false) throw new Error(`玩家 ${session.name} 已离开视野，停止跟随`);
+      const gap = bot.entity.position.distanceTo(target.position);
+      if (gap <= distance + 0.2) {
+        bot.setControlState('sprint', false);
+        await bot.lookAt(target.position.offset(0, 1.6, 0), true);
+        await sleep(250);
+        continue;
+      }
+      if (bot.pathfinder.movements) bot.pathfinder.movements.allowSprinting = gap > distance + 8;
+      try {
+        await gotoWithDeadline(new LiveFollowGoal(target, distance), 30000, '跟随寻路超时');
+      } catch (error) {
+        if (token.cancelled || interrupted) throw error;
+        log('跟随寻路未完成，稍后重试', error.message);
+        await sleep(500);
+      }
     }
-  } else {
-    const now = Date.now();
-    if (now - session.lastLook > 1200) {
-      session.lastLook = now;
-      bot.lookAt(entity.position.offset(0, 1.6, 0), true).catch(() => {});
+    if (!token.cancelled && Date.now() - startedAt >= 5 * 60 * 1000) {
+      throw new Error('跟随超过 5 分钟，自动停止');
     }
+  } finally {
+    if (followSession === session) stopFollow();
   }
 }
 
 function stopFollow() {
   if (followSession) {
     log('已停止跟随', followSession.name);
-  }
-  if (followTimer) {
-    clearInterval(followTimer);
-    followTimer = null;
   }
   followSession = null;
   // 服务器断开时 bot 可能还没加载 pathfinder 插件，这里必须容错，否则整个桥接进程会退出。
@@ -3141,6 +3287,39 @@ function stopFollow() {
   }
 }
 
+function stopResidentMovement(reason = '收到新的前台动作') {
+  if (followSession && followSession.actionId) {
+    executor.cancel(followSession.actionId, reason, 'cancelled');
+  }
+  if (wanderActionId) executor.cancel(wanderActionId, reason, 'cancelled');
+}
+
+function cancelActiveWorldWork(reason, status, token) {
+  interrupted = true;
+  for (const cancelHook of [...(token?.cancelHooks || [])]) {
+    try {
+      cancelHook();
+    } catch {
+      // 取消监听失败不能阻止 pathfinder 与容器清理。
+    }
+  }
+  if (bot) {
+    if (bot.pathfinder) {
+      bot.pathfinder.setGoal(null);
+      bot.pathfinder.stop();
+    }
+    bot.stopDigging();
+    bot.clearControlStates();
+  }
+  if (followSession && (!token || followSession.actionId === token.actionId)) {
+    stopFollow();
+  }
+  if (wanderActionId && (!token || wanderActionId === token.actionId)) {
+    wanderActive = false;
+    wanderActionId = '';
+  }
+}
+
 const STOP_INTENT = /(别跟|不要跟|不用跟|别再跟|别过来|不用过来|停下|站住|停住)/;
 
 function isStopIntent(text) {
@@ -3148,6 +3327,7 @@ function isStopIntent(text) {
 }
 
 function createBot() {
+  retreatTrail.clear();
   if (INDEPENDENT) {
     log('独立模式已启用：不向玩家索要坐标，不跟随玩家');
   }
@@ -3159,8 +3339,18 @@ function createBot() {
     version: config.version || undefined,
   });
   bot.loadPlugin(pathfinder);
-  bot.loadPlugin(armorManager);
+  installArmorManagerApi(bot, armorManager);
   bot.loadPlugin(toolModule.plugin || toolModule);
+  bot.on('physicsTick', () => {
+    if (botReady && terrainReady && bot?.entity && !executor.safetyActive) {
+      const position = bot.entity.position;
+      const floor = bot.blockAt(position.offset(0, -1, 0));
+      const feet = bot.blockAt(position);
+      if (floor?.boundingBox === 'block' && !waterLike(floor) && feet && !waterLike(feet)) {
+        retreatTrail.record(position, bot.game?.dimension);
+      }
+    }
+  });
   // 窗口状态编号必须一直跟踪：自己发的 window_click 要把最新编号回传给服务端，
   // 只有在 craftItem 里才开启跟踪的话，箱子等窗口第一次点击会被服务端按编号不符忽略。
   trackCraftStateId();
@@ -3169,10 +3359,32 @@ function createBot() {
     bot._client.on('error', (error) => log('连接 Minecraft 失败', error.message));
   }
 
+  installBridgeSessionLifecycle({
+    bot,
+    client: bot._client,
+    getIdentity: () => ({ sessionId, revision: stateRevision }),
+    setIdentity: (identity) => {
+      sessionId = identity.sessionId;
+      stateRevision = identity.revision;
+    },
+    createSessionId: randomUUID,
+    isDeathPending: () => deathPending,
+    onRespawn: ({ deathRespawn }) => {
+      log(deathRespawn ? '已重生' : '收到维度切换 respawn 包');
+      if (deathRespawn) {
+        lastHealth = 20;
+        respawnReady = true;
+      }
+      botReady = true;
+      terrainReady = false;
+      startTerrainReadinessCheck(deathRespawn ? 'respawn' : 'dimension_change');
+    },
+  });
+
   bot.once('spawn', () => {
     log('已进入世界');
     botReady = true;
-    if (!deathPending) actionBlockStatus = '';
+    terrainReady = false;
     const movements = new Movements(bot);
     const originalStop = bot.pathfinder.stop.bind(bot.pathfinder);
     bot.pathfinder.stop = (...args) => {
@@ -3189,6 +3401,7 @@ function createBot() {
     movements.canOpenDoors = true;
     movements.maxDropDown = 4;
     movements.liquidCost = 12;
+    movements.exclusionAreasPlace.push((block) => avoidWaterScaffolding(bot, block));
     movements.infiniteLiquidDropdownDistance = false;
     const avoidBlocks = [
       'cactus',
@@ -3209,15 +3422,9 @@ function createBot() {
       movements.scafoldingBlocks = scaffold;
     }
     bot.pathfinder.setMovements(movements);
-    if (bot.armorManager) {
-      bot.armorManager.equipAll().catch((error) => log('穿装备失败', error.message));
-    }
-    setInterval(() => {
-      if (bot.armorManager) {
-        bot.armorManager.equipAll().catch(() => {});
-      }
-    }, 15000);
+    if (!armorTimer) armorTimer = setInterval(queueArmorMaintenance, 15000);
     setInterval(sendState, 5000);
+    startTerrainReadinessCheck('spawn');
     sendState();
   });
 
@@ -3226,14 +3433,10 @@ function createBot() {
     lastActivity = Date.now();
     lastPlayerChatAt = Date.now();
     lastDistanceAsk = 0;
-    if (wanderActive) {
-      wanderToken += 1;
-      wanderActive = false;
-      bot.pathfinder.stop();
-    }
+    if (wanderActionId) executor.cancel(wanderActionId, '玩家发言，停止闲逛', 'cancelled');
     if (followSession && isStopIntent(message)) {
       log('收到停止跟随指令', username, message);
-      stopFollow();
+      executor.cancel(followSession.actionId, '玩家要求停止跟随', 'cancelled');
     }
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     socket.send(JSON.stringify({ type: 'chat', player: username, text: message }));
@@ -3273,11 +3476,11 @@ function createBot() {
     respawnReady = false;
     actionBlockStatus = 'dead';
     botReady = false;
-    drainActions(actionQueue, reply, 'Player died', 'dead');
-    stopFollow();
-    wanderToken += 1;
+    terrainReady = false;
+    terrainReadinessGeneration += 1;
+    executor.block('dead', '玩家角色死亡');
     wanderActive = false;
-    interruptAction('玩家角色死亡', '', 'dead');
+    wanderActionId = '';
     queueLifecycleEvent('death');
     requestRespawn();
   });
@@ -3295,33 +3498,27 @@ function createBot() {
     }, 1200);
   }
 
-  bot._client.on('respawn', () => {
-    log('已重生');
-    lastHealth = 20;
-    botReady = true;
-    respawnReady = true;
-    finishRespawnIfIdle();
-  });
-
   bot.on('error', (error) => log('mineflayer 错误', error.message));
   bot.on('kicked', (reason) => log('被服务器踢出', reason));
   bot.on('end', () => {
     log('与 Minecraft 的连接结束，5 秒后重连');
     botReady = false;
+    terrainReady = false;
+    terrainReadinessGeneration += 1;
     actionBlockStatus = 'disconnected';
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: 'world_unavailable', reason: 'minecraft_disconnected' }));
     }
-    drainActions(actionQueue, reply, 'Minecraft connection lost', 'disconnected');
-    interruptAction('Minecraft connection lost', '', 'disconnected');
-    stopFollow();
+    executor.block('disconnected', 'Minecraft connection lost');
+    wanderActive = false;
+    wanderActionId = '';
     clearTimeout(botReconnectTimer);
     botReconnectTimer = setTimeout(reconnectBotWhenIdle, 5000);
   });
 }
 
 function reconnectBotWhenIdle() {
-  if (actionBusy) {
+  if (executor.active) {
     botReconnectTimer = setTimeout(reconnectBotWhenIdle, 1000);
     return;
   }
@@ -3362,62 +3559,136 @@ function acknowledgeLifecycleEvent(message) {
   const type = String(message.event_type || '');
   if (!lifecycleId || !type) return;
   removeLifecycleEvent(pendingLifecycleEvents, type, lifecycleId);
-  if (type === 'respawn' && lifecycleId === deathLifecycleId && botReady && !deathPending) {
-    actionBlockStatus = '';
+  unblockExecutorIfReady();
+}
+
+function buildStateObservation() {
+  stateRevision += 1;
+  return createObservation(bot, {
+    sessionId,
+    revision: stateRevision,
+    ready: ordinaryActionReady(),
+    executor: executor.snapshot(),
+    nearbyOwnedCraftingTable: Boolean(ownedTableNearby(bot, temporaryCraftingTable)),
+    shelter: !bot?.entity || (rememberedShelter?.dimension && rememberedShelter.dimension !== String(bot.game?.dimension || ''))
+      ? null
+      : rememberedShelter,
+    makeVec: (x, y, z) => vec(x, y, z),
+  });
+}
+
+function ordinaryActionReady(allowWaterEscape = false) {
+  const terrainReadable = terrainReady && positionTerrainReadable();
+  if (terrainReady && !terrainReadable) startTerrainReadinessCheck('position_unloaded');
+  return Boolean(
+    bot?.entity && botReady && terrainReady && terrainReadable &&
+    !deathPending && pendingLifecycleEvents.length === 0 &&
+    !actionBlockStatus && (!waterEscapeRequired || allowWaterEscape) && socket?.readyState === WebSocket.OPEN && !executor.safetyActive
+  );
+}
+
+function currentPositionTerrain() {
+  if (!bot?.entity) return inspectPositionTerrain(null, () => null);
+  return inspectPositionTerrain(bot.entity.position, ({ x, y, z }) => bot.blockAt(vec(x, y, z)));
+}
+
+function positionTerrainReadable() {
+  return currentPositionTerrain().readable;
+}
+
+function unblockExecutorIfReady() {
+  if (
+    !bot?.entity || !botReady || !terrainReady || deathPending ||
+    pendingLifecycleEvents.length > 0 || socket?.readyState !== WebSocket.OPEN
+  ) return false;
+  if (!positionTerrainReadable()) {
+    startTerrainReadinessCheck('position_unloaded');
+    return false;
   }
+  actionBlockStatus = '';
+  executor.unblock();
+  return true;
+}
+
+function startTerrainReadinessCheck(reason) {
+  const candidateBot = bot;
+  const candidateSession = sessionId;
+  const generation = ++terrainReadinessGeneration;
+  terrainReady = false;
+  if (!candidateBot?.entity) return;
+
+  void (async () => {
+    let lastDiagnostic = '';
+    let lastLogAt = 0;
+    while (
+      generation === terrainReadinessGeneration && candidateBot === bot &&
+      candidateSession === sessionId && botReady && !terrainReady
+    ) {
+      try {
+        if (typeof candidateBot.waitForChunksToLoad === 'function') {
+          await candidateBot.waitForChunksToLoad();
+        }
+      } catch (error) {
+        const now = Date.now();
+        const detail = String(error?.message || error);
+        if (detail !== lastDiagnostic || now - lastLogAt >= 5000) {
+          lastDiagnostic = detail;
+          lastLogAt = now;
+          log('等待当前位置区块失败', reason, detail);
+        }
+      }
+      if (
+        generation !== terrainReadinessGeneration || candidateBot !== bot ||
+        candidateSession !== sessionId || !botReady
+      ) return;
+
+      const terrain = currentPositionTerrain();
+      if (terrain.readable) {
+        terrainReady = true;
+        log('当前位置区块可读', reason, JSON.stringify(terrain));
+        finishRespawnIfIdle();
+        unblockExecutorIfReady();
+        queueArmorMaintenance();
+        sendState();
+        return;
+      }
+
+      const diagnostic = JSON.stringify(terrain);
+      const now = Date.now();
+      if (diagnostic !== lastDiagnostic || now - lastLogAt >= 5000) {
+        lastDiagnostic = diagnostic;
+        lastLogAt = now;
+        log('等待当前位置地形可读', reason, diagnostic);
+      }
+      await sleep(500);
+    }
+  })();
 }
 
 function sendState() {
-  if (!bot || !bot.entity) return;
-  const healthSnapshot = worldHealthSnapshot(bot.health);
-  if (!healthSnapshot) return;
-  if (!INDEPENDENT) checkPlayerDistance();
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  const inventory = {};
-  for (const item of bot.inventory.items()) {
-    inventory[item.name] = (inventory[item.name] || 0) + item.count;
+  if (bot?.entity && !INDEPENDENT) checkPlayerDistance();
+  const observation = buildStateObservation();
+  if (observation && socket?.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'state', data: observation }));
   }
-  const position = bot.entity.position;
-  const players = Object.values(bot.players)
-    .filter((player) => player.username !== bot.username && player.entity)
-    .map((player) => ({
-      name: player.username,
-      position: {
-        x: player.entity.position.x,
-        y: player.entity.position.y,
-        z: player.entity.position.z,
-      },
-      distance: player.entity.position.distanceTo(position),
-    }))
-    .sort((left, right) => left.distance - right.distance)
-    .slice(0, 8);
-  socket.send(
-    JSON.stringify({
-      type: 'state',
-      data: {
-        alive: healthSnapshot.alive,
-        position: { x: position.x, y: position.y, z: position.z },
-        yaw: bot.entity.yaw,
-        pitch: bot.entity.pitch,
-        health: bot.health,
-        food: bot.food,
-        dimension: bot.game.dimension,
-        time: bot.time.timeOfDay,
-        day: bot.time.day,
-        is_day: bot.time.isDay,
-        weather:
-          bot.thunderState > 0 ? 'thunder' : bot.rainState > 0 ? 'rain' : 'clear',
-        players,
-        inventory,
-        held: bot.heldItem ? bot.heldItem.name : '',
-      },
-    })
-  );
+  return observation;
+}
+
+function rememberRequestedShelter(shelter) {
+  const position = shelter?.position;
+  const size = Number(shelter?.size);
+  if (!position || ![position.x, position.y, position.z].every((value) => Number.isFinite(Number(value)))) return false;
+  if (![3, 4, 5].includes(size)) return false;
+  rememberedShelter = {
+    position: { x: Math.floor(Number(position.x)), y: Math.floor(Number(position.y)), z: Math.floor(Number(position.z)) },
+    size,
+    dimension: String(bot?.game?.dimension || ''),
+  };
+  return true;
 }
 
 connectCore();
 createBot();
-setInterval(idleTick, 1000);
 setInterval(survivalTick, 1000);
 setInterval(waterTick, 500);
 
@@ -3426,4 +3697,25 @@ process.on('SIGINT', () => {
   if (bot) bot.quit();
   if (socket) socket.close();
   process.exit(0);
+});
+
+process.on('uncaughtException', (error) => {
+  log('Bridge 未捕获异常', error?.stack || error?.message || String(error));
+  if (bot?.pathfinder) {
+    bot.pathfinder.setGoal(null);
+    bot.pathfinder.stop();
+    bot.clearControlStates();
+  }
+  if (socket?.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'world_unavailable', reason: 'bridge_uncaught_exception' }));
+  }
+  setTimeout(() => process.exit(1), 100);
+});
+
+process.on('unhandledRejection', (reason) => {
+  log('Bridge 未处理 Promise 拒绝', reason?.stack || reason?.message || String(reason));
+});
+
+process.on('exit', (code) => {
+  log('Bridge 进程退出', `code=${code}`, `tool=${currentTool || 'idle'}`, `action=${currentActionId || 'none'}`);
 });

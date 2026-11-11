@@ -41,11 +41,11 @@
           <option value="S6">S6 · 末影龙</option>
         </select>
       </label>
-      <button id="runStart" class="primary">启动阶段</button>
-      <button id="runResume">续跑最近任务</button>
-      <button id="runStop">停止任务</button>
+      <button id="runStart" class="primary" disabled>启动阶段</button>
+      <button id="runResume" title="点击后才会显式续跑" disabled>续跑最近任务</button>
+      <button id="runStop" disabled>停止任务</button>
     </div>
-    <pre id="runStatus" class="aggregate">正在读取任务状态…</pre>
+    <pre id="runStatus" class="aggregate" aria-live="polite">正在读取任务状态…</pre>
   </section>
 
   <section class="panel">

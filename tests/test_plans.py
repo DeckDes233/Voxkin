@@ -7,6 +7,8 @@ from voxkin.agent.skills import find_skill, skill_ids
 SUPPORTED_VERIFY = {
     "always",
     "inventory",
+    "inventory_any",
+    "inventory_any",
     "position",
     "dimension",
     "health",
@@ -58,6 +60,10 @@ def test_verify_rules_are_supported() -> None:
         assert rule.get("type") in SUPPORTED_VERIFY, (stage, step.tool, rule)
         if rule["type"] == "inventory":
             assert rule.get("items"), (stage, step.tool)
+        if rule["type"] == "inventory_any":
+            assert rule.get("items") and rule.get("count", 1) > 0, (stage, step.tool, rule)
+        if rule["type"] == "inventory_any":
+            assert rule.get("items") and rule.get("count", 1) > 0, (stage, step.tool, rule)
 
 
 def test_stage_plans_follow_route_order() -> None:
@@ -82,7 +88,17 @@ def test_s3_budget_covers_the_iron_set_and_an_empty_bucket() -> None:
     assert bucket.verify["items"]["bucket"] == 1
 
 
-def test_s3_progress_keeps_bucket_requirement_after_filling_it_with_water() -> None:
+def test_s4_collects_both_diamond_ore_variants_and_verifies_the_drop() -> None:
+    steps = PLANS["S4"]
+    mining = next(step for step in steps if step.tool == "mine_collect" and step.arguments.get("block") == "diamond_ore")
+
+    assert mining.arguments["count"] == 3
+    assert mining.arguments["range"] == 64
+    assert mining.verify == {"type": "inventory", "items": {"diamond": 3}}
+    assert not any(step.tool == "find_diamond" for step in steps)
+
+
+def test_s3_progress_does_not_treat_filled_water_bucket_as_empty() -> None:
     from voxkin.agent.progress import STAGES, is_complete
 
     stage = next(stage for stage in STAGES if stage.id == "S3")
@@ -92,7 +108,7 @@ def test_s3_progress_keeps_bucket_requirement_after_filling_it_with_water() -> N
         "shield": 1,
         "water_bucket": 1,
     }
-    assert is_complete(stage, inventory)
+    assert not is_complete(stage, inventory)
 
 
 def test_s5_requires_flint_not_gravel_for_flint_and_steel() -> None:
@@ -183,11 +199,17 @@ def test_s2_manages_hunger_and_does_not_end_inside_a_sealed_shelter() -> None:
     shelter = next(step for step in steps if step.tool == "make_shelter")
     leave = next(step for step in steps if step.tool == "leave_shelter")
 
-    assert len(eat_steps) == 2
+    assert len(eat_steps) == 3
     assert all(step.verify == {"type": "food", "min": 8} for step in eat_steps)
-    assert all(step.arguments["threshold"] == 16 for step in eat_steps)
+    assert [step.arguments["threshold"] for step in eat_steps] == [16, 18, 16]
+    shears = next(
+        step for step in steps
+        if step.tool == "craft" and step.arguments.get("item") == "shears"
+    )
+    wool = next(step for step in steps if step.tool == "shear_sheep")
+    assert steps.index(shears) < steps.index(eat_steps[1]) < steps.index(wool)
     assert steps.index(eat_steps[0]) < steps.index(shelter)
-    assert steps.index(eat_steps[1]) < steps.index(shelter)
+    assert steps.index(eat_steps[2]) < steps.index(shelter)
     assert steps.index(leave) == steps.index(shelter) + 1
 
 
@@ -210,6 +232,13 @@ def test_s2_does_not_depend_on_trees_after_s1() -> None:
 def test_s2_hunts_inside_the_supported_radius() -> None:
     hunt = next(step for step in PLANS["S2"] if step.tool == "hunt_animal")
     assert hunt.arguments["radius"] == 64
+    assert "species" not in hunt.arguments
+    assert hunt.verify == {
+        "type": "inventory_any",
+        "items": ["beef", "porkchop", "chicken", "rabbit"],
+        "count": 3,
+    }
+    assert hunt.arguments["exclude_species"] == ["sheep"]
 
 
 def test_s2_resource_steps_verify_wool_and_bed_inventory() -> None:
@@ -223,20 +252,17 @@ def test_s2_resource_steps_verify_wool_and_bed_inventory() -> None:
 
     assert shears.arguments["item"] == "shears"
     assert wool.arguments["count"] == 3
-    assert wool.timeout_s == 180
+    assert wool.arguments["radius"] == 96
+    assert wool.timeout_s == 300
     assert wool.verify["items"] == {"wool": 3}
     assert bed.verify["items"] == {"bed": 1}
 
 
 def test_s2_shears_sheep_instead_of_hunting_them_for_wool() -> None:
-    sheep_steps = [
-        step
-        for step in PLANS["S2"]
-        if step.tool == "hunt_animal" and step.arguments.get("species") == "sheep"
-    ]
     steps = PLANS["S2"]
+    hunt = next(step for step in steps if step.tool == "hunt_animal")
 
-    assert sheep_steps == []
+    assert hunt.arguments["exclude_species"] == ["sheep"]
     iron = next(
         step
         for step in PLANS["S2"]
@@ -260,7 +286,7 @@ def test_s2_shears_sheep_instead_of_hunting_them_for_wool() -> None:
     wool = next(step for step in PLANS["S2"] if step.tool == "shear_sheep")
 
     assert iron.arguments["count"] == 2
-    assert [step.arguments["count"] for step in coal_steps] == [2, 2]
+    assert [step.arguments["count"] for step in coal_steps] == [2]
     assert fuel.arguments["item"] == "raw_iron"
     assert shears.arguments["item"] == "shears"
     assert steps.index(fuel) < steps.index(shears) < steps.index(wool)
@@ -273,10 +299,6 @@ def test_s2_preserves_enough_coal_to_cook_food_and_smelt_iron() -> None:
         for index, step in enumerate(steps)
         if step.tool == "mine_collect" and step.arguments.get("block") == "coal_ore"
     ]
-    food_smelt = next(
-        index for index, step in enumerate(steps)
-        if step.tool == "smelt_batch" and step.arguments.get("item") == "beef"
-    )
     iron_mine = next(
         index for index, step in enumerate(steps)
         if step.tool == "mine_collect" and step.arguments.get("block") == "iron_ore"
@@ -286,7 +308,18 @@ def test_s2_preserves_enough_coal_to_cook_food_and_smelt_iron() -> None:
         if step.tool == "smelt_batch" and step.arguments.get("item") == "raw_iron"
     )
 
-    assert len(coal_indices) == 2
+    assert len(coal_indices) == 1
     assert steps[coal_indices[0]].arguments["count"] == 2
-    assert steps[coal_indices[1]].arguments["count"] == 2
-    assert coal_indices[0] < food_smelt < iron_mine < coal_indices[1] < iron_smelt
+    assert iron_mine < coal_indices[0] < iron_smelt
+
+
+def test_s2_food_plan_does_not_require_cows_to_be_present() -> None:
+    steps = PLANS["S2"]
+    hunt = next(step for step in steps if step.tool == "hunt_animal")
+
+    assert "species" not in hunt.arguments
+    assert hunt.verify["type"] == "inventory_any"
+    assert not any(
+        step.tool == "smelt_batch" and step.arguments.get("item") in {"beef", "porkchop", "mutton", "chicken", "rabbit"}
+        for step in steps
+    )

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import time
 import uuid
+from collections import deque
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol
@@ -12,7 +14,6 @@ from voxkin.agent.actions import ActionDispatcher, ActionError
 from voxkin.agent.skills import find_skill
 from voxkin.bridge.protocol import ActionResult
 
-# 优先级数值越小越优先，与 docs/plans/VOICE_ACTION_LATENCY_PLAN.md 8.1 节一致。
 PRIORITY_SAFETY = 0
 PRIORITY_STOP = 1
 PRIORITY_PLAYER = 2
@@ -20,7 +21,6 @@ PRIORITY_TASK = 3
 PRIORITY_AUTONOMOUS = 4
 PRIORITY_REPORT = 5
 
-# 技能类型到默认优先级。type 来自技能清单，清单是唯一事实来源。
 TYPE_PRIORITY = {
     "sense": PRIORITY_REPORT,
     "voice": PRIORITY_REPORT,
@@ -29,23 +29,18 @@ TYPE_PRIORITY = {
     "wait": PRIORITY_TASK,
     "plan": PRIORITY_TASK,
 }
-
-# 会修改世界的技能类型：同一时刻只允许一个在跑。
 WORLD_TYPES = ("act", "path")
-
-# 停止类技能固定最高优先级，不受来源影响。
 STOP_SKILLS = ("stop",)
 
 
 def priority_for(tool: str, origin: str = "llm") -> int:
-    """算动作优先级。停止最高，反射次之，玩家指令再次，自主行为最低。"""
     if tool in STOP_SKILLS:
         return PRIORITY_STOP
     if origin == "reflex":
         return PRIORITY_SAFETY
-    if origin in ("fast_path", "player"):
+    if origin in ("fast_path", "player", "voice"):
         return PRIORITY_PLAYER
-    if origin == "autonomous":
+    if origin in ("autonomous", "goal"):
         return PRIORITY_AUTONOMOUS
     skill = find_skill(tool)
     skill_type = str(skill.get("type") or "") if skill else ""
@@ -53,7 +48,6 @@ def priority_for(tool: str, origin: str = "llm") -> int:
 
 
 def is_world_action(tool: str) -> bool:
-    """会不会改世界。清单里查不到的技能按会改世界处理，宁可排队也不要并发写世界。"""
     skill = find_skill(tool)
     if skill is None:
         return True
@@ -62,8 +56,6 @@ def is_world_action(tool: str) -> bool:
 
 @dataclass
 class ActionTicket:
-    """一次动作请求。action_id 在提交前就定下来，取消和结果路由都靠它。"""
-
     tool: str
     arguments: dict[str, Any] = field(default_factory=dict)
     action_id: str = ""
@@ -76,6 +68,8 @@ class ActionTicket:
     world_mutating: bool = False
     timeout_s: float = 0.0
     epoch: int = 0
+    goal_id: str = ""
+    intent_id: str = ""
     submitted_at: float = field(default_factory=time.monotonic)
 
     def describe(self) -> dict[str, Any]:
@@ -88,33 +82,27 @@ class ActionTicket:
             "priority": self.priority,
             "cancellable": self.cancellable,
             "world_mutating": self.world_mutating,
+            "goal_id": self.goal_id,
+            "intent_id": self.intent_id,
         }
 
 
 class ActionController(Protocol):
-    """管线只认这个接口，换实现不影响语音回合。"""
-
     async def submit(self, ticket: ActionTicket) -> ActionResult: ...
 
     async def cancel_all(self, reason: str) -> list[str]: ...
 
-    async def wait_cancelled(
-        self, action_ids: list[str], timeout_s: float = 5.0
-    ) -> bool: ...
+    async def wait_cancelled(self, action_ids: list[str], timeout_s: float = 5.0) -> bool: ...
 
     def status(self) -> dict[str, Any]: ...
 
 
-def cancelled_error(ticket: ActionTicket, reason: str) -> ActionError:
-    return ActionError(f"动作 {ticket.tool} 已被取消：{reason}", status="cancelled")
+def cancelled_error(ticket: ActionTicket, reason: str, status: str = "cancelled") -> ActionError:
+    return ActionError(f"动作 {ticket.tool} 已被中断：{reason}", status=status, action_id=ticket.action_id)
 
 
 class ActionArbiter:
-    """动作仲裁器：优先级、排队、当前动作、取消纪元与结果路由。
-
-    仲裁器只管「谁先跑、谁能抢、取消怎么落地」；
-    真正执行动作的是桥接，仲裁器通过 ActionDispatcher 与它说话。
-    """
+    """Core 准入并关联请求；排队、执行和抢占由 Bridge 的 Executor 独占管理。"""
 
     def __init__(
         self,
@@ -123,18 +111,16 @@ class ActionArbiter:
     ) -> None:
         self.dispatcher = dispatcher
         self.on_event = on_event
-        self._cond = asyncio.Condition()
         self._tickets: dict[str, ActionTicket] = {}
-        self._waiting: list[ActionTicket] = []
-        self._current: ActionTicket | None = None
-        self._cancelled: dict[str, str] = {}
         self._done: dict[str, asyncio.Event] = {}
-        self._epoch = 0
         self._history: deque[dict[str, Any]] = deque(maxlen=50)
+        self._receipt_events: dict[str, asyncio.Event] = {}
+        self._confirmed_receipts: set[str] = set()
+        self._receipt_order: deque[str] = deque()
+        self._epoch = 0
 
     @property
     def epoch(self) -> int:
-        """取消纪元。任何取消都会让它加一，旧规划据此判断自己已经过期。"""
         return self._epoch
 
     def _prepare(self, ticket: ActionTicket) -> None:
@@ -144,195 +130,190 @@ class ActionArbiter:
         skill = find_skill(ticket.tool)
         if skill is not None:
             ticket.cancellable = bool(skill.get("cancellable"))
-            # 不可取消的动作也不可被抢占，否则会留下写了一半的世界。
             ticket.preemptible = ticket.cancellable
         ticket.priority = priority_for(ticket.tool, ticket.origin)
         ticket.world_mutating = is_world_action(ticket.tool)
+        state = self.dispatcher.state_snapshot()
+        executor = state.get("executor") or {}
+        try:
+            self._epoch = int(executor.get("epoch", self._epoch))
+        except (TypeError, ValueError):
+            pass
         ticket.epoch = self._epoch
 
-    async def submit(self, ticket: ActionTicket) -> ActionResult:
-        """提交一个动作并等结果。被取消时抛 ActionError(status='cancelled')。"""
-        self._prepare(ticket)
-        state_provider = getattr(self.dispatcher, "state_snapshot", None)
-        state = state_provider() if state_provider is not None else {}
-        if is_world_action(ticket.tool):
-            if hasattr(self.dispatcher, "connected") and not self.dispatcher.connected:
-                raise ActionError("Minecraft bridge is disconnected", status="disconnected")
-            if state_provider is not None and not state:
-                raise ActionError("Minecraft world state is unavailable or stale", status="blocked")
-        if is_world_action(ticket.tool) and state.get("alive") is False:
+    def _validate_admission(self, ticket: ActionTicket) -> None:
+        if not ticket.world_mutating:
+            return
+        if not self.dispatcher.connected:
+            raise ActionError("Minecraft bridge is disconnected", status="disconnected")
+        state = self.dispatcher.state_snapshot()
+        if not state:
+            raise ActionError("Minecraft world state is unavailable or stale", status="blocked")
+        # 新协议下 ready 是硬准入条件；旧测试/客户端没有该字段时沿用基本校验。
+        if ("session_id" in state or "ready" in state) and state.get("ready") is not True:
+            raise ActionError("Minecraft bridge is not ready for ordinary actions", status="blocked")
+        if state.get("alive") is False:
             raise ActionError("Minecraft 角色已死亡，动作未派发", status="dead")
-        if is_world_action(ticket.tool):
-            position = state.get("position") or {}
-            if state.get("alive") is not True or not all(
-                isinstance(position.get(axis), (int, float))
-                and math.isfinite(float(position[axis]))
-                for axis in "xyz"
-            ):
-                raise ActionError("Minecraft world state is incomplete", status="blocked")
-            try:
-                health = float(state.get("health"))
-                if not math.isfinite(health):
-                    raise ValueError("non-finite health")
-                if health <= 0:
-                    raise ActionError("Minecraft 角色已死亡，动作未派发", status="dead")
-            except (TypeError, ValueError):
-                raise ActionError("Minecraft 生命值状态无效，动作未派发", status="blocked")
-        preempt: ActionTicket | None = None
-        async with self._cond:
-            self._tickets[ticket.action_id] = ticket
-            self._history.append({"event": "submitted", **ticket.describe()})
-            if ticket.world_mutating:
-                self._waiting.append(ticket)
-                self._waiting.sort(key=lambda item: (item.priority, item.submitted_at))
-                preempt = self._preempt_target(ticket)
-        if preempt is not None:
-            await self._cancel_ticket(preempt, "被更高优先级动作抢占")
-        result: ActionResult | None = None
+        position = state.get("position") or {}
+        if state.get("alive") is not True or not all(
+            isinstance(position.get(axis), (int, float))
+            and math.isfinite(float(position[axis]))
+            for axis in "xyz"
+        ):
+            raise ActionError("Minecraft world state is incomplete", status="blocked")
+        try:
+            health = float(state.get("health"))
+            if not math.isfinite(health):
+                raise ValueError("non-finite health")
+            if health <= 0:
+                raise ActionError("Minecraft 角色已死亡，动作未派发", status="dead")
+        except (TypeError, ValueError):
+            raise ActionError("Minecraft 生命值状态无效，动作未派发", status="blocked")
+
+    async def submit(self, ticket: ActionTicket) -> ActionResult:
+        self._prepare(ticket)
+        self._validate_admission(ticket)
+        self._tickets[ticket.action_id] = ticket
         done = asyncio.Event()
         self._done[ticket.action_id] = done
+        receipt = asyncio.Event()
+        self._receipt_events[ticket.action_id] = receipt
+        self._confirmed_receipts.discard(ticket.action_id)
+        self._receipt_order.append(ticket.action_id)
+        self._trim_receipts()
+        self._history.append({"event": "submitted", **ticket.describe()})
         try:
-            await self._acquire(ticket)
-            if ticket.action_id in self._cancelled:
-                raise cancelled_error(ticket, self._cancelled[ticket.action_id])
-            result = await self.dispatcher.dispatch_result(
+            dispatch = self.dispatcher.dispatch_result
+            try:
+                parameters = inspect.signature(dispatch).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            accepts_kwargs = any(
+                item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+            )
+            association = {
+                "action_id": ticket.action_id,
+                "priority": ticket.priority,
+                "goal_id": ticket.goal_id,
+                "intent_id": ticket.intent_id or ticket.turn_id or ticket.action_id,
+                "origin": ticket.origin,
+            }
+            supported = {
+                key: value
+                for key, value in association.items()
+                if accepts_kwargs or key in parameters
+            }
+            result = await dispatch(
                 ticket.tool,
                 ticket.arguments,
                 ticket.timeout_s or None,
-                action_id=ticket.action_id,
-                priority=ticket.priority,
+                **supported,
             )
-        finally:
-            await self._release(ticket)
-            async with self._cond:
-                self._tickets.pop(ticket.action_id, None)
-            done.set()
-        async with self._cond:
+            if result.status in {
+                "succeeded", "partial", "failed", "blocked", "cancelled",
+                "preempted", "dead", "disconnected",
+            }:
+                self._confirm_receipt(ticket.action_id)
             self._history.append(
                 {"event": "finished", "action_id": ticket.action_id, "status": result.status}
             )
-        return result
+            return result
+        except ActionError as error:
+            if error.receipt_confirmed:
+                self._confirm_receipt(ticket.action_id)
+            self._history.append(
+                {"event": "finished", "action_id": ticket.action_id, "status": error.status}
+            )
+            raise
+        finally:
+            self._tickets.pop(ticket.action_id, None)
+            done.set()
+            self._trim_receipts()
 
-    async def _acquire(self, ticket: ActionTicket) -> None:
-        """会改世界的动作排队执行，只读动作直接放行。"""
-        if not ticket.world_mutating:
-            return
-        async with self._cond:
-            while True:
-                if ticket.action_id in self._cancelled:
-                    return
-                if self._current is None and (
-                    not self._waiting or self._waiting[0] is ticket
-                ):
-                    if ticket in self._waiting:
-                        self._waiting.remove(ticket)
-                    self._current = ticket
-                    return
-                await self._cond.wait()
-
-    async def _release(self, ticket: ActionTicket) -> None:
-        if not ticket.world_mutating:
-            return
-        async with self._cond:
-            if self._current is ticket:
-                self._current = None
-            if ticket in self._waiting:
-                self._waiting.remove(ticket)
-            self._cond.notify_all()
-
-    def _preempt_target(self, ticket: ActionTicket) -> ActionTicket | None:
-        """新动作优先级更高时返回要抢占的目标。安全反射与停止可以抢占任何动作。"""
-        current = self._current
-        if current is None:
-            return None
-        if ticket.priority <= PRIORITY_STOP:
-            return current
-        if not current.preemptible:
-            return None
-        if current.priority <= ticket.priority:
-            return None
-        return current
-
-    async def cancel(self, action_id: str, reason: str = "cancelled") -> bool:
-        """按 action_id 取消一个动作。"""
-        async with self._cond:
-            ticket = self._tickets.get(action_id)
-            if ticket is None and action_id not in self._cancelled:
-                return False
-            self._cancelled[action_id] = reason
-            self._epoch += 1
-            self._cond.notify_all()
-        await self.dispatcher.cancel(action_id, reason, ticket.turn_id if ticket else "")
-        await self._emit(
-            {
-                "type": "action_cancelled",
-                "action_id": action_id,
-                "tool": ticket.tool if ticket else "",
-                "reason": reason,
-            }
+    async def cancel(
+        self,
+        action_id: str,
+        reason: str = "cancelled",
+        interrupt_status: str = "cancelled",
+    ) -> bool:
+        ticket = self._tickets.get(action_id)
+        if ticket is None:
+            return False
+        return await self.dispatcher.cancel(
+            action_id,
+            reason,
+            ticket.turn_id,
+            interrupt_status=interrupt_status,
         )
-        return True
 
     async def cancel_all(self, reason: str = "cancelled") -> list[str]:
-        """取消在途与排队的全部动作，返回被取消的 action_id 列表。"""
-        async with self._cond:
-            ids = list(self._tickets)
-            for action_id in ids:
-                self._cancelled[action_id] = reason
-            self._epoch += 1
-            self._cond.notify_all()
+        ids = list(self._tickets)
         await self.dispatcher.cancel_all(reason)
-        await self._emit({"type": "actions_cancelled", "action_ids": ids, "reason": reason})
+        await self._emit({"type": "actions_cancel_requested", "action_ids": ids, "reason": reason})
         return ids
 
     def is_cancelled(self, action_id: str) -> bool:
-        return action_id in self._cancelled
+        return False
 
-    async def wait_cancelled(
-        self, action_ids: list[str], timeout_s: float = 5.0
-    ) -> bool:
-        """等被取消的动作回报结果。返回是否都在时间内回报了。
-
-        收到回执是「停止生效」，超时是「停止没有确认」，两条结果不能混成一条。
-        """
+    async def wait_cancelled(self, action_ids: list[str], timeout_s: float = 5.0) -> bool:
         if not action_ids:
             return True
-        waiters = []
-        for action_id in action_ids:
-            event = self._done.get(action_id)
-            if event is not None:
-                waiters.append(event.wait())
-        if not waiters:
-            return True
-        try:
-            await asyncio.wait_for(asyncio.gather(*waiters), timeout=timeout_s)
-        except asyncio.TimeoutError:
-            return False
-        return True
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        terminal = {
+            "succeeded", "partial", "failed", "blocked", "cancelled",
+            "preempted", "dead", "disconnected",
+        }
+        while True:
+            unresolved = [action_id for action_id in action_ids if action_id not in self._confirmed_receipts]
+            if not unresolved:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            # 取消 action_result 若丢失，通过 Bridge action_id 账本核对 terminal receipt。
+            for action_id in unresolved:
+                if time.monotonic() >= deadline:
+                    break
+                query_status = getattr(self.dispatcher, "action_status", None)
+                if query_status is None:
+                    break
+                result = await query_status(action_id, timeout_s=min(0.2, max(0.05, deadline - time.monotonic())))
+                if result.status in terminal:
+                    self._confirm_receipt(action_id)
+            if all(action_id in self._confirmed_receipts for action_id in action_ids):
+                return True
+            await asyncio.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    def _confirm_receipt(self, action_id: str) -> None:
+        self._confirmed_receipts.add(action_id)
+        receipt = self._receipt_events.get(action_id)
+        if receipt is not None:
+            receipt.set()
+        self._trim_receipts()
+
+    def _trim_receipts(self) -> None:
+        attempts = len(self._receipt_order)
+        while len(self._receipt_order) > 100 and attempts > 0:
+            expired = self._receipt_order.popleft()
+            attempts -= 1
+            if expired in self._tickets:
+                self._receipt_order.append(expired)
+                continue
+            self._receipt_events.pop(expired, None)
+            self._done.pop(expired, None)
+            self._confirmed_receipts.discard(expired)
 
     def status(self) -> dict[str, Any]:
+        state = self.dispatcher.state_snapshot()
+        executor = state.get("executor") or {}
         return {
-            "current": self._current.describe() if self._current else None,
-            "waiting": [ticket.describe() for ticket in self._waiting],
+            "current": executor.get("active_action_id"),
+            "waiting": [],
             "tracked": len(self._tickets),
-            "epoch": self._epoch,
-            "cancelled": len(self._cancelled),
+            "epoch": executor.get("epoch", self._epoch),
+            "safety_active": bool(executor.get("safety_active")),
+            "actions": [ticket.describe() for ticket in self._tickets.values()],
         }
-
-    async def _cancel_ticket(self, ticket: ActionTicket, reason: str) -> None:
-        async with self._cond:
-            self._cancelled[ticket.action_id] = reason
-            self._epoch += 1
-            self._cond.notify_all()
-        await self.dispatcher.cancel(ticket.action_id, reason, ticket.turn_id)
-        await self._emit(
-            {
-                "type": "action_cancelled",
-                "action_id": ticket.action_id,
-                "tool": ticket.tool,
-                "reason": reason,
-            }
-        )
 
     async def _emit(self, payload: dict[str, Any]) -> None:
         if self.on_event is not None:

@@ -1,13 +1,14 @@
 import asyncio
 
 from voxkin.audio.sinks import WavDirSink
-from voxkin.config import VoxkinConfig
+from voxkin.config import TTSConfig, VoxkinConfig
 from voxkin.events import MetricsStore
 from voxkin.pipeline import ConversationPipeline
 from voxkin.runtime import Runtime
 from voxkin.services import ServiceSupervisor
 from voxkin.tts.base import TTSError
 from voxkin.tts.silent import SilentTTS
+from voxkin.tts import build_tts
 
 
 def test_silent_tts_reports_not_ready():
@@ -16,6 +17,13 @@ def test_silent_tts_reports_not_ready():
     assert described["engine"] == "silent"
     assert described["adapter_ready"] is False
     assert "服务没起来" in described["reason"]
+
+
+def test_build_tts_honors_explicit_silent_engine():
+    tts = build_tts(TTSConfig(engine="silent"))
+    assert isinstance(tts, SilentTTS)
+    assert tts.describe()["engine"] == "silent"
+    assert tts.describe()["adapter_ready"] is False
 
 
 def test_silent_tts_records_text_without_audio():

@@ -25,6 +25,8 @@ const LABELS = {
   shear_sheep: '剪羊毛',
   fight_blaze: '打烈焰人',
   hunt_enderman: '猎末影人',
+  harvest_iron_golem: '搭柱击打铁傀儡取铁',
+  loot_village: '收集村庄物资',
   break_crystal: '破坏末地水晶',
   end_break_crystal: '破坏末地水晶',
   equip_shield: '装备盾牌',
@@ -42,6 +44,7 @@ const LABELS = {
   safe_descend: '安全下降',
   swim_out_movement: '落水脱困',
   safe_travel: '避障长距离移动',
+  explore_mining_site: '换地点继续寻找矿区',
   parkour_safe: '受控跳跃',
   make_nether_portal: '造下界门',
   nether_travel: '下界坐标换算',
@@ -55,6 +58,7 @@ const LABELS = {
 
 // 需要更长预算的技能。桥接把单个动作的超时上限压在 300 秒。
 const TIMEOUTS = {
+  explore_mining_site: 180,
   smelt_batch: 300,
   craft_tool_set: 180,
   craft_torch: 180,
@@ -75,6 +79,8 @@ const TIMEOUTS = {
   hunt_animal: 180,
   shear_sheep: 180,
   hunt_enderman: 180,
+  harvest_iron_golem: 180,
+  loot_village: 250,
   fight_blaze: 240,
   checkpoint_stock: 120,
 };
@@ -108,10 +114,12 @@ function buildEntry(skillId, skill) {
     required: Boolean(parameter.required),
     default: parameter.default === undefined ? null : parameter.default,
     description: String(parameter.description || ''),
+    ...(parameter.items ? { items: parameter.items } : {}),
+    ...(parameter.enum ? { enum: parameter.enum } : {}),
   }));
   return {
     skill_id: skillId,
-    group: '专精类',
+    group: skillId === 'fill_water_bucket' ? '实用类' : '专精类',
     type: SENSE_IDS.has(skillId) ? 'sense' : 'act',
     description,
     intent_examples: intentExamples(skillId, label),
@@ -151,6 +159,8 @@ function renderEntry(entry) {
       lines.push(`          required: ${parameter.required},`);
       lines.push(`          default: ${JSON.stringify(parameter.default)},`);
       lines.push(`          description: ${JSON.stringify(parameter.description)},`);
+      if (parameter.items) lines.push(`          items: ${JSON.stringify(parameter.items)},`);
+      if (parameter.enum) lines.push(`          enum: ${JSON.stringify(parameter.enum)},`);
       lines.push('        },');
     }
     lines.push('      ],');

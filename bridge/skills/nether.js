@@ -35,6 +35,28 @@ const BLAZE_ROD_TARGET = 7;
 // 找下界门与堡垒结构的默认半径。
 const DEFAULT_PORTAL_RADIUS = 32;
 const DEFAULT_FORTRESS_RADIUS = 64;
+const FORTRESS_ROUTE_SPACING = 16;
+const FORTRESS_ROUTE_BUDGET_WAYPOINTS = 16;
+const BLAZE_PATROL_BUDGET = 8;
+
+function canonicalDimension(value) {
+  const dimension = String(value || '').trim().toLowerCase();
+  return {
+    overworld: OVERWORLD_DIMENSION,
+    the_nether: NETHER_DIMENSION,
+    the_end: END_DIMENSION,
+  }[dimension] || dimension;
+}
+
+// 导航只依赖能明确指向下界砖堡垒的方块，避免把普通下界地形当结构。
+const FORTRESS_STRUCTURE_BLOCKS = new Set([
+  'nether_bricks',
+  'nether_brick_fence',
+  'nether_brick_stairs',
+  'nether_brick_slab',
+  'nether_brick_wall',
+  'nether_wart',
+]);
 
 // 岩浆类方块：掉进去会烧死，捡掉落物时必须避开。
 const LAVA_BLOCK_NAMES = new Set(['lava', 'flowing_lava', 'magma_block', 'lava_cauldron']);
@@ -96,31 +118,50 @@ const BLOCK_LABELS = {
   blackstone: '黑石',
 };
 
-// 模块级状态：技能模块在桥接里是长驻单例，这些状态跨调用保留，
-// 供堡垒探索迷路时回退（记住门的位置与最近看到的堡垒结构）。
+// 模块级状态只服务当前 Bridge 进程；可恢复事实会随动作结果返回给 Core。
 const moduleState = {
-  portal: null,
-  structure: null,
-  spiralStep: 0,
+  portalTransition: null,
+  structures: [],
 };
+
+function copyAnchor(anchor) {
+  if (!anchor) return null;
+  return {
+    dimension: anchor.dimension,
+    position: { ...anchor.position },
+    observed: anchor.observed,
+  };
+}
+
+function portalTransitionData(transition = moduleState.portalTransition) {
+  if (!transition) return null;
+  return {
+    source: copyAnchor(transition.source),
+    target: copyAnchor(transition.target),
+  };
+}
+
+function withActionData(error, data) {
+  const result = error instanceof Error ? error : new Error(String(error));
+  result.data = { ...(result.data || {}), ...data };
+  return result;
+}
 
 // ------------------------------------------------------------------ 纯逻辑
 
 // 维度判断：下界是 minecraft:the_nether。
 export function isNetherDimension(dimension) {
-  return String(dimension || '').toLowerCase().includes('nether');
+  return canonicalDimension(dimension) === NETHER_DIMENSION;
 }
 
-// 主世界判断：拿不到维度信息时按主世界处理。
+// 主世界判断只接受 Mineflayer 的原版维度 ID。
 export function isOverworldDimension(dimension) {
-  const text = String(dimension || '').toLowerCase();
-  if (!text) return true;
-  return text.includes('overworld');
+  return canonicalDimension(dimension) === OVERWORLD_DIMENSION;
 }
 
 // 末地判断。
 export function isEndDimension(dimension) {
-  return String(dimension || '').toLowerCase().includes('end');
+  return canonicalDimension(dimension) === END_DIMENSION;
 }
 
 // 通用坐标缩放：factor 是倍率，结果按格取整。
@@ -274,15 +315,13 @@ function throwIfInterrupted(ctx, action) {
 function currentDimension(ctx) {
   const bot = ctx && ctx.bot;
   const game = bot && bot.game;
-  return String((game && game.dimension) || '').toLowerCase();
+  return canonicalDimension(game && game.dimension);
 }
 
 function isExpectedDimension(ctx, expected) {
   const actual = currentDimension(ctx);
   if (expected === NETHER_DIMENSION) return isNetherDimension(actual);
-  if (expected === OVERWORLD_DIMENSION) {
-    return actual === OVERWORLD_DIMENSION || actual === 'overworld';
-  }
+  if (expected === OVERWORLD_DIMENSION) return isOverworldDimension(actual);
   return actual === expected;
 }
 
@@ -529,12 +568,21 @@ async function makeNetherPortal(args, ctx) {
   }
   throwIfInterrupted(ctx, 'Building nether portal');
 
-  moduleState.portal = {
-    x: site.origin.x,
-    y: site.origin.y,
-    z: site.origin.z,
-    dimension: currentDimension(ctx),
-  };
+  const observedPortal = findNearbyPortal(ctx, 8);
+  moduleState.portalTransition = observedPortal
+    ? {
+        source: {
+          dimension: currentDimension(ctx),
+          position: {
+            x: Math.floor(Number(observedPortal.x)),
+            y: Math.floor(Number(observedPortal.y)),
+            z: Math.floor(Number(observedPortal.z)),
+          },
+          observed: 'nether_portal_block',
+        },
+        target: null,
+      }
+    : null;
 
   const parts = [
     `下界门已建好并点燃，位置 (${site.origin.x}, ${site.origin.y}, ${site.origin.z})`,
@@ -561,31 +609,131 @@ async function makeNetherPortal(args, ctx) {
     );
   }
 
-  return { detail: parts.join('，'), status: 'succeeded' };
+  return {
+    detail: parts.join('，'),
+    status: 'succeeded',
+    data: { portal_transition: portalTransitionData() },
+  };
 }
 
 // ------------------------------------------------------------------ 维度换算
 
 // 找附近的下界门。
 function findNearbyPortal(ctx, radius) {
+  const candidates = new Map();
   if (typeof ctx.nearbyBlock === 'function') {
     const block = ctx.nearbyBlock('nether_portal', radius);
-    if (block && block.position) return block.position;
+    if (block && block.position) {
+      const key = positionKey(block.position);
+      if (key) candidates.set(key, block.position);
+    }
   }
   const bot = botOf(ctx);
   const registry = bot.registry && bot.registry.blocksByName;
   const entry = registry && registry['nether_portal'];
-  if (!entry || typeof bot.findBlocks !== 'function') return null;
-  try {
-    const positions = bot.findBlocks({
-      matching: entry.id,
-      maxDistance: radius,
-      count: 1,
-    });
-    return positions.length > 0 ? positions[0] : null;
-  } catch {
-    return null;
+  if (entry && typeof bot.findBlocks === 'function') {
+    try {
+      const positions = bot.findBlocks({
+        matching: entry.id,
+        maxDistance: radius,
+        count: 16,
+      });
+      for (const position of positions || []) {
+        const key = positionKey(position);
+        if (key) candidates.set(key, position);
+      }
+    } catch {
+      // 加载中的区块不可读时按没有找到门处理。
+    }
   }
+  for (const position of candidates.values()) {
+    const fresh = readFreshPortalBlock(ctx, position);
+    if (fresh) return fresh;
+  }
+  return null;
+}
+
+function positionKey(position) {
+  if (!position || typeof position !== 'object') return '';
+  const coordinates = [];
+  for (const axis of 'xyz') {
+    const value = Number(position[axis]);
+    if (!Number.isFinite(value)) return '';
+    coordinates.push(Math.floor(value));
+  }
+  return coordinates.join(',');
+}
+
+function readFreshPortalBlock(ctx, position) {
+  const key = positionKey(position);
+  const bot = botOf(ctx);
+  if (!key || typeof bot.blockAt !== 'function') return null;
+  const [x, y, z] = key.split(',').map(Number);
+  const base = bot.entity && bot.entity.position;
+  const Vector = base && base.constructor;
+  let vector = { x, y, z };
+  if (typeof Vector === 'function' && Vector !== Object) {
+    try {
+      vector = new Vector(x, y, z);
+    } catch {
+      vector = { x, y, z };
+    }
+  }
+  const block = bot.blockAt(vector);
+  if (!block || block.name !== 'nether_portal') return null;
+  const actualPosition = block.position || { x, y, z };
+  return { x: Math.floor(Number(actualPosition.x)), y: Math.floor(Number(actualPosition.y)), z: Math.floor(Number(actualPosition.z)) };
+}
+
+function portalHint(value) {
+  if (!value || typeof value !== 'object') return null;
+  const readAnchor = (anchor, observed) => {
+    if (!anchor || typeof anchor !== 'object') return null;
+    const dimension = canonicalDimension(anchor.dimension);
+    if (![OVERWORLD_DIMENSION, NETHER_DIMENSION].includes(dimension) || anchor.observed !== observed) return null;
+    const key = positionKey(anchor.position);
+    if (!key) return null;
+    const [x, y, z] = key.split(',').map(Number);
+    return { dimension, position: { x, y, z }, observed };
+  };
+  const source = readAnchor(value.source, 'nether_portal_block');
+  const target = readAnchor(value.target, 'arrival_checkpoint');
+  if (!source || !target || source.dimension === target.dimension) return null;
+  return { source, target };
+}
+
+// 缓存点只用于回到该维度附近；是否有门必须重新读取方块。
+async function findPortalNearRecordedAnchor(ctx, radius, dimension, restoredHint = null) {
+  const transitions = [portalHint(restoredHint), portalHint(moduleState.portalTransition)].filter(Boolean);
+  const anchors = transitions.flatMap((transition) => [transition.target, transition.source]).filter(
+    (anchor) => anchor.dimension === dimension && anchor.position,
+  );
+  for (const anchor of anchors) {
+    throwIfInterrupted(ctx, '寻找下界门');
+    try {
+      const position = botOf(ctx).entity.position;
+      const distance = Math.hypot(
+        anchor.position.x - position.x,
+        anchor.position.z - position.z,
+      );
+      if (distance > 3) {
+        if (typeof ctx.travelTo !== 'function') continue;
+        await ctx.travelTo(anchor.position.x, anchor.position.y, anchor.position.z, 3);
+      }
+      throwIfInterrupted(ctx, '寻找下界门');
+      if (currentDimension(ctx) !== dimension) {
+        throw new Error('移动到已记录锚点时维度发生变化，停止寻找下界门');
+      }
+      const portal = findNearbyPortal(ctx, radius);
+      if (portal) return portal;
+      log(ctx, '已到达记录锚点，但附近重新扫描没有发现下界门');
+    } catch (error) {
+      throwIfInterrupted(ctx, '寻找下界门');
+      if (currentDimension(ctx) !== dimension) throw error;
+      log(ctx, '回到记录锚点失败', error.message);
+    }
+  }
+  return null;
 }
 
 // 等维度变化。
@@ -602,6 +750,7 @@ async function waitDimension(ctx, expected, timeoutMs) {
 // 走进下界门。
 async function enterPortal(ctx, portal, expectedDimension, timeoutMs) {
   throwIfInterrupted(ctx, '穿过下界门');
+  const sourceDimension = currentDimension(ctx);
   try {
     await ctx.travelTo(portal.x, portal.y, portal.z, 1);
   } catch (error) {
@@ -613,11 +762,26 @@ async function enterPortal(ctx, portal, expectedDimension, timeoutMs) {
   while (Date.now() < deadline) {
     throwIfInterrupted(ctx, '穿过下界门');
     if (isExpectedDimension(ctx, expectedDimension)) return true;
+    const beforeWalkDimension = currentDimension(ctx);
+    if (beforeWalkDimension !== sourceDimension) {
+      throw new Error(
+        '没有走进下界门所连的预期维度，实际到达了非预期维度 ' + beforeWalkDimension +
+          '，预期 ' + expectedDimension + '；停止重复穿门动作',
+      );
+    }
     try {
       await ctx.walkOnce(portal.x, portal.y, portal.z, 1, 4000);
     } catch (error) {
       throwIfInterrupted(ctx, '穿过下界门');
       log(ctx, '进门动作失败', error.message);
+    }
+    if (isExpectedDimension(ctx, expectedDimension)) return true;
+    const afterWalkDimension = currentDimension(ctx);
+    if (afterWalkDimension !== sourceDimension) {
+      throw new Error(
+        '没有走进下界门所连的预期维度，实际到达了非预期维度 ' + afterWalkDimension +
+          '，预期 ' + expectedDimension + '；停止重复穿门动作',
+      );
     }
     await sleepMs(ctx, 400);
   }
@@ -666,6 +830,10 @@ async function netherTravel(args, ctx) {
     };
   }
 
+  if (dimension !== OVERWORLD_DIMENSION && dimension !== NETHER_DIMENSION) {
+    throw new Error(`当前维度 ${dimension || '未知'} 不是可验证的原版主世界或下界，停止过门`);
+  }
+
   // 过门：先确认当前维度对不对。
   if (wanted === 'enter' && isNetherDimension(dimension)) {
     throw new Error('已经在下界里了，要回主世界请用 exit');
@@ -673,24 +841,57 @@ async function netherTravel(args, ctx) {
   if (wanted === 'exit' && !isNetherDimension(dimension)) {
     throw new Error('当前不在下界，附近没有下界门可以回去');
   }
+  if (!dimension) {
+    throw new Error('读不到当前维度，无法安全穿过下界门');
+  }
 
-  const portal = findNearbyPortal(ctx, radius);
+  let portal = findNearbyPortal(ctx, radius);
+  if (!portal) portal = await findPortalNearRecordedAnchor(ctx, radius, dimension, args.portal_hint);
   if (!portal) {
     throw new Error(`附近 ${radius} 格内没有下界门，先建好门再过`);
   }
-  moduleState.portal = { x: portal.x, y: portal.y, z: portal.z, dimension };
+  const sourceAnchor = {
+    dimension,
+    position: {
+      x: Math.floor(Number(portal.x)),
+      y: Math.floor(Number(portal.y)),
+      z: Math.floor(Number(portal.z)),
+    },
+    observed: 'nether_portal_block',
+  };
+  moduleState.portalTransition = { source: sourceAnchor, target: null };
 
   const expectedDimension = wanted === 'enter' ? NETHER_DIMENSION : OVERWORLD_DIMENSION;
-  const passed = await enterPortal(ctx, portal, expectedDimension, timeoutMs);
+  let passed;
+  try {
+    passed = await enterPortal(ctx, portal, expectedDimension, timeoutMs);
+  } catch (error) {
+    throw withActionData(error, {
+      portal_transition: portalTransitionData({ source: sourceAnchor, target: null }),
+      observed_dimension: currentDimension(ctx),
+    });
+  }
   if (!passed) {
-    throw new Error(
+    throw withActionData(new Error(
       `没有走进下界门，附近 (${portal.x}, ${portal.y}, ${portal.z}) 的门没有把维度切过去`
-    );
+    ), {
+      portal_transition: portalTransitionData({ source: sourceAnchor, target: null }),
+      observed_dimension: currentDimension(ctx),
+    });
   }
 
   const arrived = currentDimension(ctx);
   const checkpoint = checkpointInfo(bot.entity.position, arrived);
-  moduleState.portal = { x: portal.x, y: portal.y, z: portal.z, dimension: arrived };
+  const targetAnchor = {
+    dimension: arrived,
+    position: {
+      x: Math.floor(Number(bot.entity.position.x)),
+      y: Math.floor(Number(bot.entity.position.y)),
+      z: Math.floor(Number(bot.entity.position.z)),
+    },
+    observed: 'arrival_checkpoint',
+  };
+  moduleState.portalTransition = { source: sourceAnchor, target: targetAnchor };
   const netherPart = checkpoint
     ? `下界 (${checkpoint.nether.x}, ${checkpoint.position.y}, ${checkpoint.nether.z})`
     : '下界坐标未知';
@@ -705,6 +906,10 @@ async function netherTravel(args, ctx) {
       `对应${netherPart}，对应${overworldPart}`,
     status: 'succeeded',
     checkpoint,
+    data: {
+      checkpoint,
+      portal_transition: portalTransitionData(),
+    },
   };
 }
 
@@ -735,7 +940,7 @@ function findFortressStructure(ctx, radius) {
   const origin = bot.entity.position;
   let best = null;
   let bestDistance = Infinity;
-  for (const name of FORTRESS_BLOCKS) {
+  for (const name of FORTRESS_STRUCTURE_BLOCKS) {
     const entry = registry[name];
     if (!entry || typeof bot.findBlocks !== 'function') continue;
     let positions = [];
@@ -753,6 +958,66 @@ function findFortressStructure(ctx, radius) {
     }
   }
   return best;
+}
+
+function isLiveFortressStructure(ctx, record) {
+  if (!record || record.dimension !== currentDimension(ctx)) return false;
+  const block = blockAt(
+    ctx,
+    record.position.x,
+    record.position.y,
+    record.position.z,
+  );
+  return Boolean(block && block.name === record.block && FORTRESS_STRUCTURE_BLOCKS.has(block.name));
+}
+
+function fortressStructureKey(record) {
+  return record.dimension + ':' + record.position.x + ',' + record.position.y + ',' + record.position.z;
+}
+
+function rememberFortressStructure(ctx, structure, evidence) {
+  if (!structure) return null;
+  const record = {
+    dimension: currentDimension(ctx),
+    block: structure.name,
+    position: {
+      x: Math.floor(Number(structure.x)),
+      y: Math.floor(Number(structure.y)),
+      z: Math.floor(Number(structure.z)),
+    },
+  };
+  const key = fortressStructureKey(record);
+  const previous = moduleState.structures.findIndex((entry) => fortressStructureKey(entry) === key);
+  if (previous < 0) {
+    moduleState.structures.push(record);
+    if (moduleState.structures.length > 32) moduleState.structures.shift();
+  } else {
+    moduleState.structures[previous] = record;
+  }
+  if (evidence) evidence.set(key, record);
+  return record;
+}
+
+function fortressEvidenceData(dimension, evidence, route = null) {
+  const data = {
+    dimension,
+    observed_blocks: [...evidence.values()].map((entry) => ({
+      dimension: entry.dimension,
+      block: entry.block,
+      position: { ...entry.position },
+    })),
+  };
+  if (route) {
+    data.route = {
+      origin: { ...route.origin },
+      scan_radius: route.scanRadius,
+      waypoint_spacing: FORTRESS_ROUTE_SPACING,
+      route_budget_waypoints: route.budgetWaypoints,
+      attempted_waypoints: route.attemptedWaypoints,
+      dimension: route.dimension,
+    };
+  }
+  return data;
 }
 
 // 请战斗模块打烈焰人。ctx 没有技能入口时返回 null。
@@ -776,51 +1041,64 @@ async function callCombatEntry(ctx, options) {
   return null;
 }
 
-// 迷路时的回退路径：优先走回最近看到的堡垒结构，其次走回下界门，
-// 都没有就按螺旋方向往外扩一圈再找。
-async function fallbackStep(ctx, radius) {
-  throwIfInterrupted(ctx, '探索下界堡垒');
-  const bot = botOf(ctx);
-  const base = bot.entity.position;
-  const headings = [
-    { x: 0, z: 1 },
-    { x: -1, z: 0 },
-    { x: 0, z: -1 },
-    { x: 1, z: 0 },
-  ];
-
-  const targets = [];
-  if (moduleState.structure) {
-    targets.push({ ...moduleState.structure, label: '堡垒结构' });
-  }
-  if (moduleState.portal) {
-    targets.push({ ...moduleState.portal, label: '下界门' });
-  }
-  for (const target of targets) {
-    const distance = Math.hypot(target.x - base.x, target.z - base.z);
-    if (distance < 3) continue;
-    try {
-      await ctx.travelTo(target.x, target.y, target.z, 3);
-      log(ctx, `回退到${target.label}`, `${target.x}, ${target.y}, ${target.z}`);
-      return true;
-    } catch (error) {
-      throwIfInterrupted(ctx, '探索下界堡垒');
-      log(ctx, `回退到${target.label}失败`, error.message);
-    }
-  }
-
-  // 螺旋外扩：每 4 步换一个方向，步长逐圈加大。
-  moduleState.spiralStep += 1;
-  const heading = headings[moduleState.spiralStep % headings.length];
-  const ring = Math.floor(moduleState.spiralStep / headings.length) + 1;
-  const step = Math.min(radius, 8 * ring);
-  const target = {
-    x: Math.floor(base.x + heading.x * step),
-    y: Math.floor(base.y),
-    z: Math.floor(base.z + heading.z * step),
+// 探索路线围绕本次调用的固定原点生成，radius 只用于每个位置的扫描。
+function makeFortressRoute(position, dimension, scanRadius) {
+  const origin = {
+    x: Math.floor(Number(position.x)),
+    y: Math.floor(Number(position.y)),
+    z: Math.floor(Number(position.z)),
   };
+  const waypoints = [];
+  let x = 0;
+  let z = 0;
+  let dx = 1;
+  let dz = 0;
+  let segmentLength = 1;
+  while (waypoints.length < FORTRESS_ROUTE_BUDGET_WAYPOINTS) {
+    for (let segment = 0; segment < 2 && waypoints.length < FORTRESS_ROUTE_BUDGET_WAYPOINTS; segment += 1) {
+      for (let step = 0; step < segmentLength && waypoints.length < FORTRESS_ROUTE_BUDGET_WAYPOINTS; step += 1) {
+        x += dx;
+        z += dz;
+        waypoints.push({
+          x: origin.x + x * FORTRESS_ROUTE_SPACING,
+          y: origin.y,
+          z: origin.z + z * FORTRESS_ROUTE_SPACING,
+        });
+      }
+      const nextX = -dz;
+      dz = dx;
+      dx = nextX;
+    }
+    segmentLength += 1;
+  }
+  return {
+    origin,
+    dimension,
+    scanRadius,
+    budgetWaypoints: FORTRESS_ROUTE_BUDGET_WAYPOINTS,
+    attemptedWaypoints: 0,
+    nextWaypoint: 0,
+    waypoints,
+  };
+}
+
+async function fallbackStep(ctx, route) {
+  throwIfInterrupted(ctx, '探索下界堡垒');
+  if (currentDimension(ctx) !== route.dimension) {
+    throw new Error('探索路线维度变化，停止继续移动');
+  }
+  if (route.attemptedWaypoints >= route.budgetWaypoints || route.nextWaypoint >= route.waypoints.length) {
+    return false;
+  }
+  const target = route.waypoints[route.nextWaypoint];
+  route.nextWaypoint += 1;
+  route.attemptedWaypoints += 1;
   try {
     await ctx.travelTo(target.x, target.y, target.z, 3);
+    throwIfInterrupted(ctx, '探索下界堡垒');
+    if (currentDimension(ctx) !== route.dimension) {
+      throw new Error('探索路线移动后维度发生变化，停止继续移动');
+    }
     return true;
   } catch (error) {
     throwIfInterrupted(ctx, '探索下界堡垒');
@@ -839,25 +1117,42 @@ async function raidFortress(args, ctx) {
   const radius = clampNumber(args.radius, DEFAULT_FORTRESS_RADIUS, 16, 128);
   const timeoutMs = clampNumber(args.timeout_s, 120, 10, 600) * 1000;
   const wantBlazes = clampNumber(args.blazes, 1, 8, 1);
+  const route = makeFortressRoute(botOf(ctx).entity.position, dimension, radius);
   const deadline = Date.now() + timeoutMs;
 
   const notes = [];
+  const structureEvidence = new Map();
+  const visitedStructures = new Set();
   let structureFound = null;
   let blazeSeen = null;
   let lastSearch = 0;
 
   while (Date.now() < deadline) {
     throwIfInterrupted(ctx, '探索下界堡垒');
+    if (currentDimension(ctx) !== dimension) {
+      throw withActionData(new Error('探索期间维度发生变化，停止继续移动'), {
+        fortress_evidence: fortressEvidenceData(dimension, structureEvidence, route),
+      });
+    }
+
     // 1. 先看附近有没有烈焰人。
     const blaze = findBlaze(ctx, radius);
     if (blaze) {
       blazeSeen = blaze;
       const position = blaze.position;
       const distance = Math.floor(position.distanceTo(botOf(ctx).entity.position));
+      const blazeEvidence = {
+        dimension,
+        position: {
+          x: Math.floor(position.x),
+          y: Math.floor(position.y),
+          z: Math.floor(position.z),
+        },
+      };
       log(
         ctx,
         '发现烈焰人',
-        `${position.x.toFixed(1)}, ${position.y.toFixed(1)}, ${position.z.toFixed(1)}`
+        position.x.toFixed(1) + ', ' + position.y.toFixed(1) + ', ' + position.z.toFixed(1),
       );
 
       // 2. 有战斗技能入口就请它去打。
@@ -876,6 +1171,10 @@ async function raidFortress(args, ctx) {
             `烈焰棒现在 ${rods} 根` +
             (notes.length ? `；${notes.join('，')}` : ''),
           status: outcome.status === 'partial' ? 'partial' : outcome.status === 'failed' ? 'failed' : 'succeeded',
+          data: {
+            fortress_evidence: fortressEvidenceData(dimension, structureEvidence, route),
+            blaze_evidence: blazeEvidence,
+          },
         };
       }
 
@@ -889,49 +1188,78 @@ async function raidFortress(args, ctx) {
             ? `堡垒结构在 (${structureFound.x}, ${structureFound.y}, ${structureFound.z})。`
             : `附近还没找到堡垒结构，只看到这只烈焰人。`),
         status: 'partial',
+        data: {
+          fortress_evidence: fortressEvidenceData(dimension, structureEvidence, route),
+          blaze_evidence: blazeEvidence,
+        },
       };
     }
 
-    // 4. 找堡垒结构，往那边走。
+    // 4. 找当前维度里实扫到的下界砖结构。
     const structure = findFortressStructure(ctx, radius);
     if (structure) {
       if (!structureFound) structureFound = structure;
-      moduleState.structure = structure;
+      const evidence = rememberFortressStructure(ctx, structure, structureEvidence);
+      const key = fortressStructureKey(evidence);
       const origin = botOf(ctx).entity.position;
       const distance = Math.hypot(structure.x - origin.x, structure.z - origin.z);
-      if (distance > 6) {
-        log(ctx, '往堡垒结构走', `${structure.name} @ ${structure.x}, ${structure.y}, ${structure.z}`);
+      if (distance > 6 && !visitedStructures.has(key) && route.attemptedWaypoints < route.budgetWaypoints) {
+        visitedStructures.add(key);
+        route.attemptedWaypoints += 1;
+        log(ctx, '往实测堡垒方块走', structure.name + ' @ ' + structure.x + ', ' + structure.y + ', ' + structure.z);
         try {
           await ctx.travelTo(structure.x, structure.y, structure.z, 3);
+          throwIfInterrupted(ctx, '探索下界堡垒');
+          if (currentDimension(ctx) !== dimension) {
+            throw new Error('前往堡垒方块后维度发生变化，停止继续移动');
+          }
         } catch (error) {
           throwIfInterrupted(ctx, '探索下界堡垒');
-          log(ctx, '走不到堡垒结构', error.message);
+          if (currentDimension(ctx) !== dimension) {
+            throw withActionData(error, {
+              fortress_evidence: fortressEvidenceData(dimension, structureEvidence, route),
+            });
+          }
+          log(ctx, '走不到堡垒方块', error.message);
         }
         continue;
       }
-      notes.push(`在 (${structure.x}, ${structure.y}, ${structure.z}) 看到 ${label(ctx, structure.name)}`);
+      if (distance <= 6) {
+        notes.push('在 (' + structure.x + ', ' + structure.y + ', ' + structure.z + ') 看到 ' + label(ctx, structure.name));
+      }
     }
 
-    // 5. 附近什么都没有，走回退路径换个方向再找。
+    // 5. 没有可追的实测方块时，围绕本次起点走下一个有限路线点。
     if (Date.now() - lastSearch > 1500) {
       lastSearch = Date.now();
-      const moved = await fallbackStep(ctx, radius);
+      const moved = await fallbackStep(ctx, route);
+      if (!moved && route.attemptedWaypoints >= route.budgetWaypoints) break;
       if (!moved) await sleepMs(ctx, 1000);
     } else {
       await sleepMs(ctx, 500);
     }
   }
 
+  const data = {
+    fortress_evidence: fortressEvidenceData(dimension, structureEvidence, route),
+  };
   if (blazeSeen) {
-    throw new Error(
-      `时间到了，附近没有打赢烈焰人，坐标 (${Math.floor(blazeSeen.position.x)}, ` +
-        `${Math.floor(blazeSeen.position.y)}, ${Math.floor(blazeSeen.position.z)})；` +
-        `附近也没有别的东西可以换目标`
+    throw withActionData(
+      new Error(
+        `时间到了，附近没有打赢烈焰人，坐标 (${Math.floor(blazeSeen.position.x)}, ` +
+          `${Math.floor(blazeSeen.position.y)}, ${Math.floor(blazeSeen.position.z)})；` +
+          `附近也没有别的东西可以换目标`,
+      ),
+      data,
     );
   }
-  throw new Error(
-    `附近 ${radius} 格内没有堡垒结构，也没有烈焰人，找不到可以探索的方向` +
-      (notes.length ? `；${notes.join('，')}` : '')
+  throw withActionData(
+    new Error(
+      `附近 ${radius} 格内没有堡垒结构，也没有烈焰人，探索路线预算 ` +
+        route.attemptedWaypoints + '/' + route.budgetWaypoints + ' 个点已用；' +
+        (notes.length ? notes.join('，') : '找不到可以探索的方向'),
+    ),
+    data,
   );
 }
 
@@ -996,9 +1324,9 @@ function standingInLava(ctx) {
 }
 
 // 找附近能站的落脚点。
-function findSafeSpot(ctx, radius) {
+function findSafeSpot(ctx, radius, center = null) {
   const bot = botOf(ctx);
-  const base = bot.entity.position;
+  const base = center || bot.entity.position;
   for (let distance = 1; distance <= radius; distance += 1) {
     for (let step = 0; step < 8; step += 1) {
       const angle = (Math.PI * 2 * step) / 8;
@@ -1010,7 +1338,7 @@ function findSafeSpot(ctx, radius) {
         if (!ground || ground.boundingBox !== 'block') continue;
         if (isLavaName(ground.name)) continue;
         const above = blockAt(ctx, x, y + 1, z);
-        if (above && above.boundingBox !== 'empty') continue;
+        if (!above || above.boundingBox !== 'empty') continue;
         return { x, y: y + 1, z };
       }
     }
@@ -1038,32 +1366,51 @@ async function escapeLava(ctx) {
 
 // 收集烈焰棒：捡掉落物，避开岩浆。
 async function collectBlazeRods(args, ctx) {
-  const wanted = clampNumber(args.count, BLAZE_ROD_TARGET, 1, 64);
+  const wanted = Math.floor(clampNumber(args.count, BLAZE_ROD_TARGET, 1, 64));
   const radius = clampNumber(args.radius, 24, 4, 64);
   const timeoutMs = clampNumber(args.timeout_s, 180, 10, 900) * 1000;
   const deadline = Date.now() + timeoutMs;
+  const dimension = currentDimension(ctx);
 
-  let rods = ctx.countItem('blaze_rod');
+  let rods = Math.max(0, Math.floor(Number(ctx.countItem('blaze_rod')) || 0));
   if (rods >= wanted) {
     return {
       detail: `背包里已经有 ${rods} 根烈焰棒，够 ${wanted} 根`,
       status: 'succeeded',
+      data: {
+        inventory: { blaze_rod: rods },
+        target: wanted,
+        missing: 0,
+        fortress_evidence: { dimension, observed_blocks: [] },
+      },
     };
   }
 
   const notes = [];
   const tried = new Set();
+  const structureEvidence = new Map();
+  const visitedStructures = new Set();
+  const observedBlazes = new Map();
   let picked = 0;
   let avoided = 0;
   let blazeNoted = false;
+  let patrols = 0;
 
   while (Date.now() < deadline && rods < wanted) {
     throwIfInterrupted(ctx, '收集烈焰棒');
+    if (currentDimension(ctx) !== dimension) {
+      throw withActionData(new Error('收集期间维度发生变化，停止继续移动'), {
+        inventory: { blaze_rod: rods },
+        target: wanted,
+        missing: Math.max(0, wanted - rods),
+      });
+    }
+
     // 1. 先确认自己不在岩浆里。
     if (await escapeLava(ctx)) avoided += 1;
     throwIfInterrupted(ctx, '收集烈焰棒');
 
-    // 2. 找附近还没试过的烈焰棒掉落物。
+    // 2. 先捡当前附近真实存在的烈焰棒掉落物。
     const drop = findBlazeRodDrop(ctx, radius, tried);
     if (drop) {
       const key = dropKey(drop.position);
@@ -1080,18 +1427,17 @@ async function collectBlazeRods(args, ctx) {
         }
         await sleepMs(ctx, 400);
         throwIfInterrupted(ctx, '收集烈焰棒');
-        const after = ctx.countItem('blaze_rod');
+        const after = Math.max(0, Math.floor(Number(ctx.countItem('blaze_rod')) || 0));
         if (after > rods) {
           picked += after - rods;
           rods = after;
           continue;
         }
-        // 自己走位没捡到，交给桥接的拾取原语再试一次。
         if (typeof ctx.collectDrops === 'function') {
           try {
             const result = await ctx.collectDrops(radius, 'blaze_rod');
             throwIfInterrupted(ctx, '收集烈焰棒');
-            const gained = ctx.countItem('blaze_rod');
+            const gained = Math.max(0, Math.floor(Number(ctx.countItem('blaze_rod')) || 0));
             if (gained > rods) {
               picked += gained - rods;
               rods = gained;
@@ -1109,43 +1455,122 @@ async function collectBlazeRods(args, ctx) {
       continue;
     }
 
-    // 3. 附近没有掉落物，就找烈焰人，请战斗模块打。
+    // 3. 刷新当前附近的真实堡垒方块证据。
+    const structure = findFortressStructure(ctx, radius);
+    if (structure) rememberFortressStructure(ctx, structure, structureEvidence);
+
+    // 4. 附近有烈焰人时，只请求背包净缺口数量。
     const blaze = findBlaze(ctx, radius);
     if (blaze) {
+      const position = blaze.position;
+      const blazeKey = dimension + ':' + dropKey(position);
+      observedBlazes.set(blazeKey, {
+        dimension,
+        position: {
+          x: Math.floor(position.x),
+          y: Math.floor(position.y),
+          z: Math.floor(position.z),
+        },
+      });
+      const current = Math.max(0, Math.floor(Number(ctx.countItem('blaze_rod')) || 0));
+      const missing = Math.max(0, wanted - current);
       const outcome = await callCombatEntry(ctx, {
-        count: wanted - rods,
+        count: missing,
         radius,
         min_health: 6,
       });
       throwIfInterrupted(ctx, '收集烈焰棒');
       if (outcome) {
-        rods = ctx.countItem('blaze_rod');
-        if (rods >= wanted) {
+        const after = Math.max(0, Math.floor(Number(ctx.countItem('blaze_rod')) || 0));
+        if (after >= wanted) {
           return {
             detail:
-              `打了一只烈焰人，${outcome.detail || '战斗结束'}；烈焰棒一共 ${rods} 根` +
+              `打了一只烈焰人，${outcome.detail || '战斗结束'}；烈焰棒一共 ${after} 根` +
               (notes.length ? `；${notes.join('，')}` : ''),
             status: 'succeeded',
+            data: {
+              inventory: { blaze_rod: after },
+              target: wanted,
+              missing: 0,
+              fortress_evidence: fortressEvidenceData(dimension, structureEvidence),
+              blaze_evidence: [...observedBlazes.values()],
+              patrol: { budget: BLAZE_PATROL_BUDGET, attempted: patrols },
+            },
           };
         }
+        rods = after;
         continue;
       }
       if (!blazeNoted) {
         blazeNoted = true;
-        const distance = Math.floor(blaze.position.distanceTo(botOf(ctx).entity.position));
+        const distance = Math.floor(position.distanceTo(botOf(ctx).entity.position));
         notes.push(
-          `附近 ${distance} 格有烈焰人，坐标 (${Math.floor(blaze.position.x)}, ` +
-            `${Math.floor(blaze.position.y)}, ${Math.floor(blaze.position.z)})，` +
-            `但没有战斗技能入口，只能自己打`
+          `附近 ${distance} 格有烈焰人，坐标 (${Math.floor(position.x)}, ` +
+            `${Math.floor(position.y)}, ${Math.floor(position.z)})，` +
+            `但没有战斗技能入口，只能自己打`,
         );
       }
     }
 
-    // 4. 什么也没有，等一会儿再扫。
+    // 5. 只沿实扫堡垒点有限巡查，并要求目的地附近有安全落脚点。
+    if (patrols < BLAZE_PATROL_BUDGET) {
+      const position = botOf(ctx).entity.position;
+      const candidates = moduleState.structures
+        .filter((entry) => entry.dimension === dimension && !visitedStructures.has(fortressStructureKey(entry)))
+        .sort((left, right) => {
+          const leftDistance = Math.hypot(left.position.x - position.x, left.position.z - position.z);
+          const rightDistance = Math.hypot(right.position.x - position.x, right.position.z - position.z);
+          return leftDistance - rightDistance;
+        });
+      const target = candidates[0];
+      if (target) {
+        const key = fortressStructureKey(target);
+        visitedStructures.add(key);
+        patrols += 1;
+        if (!isLiveFortressStructure(ctx, target)) {
+          notes.push('已记录堡垒点重新读取时没有对应方块，跳过旧坐标');
+          await sleepMs(ctx, 500);
+          continue;
+        }
+        rememberFortressStructure(ctx, {
+          x: target.position.x,
+          y: target.position.y,
+          z: target.position.z,
+          name: target.block,
+        }, structureEvidence);
+        const safeSpot = findSafeSpot(ctx, 6, target.position);
+        if (!safeSpot) {
+          notes.push('堡垒点 (' + target.position.x + ', ' + target.position.y + ', ' + target.position.z + ') 周围没有确认安全的落脚点，跳过');
+          await sleepMs(ctx, 500);
+          continue;
+        }
+        const distance = Math.hypot(
+          safeSpot.x - position.x,
+          safeSpot.z - position.z,
+        );
+        if (distance > 3) {
+          try {
+            await ctx.travelTo(safeSpot.x, safeSpot.y, safeSpot.z, 1);
+            throwIfInterrupted(ctx, '收集烈焰棒');
+            if (currentDimension(ctx) !== dimension) {
+              throw new Error('前往安全巡点后维度发生变化，停止继续移动');
+            }
+            log(ctx, '前往堡垒附近安全巡点', safeSpot.x + ', ' + safeSpot.y + ', ' + safeSpot.z);
+          } catch (error) {
+            throwIfInterrupted(ctx, '收集烈焰棒');
+            if (currentDimension(ctx) !== dimension) throw error;
+            log(ctx, '走不到堡垒附近安全巡点', error.message);
+          }
+        }
+        continue;
+      }
+    }
+
+    // 6. 周围没有可安全访问的新巡点时，等下一轮实体和掉落物更新。
     await sleepMs(ctx, 1000);
   }
 
-  rods = ctx.countItem('blaze_rod');
+  rods = Math.max(0, Math.floor(Number(ctx.countItem('blaze_rod')) || 0));
   if (rods >= wanted) {
     return {
       detail:
@@ -1153,11 +1578,29 @@ async function collectBlazeRods(args, ctx) {
         (avoided ? `，中途躲开 ${avoided} 次岩浆` : '') +
         (notes.length ? `；${notes.join('，')}` : ''),
       status: 'succeeded',
+      data: {
+        inventory: { blaze_rod: rods },
+        target: wanted,
+        missing: 0,
+        fortress_evidence: fortressEvidenceData(dimension, structureEvidence),
+        blaze_evidence: [...observedBlazes.values()],
+        patrol: { budget: BLAZE_PATROL_BUDGET, attempted: patrols },
+      },
     };
   }
-  throw new Error(
-    `还差 ${wanted - rods} 根烈焰棒，附近 ${radius} 格内没有更多掉落物了` +
-      (notes.length ? `；${notes.join('，')}` : '')
+  throw withActionData(
+    new Error(
+      `还差 ${wanted - rods} 根烈焰棒，附近 ${radius} 格内没有更多掉落物了` +
+        (notes.length ? `；${notes.join('，')}` : ''),
+    ),
+    {
+      inventory: { blaze_rod: rods },
+      target: wanted,
+      missing: Math.max(0, wanted - rods),
+      fortress_evidence: fortressEvidenceData(dimension, structureEvidence),
+      blaze_evidence: [...observedBlazes.values()],
+      patrol: { budget: BLAZE_PATROL_BUDGET, attempted: patrols },
+    },
   );
 }
 
@@ -1175,7 +1618,7 @@ export const skills = {
   },
   nether_travel: {
     description:
-      '下界坐标换算与过门：主世界与下界按 1:8 互算坐标，enter 走进下界、exit 穿回主世界，过门后的 checkpoint 写在结果里，不落盘。',
+      '下界坐标换算与过门：主世界与下界按 1:8 互算坐标，enter 走进下界、exit 穿回主世界；结果分别记录实测源门和过门后抵达点。',
     parameters: [
       { name: 'mode', type: 'string', required: false, default: 'auto', description: 'convert 只换算，enter 进下界，exit 回主世界，auto 按当前维度选。' },
       { name: 'x', type: 'number', required: false, default: null, description: '要换算的目标 x，不填就用当前位置。' },
@@ -1188,7 +1631,7 @@ export const skills = {
   },
   raid_fortress: {
     description:
-      '探索下界堡垒：识别下界砖块、下界疣、下界门等结构方块，找到烈焰人后请战斗技能去打；没有战斗技能就报出烈焰人坐标与打法，迷路时沿结构或门户回退。',
+      '探索下界堡垒：扫描明确的下界砖结构方块，找到烈焰人后请战斗技能去打；无目标时围绕本次固定起点走有限路线，扫描半径与路线点预算分开。',
     parameters: [
       { name: 'radius', type: 'number', required: false, default: DEFAULT_FORTRESS_RADIUS, description: '搜索半径。' },
       { name: 'blazes', type: 'number', required: false, default: 1, description: '要打几只烈焰人。' },
@@ -1198,7 +1641,7 @@ export const skills = {
   },
   collect_blaze_rods: {
     description:
-      '收集烈焰棒：走近掉落物拾取并计数，掉进岩浆先爬出来再捡；附近没有掉落物时会找烈焰人请战斗技能去打。',
+      '收集烈焰棒：按背包净缺口请求战斗数量，走近掉落物拾取并计数，掉进岩浆先爬出来再捡；附近无目标时只巡查实测堡垒点周围确认安全的有限位置。',
     parameters: [
       { name: 'count', type: 'number', required: false, default: BLAZE_ROD_TARGET, description: '要几根烈焰棒，M7.4 的目标是 7 根。' },
       { name: 'radius', type: 'number', required: false, default: 24, description: '掉落物搜索半径。' },

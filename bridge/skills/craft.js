@@ -4,10 +4,7 @@
 // 设计原则：合成窗口协议由 ctx.craftItem / ctx.smeltItem 负责（已在真实服务器验证过），
 // 本模块只做编排：材料核算 → 中间件 → 成品 → 放置 → 校验。
 //
-// 待接入（集成阶段补进 ctx，模块里已做降级）：
-// - placeBlockWithFacing(x, y, z, dir)：带朝向放置方块。床必须水平放置，
-//   ctx.placeBlock 没有朝向参数，这里退化成直接用 ctx.bot 的放置接口。
-// - lookAt：转向能力。床的床头朝向取决于 bot 的朝向，这里直接用 ctx.bot.lookAt。
+// 放床由 ctx.placeBedAt 统一处理朝向、玩家站位和服务端回执。
 //
 // 错误关键词与状态映射（对应 minecraft_bridge.js 的 statusForError）：
 // - 「材料不够，还差 N 个 X」→ partial
@@ -33,24 +30,8 @@ export const SMELT_MAP = {
   salmon: 'cooked_salmon',
 };
 
-// 1 个燃料能烧几个物品。煤与木炭烧 8 个，木板烧 1.5 个。
-// 木棍不在这张表里：ctx.smeltItem 对木棍用的还是 1.5 的算法，
-// 而原版木棍只烧 0.5 个，算出来的燃料量不够烧完一轮，会白白等 90 秒。
-export const FUEL_BURN = {
-  coal: 8,
-  charcoal: 8,
-  oak_planks: 1.5,
-  spruce_planks: 1.5,
-  birch_planks: 1.5,
-  jungle_planks: 1.5,
-  acacia_planks: 1.5,
-  dark_oak_planks: 1.5,
-  mangrove_planks: 1.5,
-  cherry_planks: 1.5,
-  bamboo_planks: 1.5,
-  crimson_planks: 1.5,
-  warped_planks: 1.5,
-};
+import { FUEL_BURN, selectFuel } from '../fuel.js';
+export { FUEL_BURN } from '../fuel.js';
 
 // 熔炼一轮最多烧几个。熔炉每 10 秒烧一个，8 个约 80 秒，
 // 压在 ctx.smeltItem 的 90 秒等待上限之内。
@@ -332,6 +313,8 @@ function findWoodForPlanks(ctx, requiredPlanks, range) {
     .filter((source) => source.available >= requiredPlanks)
     .sort((left, right) => right.planks - left.planks || right.logs - left.logs);
   if (stocked.length) return stocked[0];
+  const partial = candidates.filter(source => source.logs > 0).sort((a, b) => b.available - a.available);
+  if (partial.length) return partial[0];
 
   if (typeof bot?.findBlocks !== 'function') return null;
   for (const source of candidates) {
@@ -378,7 +361,13 @@ async function prepareBowArrows(args, ctx) {
   }
 
   if (requiredPlanks > 0) {
-    const source = findWoodForPlanks(ctx, requiredPlanks, range);
+    let source = findWoodForPlanks(ctx, requiredPlanks, range);
+    if (!source && typeof ctx.runSkill === 'function') {
+      const outcome = await ctx.runSkill('mine_collect', { block: 'wood_log', count: Math.ceil(requiredPlanks / 4), range });
+      if (ctx.interrupted) throw new Error('制作弓箭被新的指令打断');
+      if (outcome?.status !== 'succeeded') throw new Error(outcome?.detail || '探索后仍没有足够木材');
+      source = findWoodForPlanks(ctx, requiredPlanks, range);
+    }
     if (!source) {
       throw new Error(`缺少木材：需要 ${requiredPlanks} 块同种木板，或附近 ${range} 格内可采集的原木`);
     }
@@ -483,11 +472,10 @@ function faceVector(reference, dx, dy, dz) {
 
 // 找一把最顺手的燃料。必须跟 ctx.smeltItem 里的 findFuelItem 选到同一个，
 // 否则核算出来的燃料量和熔炉真正烧的燃料对不上。
-function pickFuel(ctx) {
-  if (typeof ctx.findFuelItem !== 'function') return null;
-  const fuel = ctx.findFuelItem();
-  if (!fuel || !fuel.name || !FUEL_BURN[fuel.name]) return null;
-  return { name: fuel.name, burn: FUEL_BURN[fuel.name] };
+function pickFuel(ctx, rounds = [1], preferred = '') {
+  const items = Object.keys(FUEL_BURN).map(name => ({ name, count: countOf(ctx, name) }));
+  const fuel = selectFuel(items, rounds, preferred);
+  return fuel ? { name: fuel.name, burn: FUEL_BURN[fuel.name] } : null;
 }
 
 // 木板需求怎么补：先用现成木板，不够就用原木换。
@@ -507,18 +495,12 @@ function resolvePlanks(ctx, need) {
   if (bestPlankCount >= need) {
     return { plank: bestPlank, planks: need, log: null, logs: 0 };
   }
-  const logs = chainCost(chain, need).raws;
-  let bestLog = null;
-  let bestLogCount = 0;
   for (const entry of chain.sources) {
-    const stock = countOf(ctx, entry.log);
-    if (stock > bestLogCount) {
-      bestLogCount = stock;
-      bestLog = entry.log;
+    const missing = Math.max(0, need - countOf(ctx, entry.plank));
+    const logs = Math.ceil(missing / 4);
+    if (countOf(ctx, entry.log) >= logs) {
+      return { plank: entry.plank, planks: missing, log: entry.log, logs };
     }
-  }
-  if (bestLogCount >= logs) {
-    return { plank: bestLog.replace('_log', '_planks'), planks: need, log: bestLog, logs };
   }
   return null;
 }
@@ -554,7 +536,7 @@ function resolveSticks(ctx, need) {
 async function buildWood(ctx, plan) {
   const made = [];
   if (plan.log && plan.logs > 0) {
-    made.push(await ctx.craftItem({ item: plan.log, count: plan.planks }));
+    made.push(await ctx.craftItem({ item: plan.log.replace('_log', '_planks'), count: plan.planks }));
   }
   if (plan.sticks > 0) {
     made.push(await ctx.craftItem({ item: 'stick', count: plan.sticks }));
@@ -666,9 +648,9 @@ function torchHeight(ctx, x, z, feetY) {
   const bot = ctx.bot;
   if (!bot || typeof bot.blockAt !== 'function') return null;
   for (const y of [feetY, feetY + 1]) {
-    if (!isSolid(bot.blockAt(x, y - 1, z))) continue;
-    if (!isAir(bot.blockAt(x, y, z))) continue;
-    if (!isAir(bot.blockAt(x, y + 1, z))) continue;
+    if (!isSolid(blockAt(bot, x, y - 1, z))) continue;
+    if (!isAir(blockAt(bot, x, y, z))) continue;
+    if (!isAir(blockAt(bot, x, y + 1, z))) continue;
     return y;
   }
   return null;
@@ -710,7 +692,7 @@ async function placeTorch(ctx, spot) {
   if (!bot || typeof bot.blockAt !== 'function') {
     throw new Error('没有 bot 实例，不能放火把');
   }
-  const support = bot.blockAt(spot.x, spot.y - 1, spot.z);
+  const support = blockAt(bot, spot.x, spot.y - 1, spot.z);
   if (!isSolid(support)) throw new Error('火把下面没有支撑方块');
 
   // 太远够不着，先走过去。
@@ -729,11 +711,21 @@ async function placeTorch(ctx, spot) {
   const item = bot.inventory.items().find((entry) => entry.name === 'torch');
   if (item && typeof bot.equip === 'function') await bot.equip(item, 'hand');
   await bot.placeBlock(support, faceVector(support, 0, 1, 0));
-  const placed = bot.blockAt(spot.x, spot.y, spot.z);
+  const placed = blockAt(bot, spot.x, spot.y, spot.z);
   if (!placed || placed.name !== 'torch') throw new Error('放下去的位置看不到火把');
 }
 
+// Mineflayer 只接收 Vec3，不能传三个数；测试替身也遵循相同接口。
+function blockAt(bot, x, y, z) {
+  const origin = bot.entity.position;
+  const position = typeof origin.offset === 'function'
+    ? origin.offset(x - origin.x, y - origin.y, z - origin.z)
+    : { x, y, z };
+  return bot.blockAt(position);
+}
+
 // 找一个能放床的位置：床脚与床头两格都要空，床脚下面要有完整方块。
+// 2×2 庇护所内不要求床脚后方再空出第三格。
 function findBedSpot(ctx) {
   const bot = ctx.bot;
   if (!bot || !bot.entity || typeof bot.blockAt !== 'function') return null;
@@ -759,18 +751,13 @@ function findBedSpot(ctx) {
   ];
   for (const cell of around) {
     const foot = { x: bx + cell.x, y, z: bz + cell.z };
-    if (!isSolid(bot.blockAt(foot.x, foot.y - 1, foot.z))) continue;
-    if (!isAir(bot.blockAt(foot.x, foot.y, foot.z))) continue;
-    if (!isAir(bot.blockAt(foot.x, foot.y + 1, foot.z))) continue;
+    if (!isSolid(blockAt(bot, foot.x, foot.y - 1, foot.z))) continue;
+    if (!isAir(blockAt(bot, foot.x, foot.y, foot.z))) continue;
+    if (!isAir(blockAt(bot, foot.x, foot.y + 1, foot.z))) continue;
     for (const dir of dirs) {
       const head = { x: foot.x + dir.x, y: foot.y, z: foot.z + dir.z };
-      if (!isAir(bot.blockAt(head.x, head.y, head.z))) continue;
-      if (!isAir(bot.blockAt(head.x, head.y + 1, head.z))) continue;
-      // 床头最终落在哪一侧取决于 bot 的朝向，两侧都得留空，
-      // 不然服务端会因为放不下床头而拒绝这次放置。
-      const back = { x: foot.x - dir.x, y: foot.y, z: foot.z - dir.z };
-      if (!isAir(bot.blockAt(back.x, back.y, back.z))) continue;
-      if (!isAir(bot.blockAt(back.x, back.y + 1, back.z))) continue;
+      if (!isAir(blockAt(bot, head.x, head.y, head.z))) continue;
+      if (!isAir(blockAt(bot, head.x, head.y + 1, head.z))) continue;
       return { foot, head, dir };
     }
   }
@@ -781,55 +768,21 @@ function findBedSpot(ctx) {
 async function placeBed(ctx, bedItem) {
   const bot = ctx.bot;
   if (!bot || !bot.entity) throw new Error('没有 bot 实例，不能放床');
-  const item = bot.inventory.items().find((entry) => entry.name === bedItem);
+  const item = bot.inventory?.items?.().find((entry) => entry.name === bedItem);
   if (!item) throw new Error(`背包里没有${labelOf(ctx, bedItem)}`);
+  if (typeof ctx.placeBedAt !== 'function') throw new Error('桥接没有提供经过验证的放床接口');
   const spot = findBedSpot(ctx);
   if (!spot) {
     throw new Error('附近没有能放床的地方：床脚和床头都要空，床脚下面还要有支撑方块');
   }
-  const support = bot.blockAt(spot.foot.x, spot.foot.y - 1, spot.foot.z);
-  if (!support) throw new Error('床脚下面没有支撑方块');
-
-  await bot.equip(item, 'hand');
-  // 原版把床头放在朝向的反方向，所以先转向 -(dir)，床头才落在 dir 上。
-  const yaw = Math.atan2(spot.dir.x, -spot.dir.z);
-  bot.entity.yaw = yaw;
-  bot.entity.pitch = 0;
-  if (typeof bot.lookAt === 'function') {
-    await bot.lookAt(bot.entity.position.offset(-spot.dir.x * 3, 0, -spot.dir.z * 3), true);
-  }
-  await sleepOf(ctx, 150);
-  const face = faceVector(support, 0, 1, 0);
-  if (typeof bot._placeBlockWithOptions === 'function') {
-    await bot._placeBlockWithOptions(support, face, { swingArm: 'right', forceLook: 'ignore' });
-  } else {
-    bot.entity.yaw = yaw;
-    await bot.placeBlock(support, face);
-  }
-
-  const footBlock = bot.blockAt(spot.foot.x, spot.foot.y, spot.foot.z);
-  if (!isBedBlock(footBlock)) {
-    throw new Error(
-      `床放下后 (${spot.foot.x}, ${spot.foot.y}, ${spot.foot.z}) 不是床，而是${footBlock ? footBlock.name : '空气'}`
-    );
-  }
-  // 床头的方块更新比床脚晚到一点，等它下发完再校验。
-  let headBlock = null;
-  let reverse = null;
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    headBlock = bot.blockAt(spot.head.x, spot.head.y, spot.head.z);
-    reverse = bot.blockAt(spot.foot.x - spot.dir.x, spot.foot.y, spot.foot.z - spot.dir.z);
-    if (isBedBlock(headBlock) || isBedBlock(reverse)) break;
-    await sleepOf(ctx, 100);
-  }
-  if (!isBedBlock(headBlock) && !isBedBlock(reverse)) {
-    throw new Error('床只放下了一半，床头那一格不是床');
-  }
-  const headOk = isBedBlock(headBlock) ? headBlock : reverse;
+  const placed = await ctx.placeBedAt(spot.foot, bedItem);
+  const footBlock = blockAt(bot, placed.foot.x, placed.foot.y, placed.foot.z);
+  const headBlock = blockAt(bot, placed.head.x, placed.head.y, placed.head.z);
+  if (!isBedBlock(footBlock) || !isBedBlock(headBlock)) throw new Error('放床接口返回后没有观察到完整的床脚和床头');
   return {
     foot: footBlock,
-    head: headOk,
-    position: `${spot.foot.x}, ${spot.foot.y}, ${spot.foot.z}`,
+    head: headBlock,
+    position: `${placed.foot.x}, ${placed.foot.y}, ${placed.foot.z}`,
   };
 }
 
@@ -859,6 +812,7 @@ export const skills = {
         default: null,
         description: '期望的产物 ID，缺省按内置熔炼表推导。',
       },
+      { name: 'fuel', type: 'string', required: false, description: '指定本批燃料物品，省略时选择库存足够的可燃材料。' },
     ],
     handler: async (args, ctx) => {
       const name = String(args.item || '').trim();
@@ -877,7 +831,7 @@ export const skills = {
 
       // 2) 燃料核算：每一轮都要单独加一次燃料，燃料量按轮累加
       const rounds = smeltRounds(count);
-      const fuel = pickFuel(ctx);
+      const fuel = pickFuel(ctx, rounds, String(args.fuel || ''));
       if (!fuel) throw new Error('没有燃料（煤、木炭或木板）');
       const needFuel = fuelNeededForRounds(rounds, fuel.name);
       const haveFuel = countOf(ctx, fuel.name);
@@ -904,7 +858,7 @@ export const skills = {
       try {
         for (const size of rounds) {
           // 上一轮烧掉了燃料，每轮都要重新核对
-          const nowFuel = pickFuel(ctx);
+          const nowFuel = pickFuel(ctx, [size], fuel.name);
           if (!nowFuel) throw new Error('没有燃料（煤、木炭或木板）');
           const need = fuelNeeded(size, nowFuel.name);
           const stock = countOf(ctx, nowFuel.name);
@@ -912,7 +866,7 @@ export const skills = {
             throw new Error(`燃料不够，还差 ${need - stock} 个${labelOf(ctx, nowFuel.name)}`);
           }
           const before = countOf(ctx, outputName);
-          const detail = await ctx.smeltItem({ item: name, count: size });
+          const detail = await ctx.smeltItem({ item: name, count: size, fuel: fuel.name });
           if (typeof ctx.syncInventory === 'function') await ctx.syncInventory();
           const after = countOf(ctx, outputName);
           if (after <= before) {

@@ -49,13 +49,81 @@ def test_current_stage_advances() -> None:
         "bed": 1,
         "cooked_beef": 3,
     }
-    assert current_stage(inventory).id == "S3"
+    prepared_state = {
+        "alive": True,
+        "health": 20,
+        "food": 12,
+        "dimension": "overworld",
+        "is_day": True,
+        "inventory": inventory,
+        "shelter": {
+            "position": {"x": 0, "y": 64, "z": 0},
+            "size": 4,
+            "sealed": True,
+            "inside": True,
+            "bounds": {"min": {"x": -2, "y": 64, "z": -2}, "max": {"x": 1, "y": 67, "z": 1}},
+        },
+        "nearby_beds": [{"x": 0, "y": 65, "z": 0}],
+    }
+    assert current_stage(inventory, state=prepared_state).id == "S3"
 
 
-def test_stage_accepts_colored_bed_items() -> None:
+def test_s2_requires_fresh_structural_shelter_and_placed_bed_evidence() -> None:
     stage = stage_by_id("S2")
     assert stage is not None
-    assert is_complete(stage, {"red_bed": 1, "cooked_beef": 3})
+    inventory = {"red_bed": 1}
+    assert not is_complete(stage, inventory)
+    state = {
+        "alive": True,
+        "health": 20,
+        "food": 8,
+        "dimension": "overworld",
+        "is_day": True,
+        "inventory": inventory,
+        "shelter": {
+            "position": {"x": 0, "y": 64, "z": 0},
+            "size": 4,
+            "sealed": True,
+            "inside": True,
+            "bounds": {"min": {"x": -2, "y": 64, "z": -2}, "max": {"x": 1, "y": 67, "z": 1}},
+        },
+        "nearby_beds": [{"x": 0, "y": 65, "z": 0}],
+    }
+    assert is_complete(stage, inventory, state=state)
+    state["nearby_beds"] = [{"x": 1, "y": 65, "z": 1}]
+    assert not is_complete(stage, inventory, state=state)
+
+
+def test_s2_night_observation_requires_safe_night_evidence_and_finite_needs() -> None:
+    stage = stage_by_id("S2")
+    assert stage is not None
+    state = {
+        "alive": True,
+        "health": 20,
+        "food": 12,
+        "dimension": "overworld",
+        "is_day": False,
+        "shelter": {
+            "position": {"x": 0, "y": 64, "z": 0},
+            "size": 4,
+            "sealed": True,
+            "inside": True,
+            "bounds": {"min": {"x": -2, "y": 64, "z": -2}, "max": {"x": 1, "y": 67, "z": 1}},
+        },
+        "nearby_beds": [{"x": 0, "y": 65, "z": 0}],
+    }
+    context: dict[str, bool] = {}
+    assert not is_complete(stage, {}, state=state, context=context)
+    assert context["night_required"] is True
+    assert is_complete(stage, {}, state=state, context={"sleep_confirmed": True}) is False
+    state["is_day"] = True
+    assert is_complete(
+        stage, {}, state=state, context={"night_required": True, "guarded_night_confirmed": True}
+    )
+    state["food"] = float("nan")
+    assert not is_complete(
+        stage, {}, state=state, context={"night_required": True, "guarded_night_confirmed": True}
+    )
 
 
 def test_nether_stage_budget_matches_eyes_for_search_and_end_portal() -> None:
@@ -65,11 +133,24 @@ def test_nether_stage_budget_matches_eyes_for_search_and_end_portal() -> None:
     assert stage.produces == {"blaze_rod": 12, "ender_pearl": 24}
     assert end_stage.requires == stage.produces
     assert not is_complete(stage, {"blaze_rod": 7, "ender_pearl": 16})
-    assert is_complete(stage, {"blaze_rod": 12, "ender_pearl": 24})
+    assert not is_complete(stage, {"blaze_rod": 12, "ender_pearl": 24})
+    assert missing_items(stage, {"blaze_rod": 12, "ender_pearl": 24}) == {"_acceptance_condition": 1}
+    assert is_complete(
+        stage,
+        {"blaze_rod": 12, "ender_pearl": 24},
+        state={"dimension": "overworld"},
+    )
 
 
 def test_end_stage_needs_an_event() -> None:
     stage = stage_by_id("S6")
     assert stage is not None
     assert not is_complete(stage, {})
-    assert is_complete(stage, {}, {"ender_dragon_killed"})
+    assert not is_complete(stage, {}, {"ender_dragon_killed"})
+    assert missing_items(stage, {}) == {"_acceptance_condition": 1}
+    assert is_complete(
+        stage,
+        {},
+        {"ender_dragon_killed"},
+        state={"dimension": "overworld"},
+    )

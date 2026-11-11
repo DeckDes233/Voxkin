@@ -31,11 +31,16 @@ const DEFAULT_DRAGON_RADIUS = 64;
 
 // 投掷记录只保留最近 8 次，避免长跑时越攒越多。
 const MAX_THROW_RECORDS = 8;
+const S6_DESCENT_SEGMENT_LAYERS = 8;
+const S6_MAX_DESCENT_LAYERS = 96;
+const S6_MIN_DESCENT_HEALTH = 12;
+const S6_FRAME_RADIUS = 64;
 
 // ------------------------------------------------------------------ 纯逻辑
 
 export function isEndDimension(dimension) {
-  return String(dimension || '').toLowerCase().includes('end');
+  const text = String(dimension || '').trim().toLowerCase();
+  return text === END_DIMENSION || text === 'the_end';
 }
 
 export function isOverworldDimension(dimension) {
@@ -263,7 +268,357 @@ function findBlockPositions(ctx, name, radius, count = PORTAL_FRAME_COUNT * 2) {
 function findFramesNearby(ctx, radius) {
   return findBlockPositions(ctx, FRAME_BLOCK, radius, 32)
     .map((position) => botOf(ctx).blockAt(position))
-    .filter(Boolean);
+    .filter((block) => block && block.name === FRAME_BLOCK);
+}
+
+function countItemIfKnown(ctx, name) {
+  if (typeof ctx.countItem === 'function') {
+    try {
+      const count = Number(ctx.countItem(name));
+      return Number.isFinite(count) && count >= 0 ? Math.floor(count) : null;
+    } catch {
+      return null;
+    }
+  }
+  const inventory = botOf(ctx).inventory;
+  if (!inventory || typeof inventory.items !== 'function') return null;
+  const matches = inventory.items().filter((item) => item && item.name === name);
+  if (matches.some((item) => !Number.isFinite(Number(item.count)) || Number(item.count) < 0)) return null;
+  return matches.reduce((total, item) => total + Number(item.count), 0);
+}
+
+function finitePosition(position) {
+  return Boolean(position) && ['x', 'y', 'z'].every((axis) => Number.isFinite(Number(position[axis])));
+}
+
+function scanFramesFresh(ctx, radius = S6_FRAME_RADIUS) {
+  const dimensionBefore = currentDimension(ctx);
+  if (!isOverworldDimension(dimensionBefore)) {
+    return { fresh: false, stable: false, dimension: dimensionBefore, radius, frames: [] };
+  }
+  const bot = botOf(ctx);
+  if (typeof bot.blockAt !== 'function' || (typeof bot.findBlocks !== 'function' && typeof bot.findBlock !== 'function')) {
+    return { fresh: false, stable: true, dimension: dimensionBefore, radius, frames: [] };
+  }
+  let positions = [];
+  try {
+    if (typeof bot.findBlocks === 'function') {
+      positions = bot.findBlocks({
+        point: bot.entity.position,
+        matching: (block) => Boolean(block && block.name === FRAME_BLOCK),
+        maxDistance: radius,
+        count: 32,
+      }) || [];
+    } else {
+      const frame = bot.findBlock({
+        point: bot.entity.position,
+        matching: (block) => Boolean(block && block.name === FRAME_BLOCK),
+        maxDistance: radius,
+      });
+      positions = frame ? [frame.position] : [];
+    }
+  } catch (error) {
+    log(ctx, 'fresh frame scan 失败', error.message);
+    const dimensionAfter = currentDimension(ctx);
+    return {
+      fresh: false,
+      stable: dimensionBefore === dimensionAfter && isOverworldDimension(dimensionAfter),
+      dimension: dimensionAfter,
+      radius,
+      frames: [],
+    };
+  }
+  let fresh = true;
+  const frames = [];
+  for (const position of positions) {
+    if (!finitePosition(position)) {
+      fresh = false;
+      continue;
+    }
+    const block = bot.blockAt(position);
+    if (!block) {
+      fresh = false;
+      continue;
+    }
+    if (block.name !== FRAME_BLOCK) continue;
+    const actualPosition = block.position || position;
+    if (!finitePosition(actualPosition)) {
+      fresh = false;
+      continue;
+    }
+    frames.push(copyPosition(actualPosition));
+  }
+  const dimensionAfter = currentDimension(ctx);
+  return {
+    fresh,
+    stable: dimensionBefore === dimensionAfter && isOverworldDimension(dimensionAfter),
+    dimension: dimensionAfter,
+    radius,
+    frames,
+  };
+}
+
+function eyeAccounting(ctx, throwsCompleted, inventoryBefore) {
+  const inventoryAfter = countItemIfKnown(ctx, EYE_ITEM);
+  return {
+    throws_completed: throwsCompleted,
+    inventory_before: inventoryBefore,
+    inventory_after: inventoryAfter,
+    inventory_net_change:
+      inventoryBefore !== null && inventoryAfter !== null
+        ? inventoryAfter - inventoryBefore
+        : null,
+  };
+}
+
+function makeStrongholdSearch(ctx, {
+  phase,
+  estimate,
+  throwsCompleted,
+  inventoryBefore,
+  evidence,
+  layersCompleted = 0,
+  scan,
+  stopReason = '',
+  searchId = null,
+}) {
+  const search = {
+    schema_version: 1,
+    search_id: searchId,
+    phase,
+    evidence,
+    estimate: estimate ? { ...estimate } : null,
+    eye_accounting: eyeAccounting(ctx, throwsCompleted, inventoryBefore),
+    position: copyPosition(botOf(ctx).entity.position),
+    descent: {
+      layers_completed: layersCompleted,
+      max_layers: S6_MAX_DESCENT_LAYERS,
+      segment_layers: S6_DESCENT_SEGMENT_LAYERS,
+    },
+    scan,
+  };
+  if (stopReason) search.stop_reason = String(stopReason).slice(0, 240);
+  return search;
+}
+
+function searchReceipt(status, detail, search) {
+  return { status, detail, data: { stronghold_search: search } };
+}
+
+function safeSearchContext(raw) {
+  if (!raw || typeof raw !== 'object' || raw.schema_version !== 1) return null;
+  if (typeof raw.search_id !== 'string' || !raw.search_id.trim()) return null;
+  if (!['descend', 'blocked', 'frames_found'].includes(raw.phase)) return null;
+  if (!finitePosition(raw.position)) return null;
+  const evidence = raw.evidence;
+  if (!evidence || typeof evidence !== 'object' || evidence.kind !== 'eye_overhead') return null;
+  if (!finitePosition(evidence.throw_origin) || !finitePosition(evidence.eye_position)) return null;
+  const horizontalDistance = Number(evidence.horizontal_distance);
+  if (!Number.isFinite(horizontalDistance) || horizontalDistance < 0 || horizontalDistance >= 20) return null;
+  const accounting = raw.eye_accounting;
+  const throws = Number(accounting && accounting.throws_completed);
+  const layers = Number(raw.descent && raw.descent.layers_completed);
+  if (!Number.isInteger(throws) || throws < 1) return null;
+  if (!Number.isInteger(layers) || layers < 0 || layers > S6_MAX_DESCENT_LAYERS) return null;
+  if (raw.estimate !== null && raw.estimate !== undefined) {
+    if (!Number.isFinite(Number(raw.estimate.x)) || !Number.isFinite(Number(raw.estimate.z))) return null;
+  }
+  return raw;
+}
+
+function blockedSearchReceipt(search, reason, allowExplicitResume = false) {
+  const layers = Number(search && search.descent && search.descent.layers_completed);
+  const maximum = Number(search && search.descent && search.descent.max_layers);
+  const resumeAllowed = Boolean(
+    allowExplicitResume &&
+    search &&
+    search.phase === 'descend' &&
+    search.evidence &&
+    search.evidence.kind === 'eye_overhead' &&
+    finitePosition(search.position) &&
+    Number.isInteger(layers) &&
+    Number.isInteger(maximum) &&
+    layers >= 0 &&
+    layers < maximum &&
+    maximum <= S6_MAX_DESCENT_LAYERS
+  );
+  return searchReceipt('partial', `要塞下探已停止：${reason}`, {
+    ...search,
+    phase: 'blocked',
+    resume_allowed: resumeAllowed,
+    stop_reason: String(reason).slice(0, 240),
+  });
+}
+
+function freshFrameSearch(search, scan, ctx) {
+  return {
+    ...search,
+    phase: scan.fresh && scan.stable && scan.frames.length > 0 ? 'frames_found' : search.phase,
+    position: copyPosition(botOf(ctx).entity.position),
+    scan,
+  };
+}
+
+async function continueStrongholdSearch(raw, ctx) {
+  let search = safeSearchContext(raw);
+  if (!search) {
+    return searchReceipt('partial', '保存的要塞搜索上下文无效；不会重新投掷末影之眼', {
+      schema_version: 1,
+      search_id: raw && typeof raw.search_id === 'string' ? raw.search_id : null,
+      phase: 'blocked',
+      evidence: raw && raw.evidence ? raw.evidence : null,
+      estimate: raw && raw.estimate ? raw.estimate : null,
+      eye_accounting: raw && raw.eye_accounting ? raw.eye_accounting : null,
+      position: copyPosition(botOf(ctx).entity.position),
+      descent: { layers_completed: 0, max_layers: S6_MAX_DESCENT_LAYERS, segment_layers: S6_DESCENT_SEGMENT_LAYERS },
+      scan: null,
+      stop_reason: 'invalid_search_context',
+    });
+  }
+  if (search.phase === 'blocked' && search.resume_allowed === true) {
+    search = { ...search, phase: 'descend', resume_allowed: false };
+  }
+  if (search.phase !== 'descend') {
+    return blockedSearchReceipt(search, search.stop_reason || `当前阶段 ${search.phase} 不允许继续下探`);
+  }
+  if (!isOverworldDimension(currentDimension(ctx))) {
+    return blockedSearchReceipt(search, '角色当前不在主世界');
+  }
+  if (!search.scan || !isOverworldDimension(search.scan.dimension)) {
+    return blockedSearchReceipt(search, '保存的搜索维度未确认主世界；不会跨维度复用 eye-overhead 证据');
+  }
+
+  const bot = botOf(ctx);
+  const savedPosition = search.position;
+  const currentPosition = copyPosition(bot.entity.position);
+  if (
+    Math.floor(savedPosition.x) !== Math.floor(currentPosition.x) ||
+    Math.floor(savedPosition.y) !== Math.floor(currentPosition.y) ||
+    Math.floor(savedPosition.z) !== Math.floor(currentPosition.z)
+  ) {
+    return blockedSearchReceipt({ ...search, position: currentPosition }, '角色位置已变化；不会在未核对的地点继续下探');
+  }
+  const health = Number(bot.health);
+  if (!Number.isFinite(health) || health <= S6_MIN_DESCENT_HEALTH) {
+    return blockedSearchReceipt(search, `生命值不足或未确认（需高于 ${S6_MIN_DESCENT_HEALTH}）`, true);
+  }
+  if (typeof ctx.findHostile !== 'function') {
+    return blockedSearchReceipt(search, '缺少附近敌对生物检查能力', true);
+  }
+  const hostile = ctx.findHostile(12);
+  if (hostile) {
+    return blockedSearchReceipt(search, `附近有敌对生物 ${String(hostile.name || '未知')}，停止下探`, true);
+  }
+  if (typeof ctx.runSkill !== 'function') {
+    return blockedSearchReceipt(search, '缺少 safe_descend 技能入口', true);
+  }
+
+  let scan = scanFramesFresh(ctx, S6_FRAME_RADIUS);
+  if (!scan.fresh || !scan.stable) {
+    return blockedSearchReceipt({ ...search, scan, position: currentPosition }, 'fresh frame scan 未取得可重查的门框区块与稳定主世界维度', true);
+  }
+  if (scan.frames.length > 0) {
+    return searchReceipt('succeeded', `fresh scan 在 ${scan.radius} 格内观察到 ${scan.frames.length} 个末地门框架`, {
+      ...freshFrameSearch(search, scan, ctx),
+      phase: 'frames_found',
+    });
+  }
+
+  const descent = search.descent || {};
+  const layersBefore = Number(descent.layers_completed);
+  const remainingBudget = S6_MAX_DESCENT_LAYERS - layersBefore;
+  if (remainingBudget <= 0) return blockedSearchReceipt(search, `已达到 ${S6_MAX_DESCENT_LAYERS} 层下探预算`);
+
+  let layersCompleted = layersBefore;
+  const segmentLimit = Math.min(S6_DESCENT_SEGMENT_LAYERS, remainingBudget);
+  for (let index = 0; index < segmentLimit; index += 1) {
+    throwIfInterrupted(ctx, '继续搜索要塞');
+    if (!isOverworldDimension(currentDimension(ctx))) {
+      return blockedSearchReceipt({ ...search, descent: { ...descent, layers_completed: layersCompleted } }, '下探过程中维度发生变化');
+    }
+    const currentHealth = Number(bot.health);
+    if (!Number.isFinite(currentHealth) || currentHealth <= S6_MIN_DESCENT_HEALTH) {
+      return blockedSearchReceipt({ ...search, descent: { ...descent, layers_completed: layersCompleted } }, `生命值降到安全阈值 ${S6_MIN_DESCENT_HEALTH} 或未确认`, true);
+    }
+    const nearbyHostile = ctx.findHostile(12);
+    if (nearbyHostile) {
+      return blockedSearchReceipt({ ...search, descent: { ...descent, layers_completed: layersCompleted } }, `出现敌对生物 ${String(nearbyHostile.name || '未知')}，停止下探`, true);
+    }
+    const before = copyPosition(bot.entity.position);
+    const beforeY = Math.floor(before.y);
+    if (beforeY <= -64) {
+      return blockedSearchReceipt({ ...search, descent: { ...descent, layers_completed: layersCompleted } }, '已到世界底部 Y=-64');
+    }
+    try {
+      await ctx.runSkill('safe_descend', {
+        targetY: Math.max(-64, beforeY - 1),
+        maxLayers: 1,
+        fill: false,
+        detour: false,
+      });
+      throwIfInterrupted(ctx, '继续搜索要塞');
+    } catch (error) {
+      throwIfInterrupted(ctx, '继续搜索要塞');
+      return blockedSearchReceipt({
+        ...search,
+        position: copyPosition(bot.entity.position),
+        scan: {
+          fresh: false,
+          stable: false,
+          dimension: currentDimension(ctx),
+          radius: S6_FRAME_RADIUS,
+          frames: [],
+        },
+        descent: { ...descent, layers_completed: layersCompleted },
+      }, `safe_descend 停止：${String((error && error.message) || error)}`);
+    }
+    const after = copyPosition(bot.entity.position);
+    const afterY = Math.floor(after.y);
+    if (
+      afterY !== beforeY - 1 ||
+      Math.floor(after.x) !== Math.floor(before.x) ||
+      Math.floor(after.z) !== Math.floor(before.z)
+    ) {
+      return blockedSearchReceipt({
+        ...search,
+        position: after,
+        scan: {
+          fresh: false,
+          stable: false,
+          dimension: currentDimension(ctx),
+          radius: S6_FRAME_RADIUS,
+          frames: [],
+        },
+        descent: { ...descent, layers_completed: layersCompleted },
+      }, '下降后未确认只向下移动一层且水平位置未变');
+    }
+    layersCompleted += 1;
+    scan = scanFramesFresh(ctx, S6_FRAME_RADIUS);
+    const updated = {
+      ...search,
+      position: after,
+      descent: { ...descent, layers_completed: layersCompleted },
+      scan,
+    };
+    if (!scan.fresh || !scan.stable) {
+      return blockedSearchReceipt(updated, 'fresh frame scan 未取得可重查的门框区块与稳定主世界维度', true);
+    }
+    if (scan.frames.length > 0) {
+      return searchReceipt('succeeded', `下探 ${layersCompleted} 层后在 ${scan.radius} 格内观察到 ${scan.frames.length} 个末地门框架`, {
+        ...updated,
+        phase: 'frames_found',
+      });
+    }
+    search = updated;
+  }
+
+  return searchReceipt('partial', `已安全下探 ${layersCompleted} 层，fresh scan 尚未观察到末地门框架`, {
+    ...search,
+    phase: 'descend',
+    position: copyPosition(bot.entity.position),
+    descent: { ...descent, layers_completed: layersCompleted },
+    scan,
+  });
 }
 
 function findItem(ctx, name) {
@@ -314,7 +669,7 @@ async function activateOnce(ctx) {
   throwIfInterrupted(ctx, '使用末影之眼');
 }
 
-// 跟踪刚投出的末影之眼，返回它最后被看到的位置。
+// 跟踪刚投出的末影之眼，保留最后坐标与实体是否已经消失。
 async function trackEye(ctx, knownIds, durationMs) {
   const deadline = Date.now() + durationMs;
   let eye = null;
@@ -327,7 +682,7 @@ async function trackEye(ctx, knownIds, durationMs) {
     if (eye && eye.position) last = copyPosition(eye.position);
     if (eye && entityGone(ctx, eye)) break;
   }
-  return last;
+  return last ? { position: last, settled: Boolean(eye && entityGone(ctx, eye)) } : null;
 }
 
 async function moveToward(ctx, x, z, radius = 3) {
@@ -354,6 +709,9 @@ async function moveToward(ctx, x, z, radius = 3) {
 
 async function throwEye(args, ctx) {
   throwIfInterrupted(ctx, '寻找要塞');
+  if (args && args.resume_search !== undefined) {
+    return continueStrongholdSearch(args.resume_search, ctx);
+  }
   const bot = botOf(ctx);
   const dimension = currentDimension(ctx);
   if (isEndDimension(dimension)) {
@@ -373,6 +731,22 @@ async function throwEye(args, ctx) {
   let lastDirection = null;
   const throwRecords = [];
   const notes = [];
+  const inventoryBefore = countItemIfKnown(ctx, EYE_ITEM);
+  let overheadEvidence = null;
+  let lastFrameScan = null;
+  const estimatedPosition = () => estimateStronghold(throwRecords);
+  const makeSearch = (phase, scan = lastFrameScan, stopReason = '') => makeStrongholdSearch(ctx, {
+    phase,
+    estimate: estimatedPosition(),
+    throwsCompleted: throws,
+    inventoryBefore,
+    evidence: overheadEvidence || {
+      kind: estimatedPosition() ? 'direction_estimate_only' : 'direction_insufficient',
+      throw_origin: throwRecords.length > 0 ? { x: throwRecords.at(-1).x, y: Math.floor(bot.entity.position.y), z: throwRecords.at(-1).z } : null,
+    },
+    scan,
+    stopReason,
+  });
 
   for (let index = 0; index < maxThrows && Date.now() < deadline; index += 1) {
     throwIfInterrupted(ctx, '寻找要塞');
@@ -401,8 +775,8 @@ async function throwEye(args, ctx) {
     let direction = fallback;
     let eyeDistance = null;
     if (observed) {
-      eyeDistance = Math.hypot(observed.x - origin.x, observed.z - origin.z);
-      const fromFlight = normalizeVector(observed.x - origin.x, observed.z - origin.z);
+      eyeDistance = Math.hypot(observed.position.x - origin.x, observed.position.z - origin.z);
+      const fromFlight = normalizeVector(observed.position.x - origin.x, observed.position.z - origin.z);
       if (fromFlight) direction = fromFlight;
     } else {
       notes.push('没看到末影之眼的飞行实体，按投掷朝向推算');
@@ -419,44 +793,68 @@ async function throwEye(args, ctx) {
       throwRecords.splice(0, throwRecords.length - MAX_THROW_RECORDS);
     }
 
-    const frames = findFramesNearby(ctx, frameRadius);
-    if (frames.length > 0) {
-      return {
-        detail:
-          `第 ${throws} 次投掷后，在 ${frameRadius} 格内发现 ${frames.length} 个末地门框架，` +
-          `方向 (${direction.dx.toFixed(2)}, ${direction.dz.toFixed(2)})，可以开始激活末地门`,
-        status: 'succeeded',
+    if (observed && observed.settled && eyeDistance !== null && eyeDistance < 20) {
+      overheadEvidence = {
+        kind: 'eye_overhead',
+        throw_origin: origin,
+        eye_position: observed.position,
+        horizontal_distance: eyeDistance,
       };
     }
 
-    // 眼在附近落下，说明要塞就在脚下，不要再朝远处走。
-    const droppedNearby = eyeDistance !== null && eyeDistance < 20;
+    lastFrameScan = scanFramesFresh(ctx, frameRadius);
+      if (!lastFrameScan.fresh || !lastFrameScan.stable) {
+        return searchReceipt('partial', '投眼后 fresh frame scan 无法重查门框区块或未确认稳定主世界；已保留搜索账本',
+        makeSearch('blocked', lastFrameScan, 'frame_scan_dimension_unverified'));
+    }
+    if (lastFrameScan.frames.length > 0) {
+      return {
+        detail:
+          `第 ${throws} 次投掷后，在 ${frameRadius} 格内发现 ${lastFrameScan.frames.length} 个末地门框架，` +
+          `方向 (${direction.dx.toFixed(2)}, ${direction.dz.toFixed(2)})，可以开始激活末地门`,
+        status: 'succeeded',
+        data: { stronghold_search: { ...makeSearch('frames_found', lastFrameScan), phase: 'frames_found' } },
+      };
+    }
+
+    // 只有实体已消失且最后观测点接近投掷起点，才把它记作 overhead 证据。
+    const droppedNearby = Boolean(overheadEvidence);
     if (droppedNearby) {
-      const wideFrames = findFramesNearby(ctx, Math.min(frameRadius * 2, 64));
-      if (wideFrames.length > 0) {
+      lastFrameScan = scanFramesFresh(ctx, Math.min(frameRadius * 2, S6_FRAME_RADIUS));
+        if (!lastFrameScan.fresh || !lastFrameScan.stable) {
+          return searchReceipt('partial', '末影之眼在附近消失，但 fresh frame scan 无法重查门框区块或未确认稳定主世界；已保留搜索账本',
+          makeSearch('blocked', lastFrameScan, 'wide_frame_scan_dimension_unverified'));
+      }
+      if (lastFrameScan.frames.length > 0) {
         return {
           detail:
-            `第 ${throws} 次投掷后，末影之眼在 ${Math.round(eyeDistance)} 格内落下，` +
-            `在 ${Math.min(frameRadius * 2, 64)} 格内发现 ${wideFrames.length} 个末地门框架`,
+            `第 ${throws} 次投掷后，末影之眼在 ${Math.round(eyeDistance)} 格内消失，` +
+            `在 ${lastFrameScan.radius} 格内发现 ${lastFrameScan.frames.length} 个末地门框架`,
           status: 'succeeded',
+          data: { stronghold_search: { ...makeSearch('frames_found', lastFrameScan), phase: 'frames_found' } },
         };
       }
-      notes.push('眼在附近落下，但附近没有找到框架，可能要先往下挖进要塞');
+      notes.push('末影之眼在附近消失，但附近没有找到框架；可以从当前位置安全分段下探');
       break;
     }
 
-    const estimate = estimateStronghold(throwRecords);
+    const estimate = estimatedPosition();
     if (advance > 0 && estimate && estimate.distance <= advance + frameRadius) {
       const moved = await moveToward(ctx, estimate.x, estimate.z, 4);
       throwIfInterrupted(ctx, '寻找要塞');
       if (moved) {
-        const estimatedFrames = findFramesNearby(ctx, Math.min(frameRadius * 2, 64));
-        if (estimatedFrames.length > 0) {
+        lastFrameScan = scanFramesFresh(ctx, Math.min(frameRadius * 2, S6_FRAME_RADIUS));
+          if (!lastFrameScan.fresh || !lastFrameScan.stable) {
+            return searchReceipt('partial', '到达估算点后 fresh frame scan 无法重查门框区块或未确认稳定主世界；已保留搜索账本',
+            makeSearch('blocked', lastFrameScan, 'estimate_frame_scan_dimension_unverified'));
+        }
+        if (lastFrameScan.frames.length > 0) {
           return {
             detail:
               `根据 ${estimate.throws} 次投掷收敛到要塞估算点 (${estimate.x}, ${estimate.z})，` +
-              `在附近发现 ${estimatedFrames.length} 个末地门框架`,
+              `在附近发现 ${lastFrameScan.frames.length} 个末地门框架`,
             status: 'succeeded',
+            data: { stronghold_search: { ...makeSearch('frames_found', lastFrameScan), phase: 'frames_found' } },
           };
         }
         notes.push(`已到达要塞估算点 (${estimate.x}, ${estimate.z})，附近尚未发现门框`);
@@ -476,9 +874,6 @@ async function throwEye(args, ctx) {
   if (throws === 0) {
     throw new Error('一次末影之眼都没有投出去，先确认背包里有末影之眼');
   }
-  if (!estimate) {
-    throw new Error('已投掷末影之眼，但方向数据不足，无法可靠估算要塞位置；不会把结果当成已定位');
-  }
   const head =
     `投了 ${throws} 次末影之眼，最后一次朝向 ` +
     (lastDirection
@@ -488,10 +883,13 @@ async function throwEye(args, ctx) {
     ? `；两次投掷推算要塞大约在 (${estimate.x}, ${estimate.z})，距最后一次起点约 ${estimate.distance} 格`
     : '；投掷方向太接近，还推算不出要塞坐标，换个位置再投';
   const tail = notes.length ? `；${notes.join('，')}` : '';
-  return {
-    detail: `${head}${guess}${tail}`,
-    status: estimate ? 'partial' : 'failed',
-  };
+  const phase = overheadEvidence ? 'descend' : 'blocked';
+  const reason = overheadEvidence
+    ? ''
+    : estimate
+      ? '没有 eye-overhead 证据；保留估算供人工或上层重新规划'
+      : '方向数据不足且没有 eye-overhead 证据；不会自动重投';
+  return searchReceipt('partial', `${head}${guess}${tail}`, makeSearch(phase, lastFrameScan, reason));
 }
 
 // ------------------------------------------------------------------ 技能：激活末地门
@@ -669,7 +1067,7 @@ async function activateEndPortal(args, ctx) {
       `填了 ${inserted} 个末地门框架（原有 ${filledBefore} 个），` +
       `从 (${Math.floor(portal.x)}, ${Math.floor(portal.y)}, ${Math.floor(portal.z)}) 进入末地，` +
       `现在在 (${Math.floor(position.x)}, ${Math.floor(position.y)}, ${Math.floor(position.z)})`,
-    status: outcome.status === 'partial' ? 'partial' : outcome.status === 'failed' ? 'failed' : 'succeeded',
+    status: 'succeeded',
   };
 }
 
@@ -772,8 +1170,16 @@ async function fightDragon(args, ctx) {
   const timeoutMs = clampNumber(args.timeout_s, 240, 30, 300) * 1000;
   const deadline = Date.now() + timeoutMs;
   const notes = [];
+  const returnPortalPresentAtStart = findBlockPositions(ctx, PORTAL_BLOCK, 128, 8).length > 0;
 
   let dragon = findEntity(ctx, DRAGON_ENTITY, radius);
+  if (!dragon && returnPortalPresentAtStart) {
+    return {
+      detail: '中央返回传送门在本次战斗开始前已经存在，附近也没有末影龙；不报告本次击杀事件',
+      status: 'partial',
+      data: { evidence: 'return_portal_preexisting_dragon_absent', events: [] },
+    };
+  }
   if (!dragon) {
     const waitUntil = Math.min(deadline, Date.now() + 8000);
     while (!dragon && Date.now() < waitUntil) {
@@ -785,12 +1191,9 @@ async function fightDragon(args, ctx) {
   if (!dragon) {
     if (findBlockPositions(ctx, PORTAL_BLOCK, radius, 4).length > 0) {
       return {
-        detail: '末影龙已经不在了，末地中央有返回传送门',
-        status: 'succeeded',
-        data: {
-          events: ['ender_dragon_killed'],
-          evidence: 'return_portal_present_dragon_absent',
-        },
+        detail: '观察到中央返回传送门，但本次战斗没有观察到末影龙；不报告击杀事件',
+        status: 'partial',
+        data: { events: [], evidence: 'return_portal_present_dragon_absent_before_fight' },
       };
     }
     throw new Error('附近没有末影龙，可能还没生成');
@@ -811,15 +1214,16 @@ async function fightDragon(args, ctx) {
     throwIfInterrupted(ctx, '末地战斗');
     dragon = findEntity(ctx, DRAGON_ENTITY, radius);
     if (!dragon) {
-      if (findBlockPositions(ctx, PORTAL_BLOCK, 128, 8).length > 0) {
+      const returnPortalPresentNow = findBlockPositions(ctx, PORTAL_BLOCK, 128, 8).length > 0;
+      if (returnPortalPresentNow && !returnPortalPresentAtStart) {
         return {
           detail:
-            `确认中央返回传送门已出现，末影龙不在附近；打碎 ${crystalResult.broken} 个末地水晶` +
+            `确认中央返回传送门在本次战斗期间出现，末影龙已不在附近；打碎 ${crystalResult.broken} 个末地水晶` +
             (notes.length ? `；过程记录：${notes.slice(-3).join('，')}` : ''),
           status: 'succeeded',
           data: {
             events: ['ender_dragon_killed'],
-            evidence: 'return_portal_present_dragon_absent',
+            evidence: 'return_portal_appeared_dragon_absent',
           },
         };
       }
@@ -959,12 +1363,13 @@ async function returnHome(args, ctx) {
 export const skills = {
   throw_eye: {
     description:
-      '在主世界投掷末影之眼找要塞：朝当前朝向抛眼，跟踪飞行方向，按需朝该方向前进一段；多次投掷会用射线求交估算要塞坐标，靠近框架后自动停下。',
+      '在主世界投掷末影之眼找要塞：只在实际观测到末地门框架时报告找到；眼在附近消失但没有框架时保留单次搜索上下文，可在安全检查后分段下探并逐段新扫描。',
     parameters: [
       { name: 'count', type: 'number', required: false, default: 3, description: '最多投几次，范围 1-12。' },
       { name: 'advance', type: 'number', required: false, default: 0, description: '每次投掷后朝眼飞的方向走多少格，0 表示原地投。' },
       { name: 'frame_radius', type: 'number', required: false, default: 24, description: '发现末地门框架的搜索半径，范围 8-64 格。' },
       { name: 'timeout_s', type: 'number', required: false, default: 180, description: '整个寻找过程的最长用时，范围 20-300 秒。' },
+      { name: 'resume_search', type: 'object', required: false, default: null, description: 'Core 内部续跑字段；仅使用先前 Bridge 回执中的 stronghold_search，续跑不会再次投掷末影之眼。' },
     ],
     handler: throwEye,
   },

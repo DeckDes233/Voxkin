@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { Vec3 } from 'vec3';
 
 import { skills } from '../skills/craft.js';
 
@@ -111,6 +112,27 @@ test('smelt_batch synchronizes inventory before verifying furnace output', async
   assert.match(result.detail, /cooked_beef，背包共 3 个/);
 });
 
+test('smelt_batch pins sufficient non-oak fuel through every furnace round', async () => {
+  const inventory = { raw_iron: 9, iron_ingot: 0, coal: 1, spruce_planks: 7 };
+  const calls = [];
+  const result = await skills.smelt_batch.handler({ item: 'raw_iron', count: 9 }, {
+    countItem: name => inventory[name] || 0,
+    nearbyBlock: () => ({ name: 'furnace' }),
+    async smeltItem(args) {
+      calls.push(args);
+      assert.equal(args.fuel, 'spruce_planks');
+      inventory.spruce_planks -= Math.ceil(args.count / 1.5);
+      inventory.raw_iron -= args.count;
+      inventory.iron_ingot += args.count;
+      return '已取出铁锭';
+    },
+  });
+  assert.equal(result.status, 'succeeded');
+  assert.deepEqual(calls.map(args => args.count), [8, 1]);
+  assert.equal(inventory.iron_ingot, 9);
+  assert.equal(inventory.coal, 1);
+});
+
 test('prepare_bow_arrows uses available non-oak wood and verifies actual inventory', async () => {
   const ctx = makeBowContext({
     inventory: { spruce_log: 4, string: 3, feather: 16, flint: 16 },
@@ -165,6 +187,18 @@ test('prepare_bow_arrows accepts bamboo planks and an existing crafting table', 
   assert.deepEqual(ctx.craftCalls.map((call) => call.item), ['stick', 'bow', 'arrow']);
 });
 
+test('prepare_bow_arrows invokes wood exploration when the initial local scan is empty', async () => {
+  const ctx = makeBowContext({ inventory: { string: 3, feather: 16, flint: 16 } });
+  const original = ctx.runSkill;
+  ctx.runSkill = async (id, args) => {
+    assert.equal(args.block, 'wood_log');
+    return original(id, { ...args, block: 'spruce_log' });
+  };
+  assert.equal((await skills.prepare_bow_arrows.handler({ count: 64 }, ctx)).status, 'succeeded');
+  assert.equal(ctx.countItem('bow'), 1);
+  assert.equal(ctx.countItem('arrow'), 64);
+});
+
 test('prepare_bow_arrows fails closed when required arrow materials are missing', async () => {
   const ctx = makeBowContext({ inventory: { string: 3, feather: 15, flint: 16 } });
 
@@ -189,4 +223,73 @@ test('prepare_bow_arrows does not craft after its nested collection is interrupt
   );
   assert.deepEqual(ctx.craftCalls, []);
   assert.equal(ctx.mineCalls.length, 1);
+});
+
+test('craft_bed delegates placement and orientation to the shared bridge bed helper', async () => {
+  const inventory = { white_wool: 3, oak_planks: 3, white_bed: 0 };
+  const blocks = new Map();
+  const key = (x, y, z) => `${x},${y},${z}`;
+  for (let x = -3; x <= 4; x += 1) {
+    for (let z = -3; z <= 3; z += 1) blocks.set(key(x, 0, z), { name: 'stone', boundingBox: 'block' });
+  }
+  const bedPlacements = [];
+  const bot = {
+    entity: { position: new Vec3(0.5, 1, 0.5) },
+    inventory: {
+      items: () => Object.entries(inventory)
+        .filter(([, count]) => count > 0)
+        .map(([name, count]) => ({ name, count })),
+    },
+    blockAt: (position) => {
+      const { x, y, z } = position.floored();
+      return blocks.get(key(x, y, z)) || { name: 'air', boundingBox: 'empty' };
+    },
+  };
+  const ctx = {
+    bot,
+    countItem: (name) => inventory[name] || 0,
+    async craftItem({ item }) {
+      inventory[item] = (inventory[item] || 0) + 1;
+      return `合成 ${item}`;
+    },
+    async placeBedAt(foot, item) {
+      const head = { x: foot.x + 1, y: foot.y, z: foot.z };
+      bedPlacements.push({ foot, item });
+      blocks.set(key(foot.x, foot.y, foot.z), { name: item, boundingBox: 'empty' });
+      blocks.set(key(head.x, head.y, head.z), { name: item, boundingBox: 'empty' });
+      inventory[item] -= 1;
+      return { foot, head, item };
+    },
+  };
+
+  const result = await skills.craft_bed.handler({ color: 'white', count: 1, place: true }, ctx);
+
+  assert.equal(result.status, 'succeeded');
+  assert.equal(bedPlacements.length, 1);
+  assert.equal(bedPlacements[0].item, 'white_bed');
+  assert.equal(blocks.get(key(1, 1, 0)).name, 'white_bed');
+  assert.equal(blocks.get(key(2, 1, 0)).name, 'white_bed');
+});
+
+test('craft_bed converts the missing planks instead of trying to craft logs', async () => {
+  const inventory = { white_wool: 3, spruce_planks: 2, spruce_log: 1 };
+  const calls = [];
+  const ctx = {
+    countItem: name => inventory[name] || 0,
+    async craftItem({ item, count }) {
+      calls.push({ item, count });
+      if (item === 'spruce_planks') {
+        inventory.spruce_log -= 1;
+        inventory.spruce_planks += 4;
+      } else {
+        assert.equal(item, 'white_bed');
+        inventory.spruce_planks -= 3;
+        inventory.white_wool -= 3;
+        inventory.white_bed = 1;
+      }
+      return '完成';
+    },
+  };
+  assert.equal((await skills.craft_bed.handler({ count: 1, color: 'white', place: false }, ctx)).status, 'succeeded');
+  assert.deepEqual(calls, [{ item: 'spruce_planks', count: 1 }, { item: 'white_bed', count: 1 }]);
 });

@@ -33,6 +33,11 @@ function makeTravelContext(dimension, { destination, cancel = false } = {}) {
   const bot = {
     game: { dimension },
     entity: { position: makePosition() },
+    blockAt(position) {
+      return position.x === 1 && position.y === 64 && position.z === 0
+        ? { name: 'nether_portal', position: { x: 1, y: 64, z: 0 } }
+        : null;
+    },
   };
   const ctx = {
     bot,

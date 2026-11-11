@@ -14,6 +14,8 @@ ACTION_STATUSES = (
     "disconnected",
     "blocked",
     "dead",
+    "preempted",
+    "unknown",
 )
 
 SUCCESS_STATUSES = ("succeeded", "partial")
@@ -32,6 +34,11 @@ class ActionRequest:
     timeout_s: float = 120.0
     skill_id: str = ""
     priority: int = 3
+    session_id: str = ""
+    state_revision: int | None = None
+    goal_id: str = ""
+    intent_id: str = ""
+    origin: str = "player"
     action_id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
 
     def to_message(self) -> dict[str, Any]:
@@ -43,7 +50,39 @@ class ActionRequest:
             "arguments": self.arguments,
             "timeout_s": self.timeout_s,
             "priority": self.priority,
+            "session_id": self.session_id,
+            "state_revision": self.state_revision,
+            "goal_id": self.goal_id,
+            "intent_id": self.intent_id,
+            "origin": self.origin,
         }
+
+
+@dataclass(frozen=True)
+class ActionStatusResult:
+    action_id: str
+    status: str = "unknown"
+    detail: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_message(cls, message: dict[str, Any]) -> "ActionStatusResult":
+        if message.get("type") != "action_status_result":
+            raise ValueError(f"不是 action_status_result 消息: {message.get('type')}")
+        action_id = str(message.get("action_id") or "")
+        if not action_id:
+            raise ValueError("action_status_result 缺少 action_id")
+        allowed = set(ACTION_STATUSES) | {"queued", "cancelling", "preempting", "unknown"}
+        status = str(message.get("status") or "unknown")
+        if status not in allowed:
+            status = "unknown"
+        data = message.get("data")
+        return cls(
+            action_id=action_id,
+            status=status,
+            detail=str(message.get("detail") or ""),
+            data=dict(data) if isinstance(data, dict) else {},
+        )
 
 
 @dataclass
@@ -54,6 +93,7 @@ class ActionCancel:
     reason: str = ""
     turn_id: str = ""
     scope: str = "action"
+    interrupt_status: str = "cancelled"
 
     def to_message(self) -> dict[str, Any]:
         return {
@@ -62,6 +102,7 @@ class ActionCancel:
             "reason": self.reason,
             "turn_id": self.turn_id,
             "scope": self.scope,
+            "interrupt_status": self.interrupt_status,
         }
 
     @classmethod
@@ -76,6 +117,11 @@ class ActionCancel:
             reason=str(message.get("reason") or ""),
             turn_id=str(message.get("turn_id") or ""),
             scope=scope,
+            interrupt_status=(
+                str(message.get("interrupt_status"))
+                if message.get("interrupt_status") in ("cancelled", "preempted")
+                else "cancelled"
+            ),
         )
 
 
@@ -88,6 +134,10 @@ class ActionProgress:
     detail: str = ""
     progress: float = 0.0
     skill_id: str = ""
+    session_id: str = ""
+    state_revision: int | None = None
+    executor_epoch: int | None = None
+    data: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_message(cls, message: dict[str, Any]) -> "ActionProgress":
@@ -100,12 +150,27 @@ class ActionProgress:
             progress = float(message.get("progress") or 0.0)
         except (TypeError, ValueError):
             progress = 0.0
+        raw_revision = message.get("state_revision", message.get("revision"))
+        raw_epoch = message.get("executor_epoch")
+        try:
+            state_revision = int(raw_revision) if raw_revision is not None else None
+        except (TypeError, ValueError):
+            state_revision = None
+        try:
+            executor_epoch = int(raw_epoch) if raw_epoch is not None else None
+        except (TypeError, ValueError):
+            executor_epoch = None
+        raw_data = message.get("data")
         return cls(
             action_id=action_id,
             phase=str(message.get("phase") or ""),
             detail=str(message.get("detail") or ""),
             progress=max(0.0, min(1.0, progress)),
             skill_id=str(message.get("skill_id") or ""),
+            session_id=str(message.get("session_id") or ""),
+            state_revision=state_revision,
+            executor_epoch=executor_epoch,
+            data=dict(raw_data) if isinstance(raw_data, dict) else {},
         )
 
 

@@ -90,10 +90,14 @@ S1_STEPS: tuple[StepSpec, ...] = (
 
 S2_STEPS: tuple[StepSpec, ...] = (
     StepSpec(
-        "打 3 块牛肉",
+        "获取 3 块可食用的肉（不猎羊）",
         "hunt_animal",
-        {"count": 3, "species": "cow", "radius": 64, "min_health": 10},
-        {"type": "inventory", "items": {"beef": 3}},
+        {"count": 3, "radius": 64, "min_health": 10, "exclude_species": ["sheep"]},
+        {
+            "type": "inventory_any",
+            "items": ["beef", "porkchop", "chicken", "rabbit"],
+            "count": 3,
+        },
         retries=2,
         timeout_s=250,
     ),
@@ -114,22 +118,6 @@ S2_STEPS: tuple[StepSpec, ...] = (
         timeout_s=60,
     ),
     StepSpec(
-        "采 2 个煤用于烤肉",
-        "mine_collect",
-        {"block": "coal_ore", "count": 2, "range": 64},
-        {"type": "inventory", "items": {"coal": 2}},
-        retries=1,
-        timeout_s=250,
-    ),
-    StepSpec(
-        "把牛肉烤熟",
-        "smelt_batch",
-        {"item": "beef", "count": 3, "output": "cooked_beef"},
-        {"type": "inventory", "items": {"cooked_beef": 3}},
-        retries=1,
-        timeout_s=190,
-    ),
-    StepSpec(
         "饥饿时吃东西",
         "eat_if_hungry",
         {"threshold": 16},
@@ -146,7 +134,7 @@ S2_STEPS: tuple[StepSpec, ...] = (
         timeout_s=250,
     ),
     StepSpec(
-        "补煤作铁锭熔炼燃料",
+        "采煤作铁锭熔炼燃料",
         "mine_collect",
         {"block": "coal_ore", "count": 2, "range": 64},
         {"type": "inventory", "items": {"coal": 2}},
@@ -170,12 +158,20 @@ S2_STEPS: tuple[StepSpec, ...] = (
         timeout_s=60,
     ),
     StepSpec(
+        "外出剪羊前补充食物",
+        "eat_if_hungry",
+        {"threshold": 18},
+        {"type": "food", "min": 8},
+        retries=1,
+        timeout_s=60,
+    ),
+    StepSpec(
         "剪羊毛并收集 3 个同色羊毛",
         "shear_sheep",
-        {"count": 3, "radius": 48, "color": "auto"},
+        {"count": 3, "radius": 96, "color": "auto"},
         {"type": "inventory", "items": {"wool": 3}},
         retries=2,
-        timeout_s=180,
+        timeout_s=300,
     ),
     StepSpec(
         "合成床",
@@ -327,20 +323,12 @@ S4_STEPS: tuple[StepSpec, ...] = (
         timeout_s=310,
     ),
     StepSpec(
-        "搜索钻石矿坐标",
-        "find_diamond",
-        {"yMin": -59, "yMax": -54, "radius": 32, "count": 8},
-        {"type": "always"},
-        retries=1,
-        timeout_s=60,
-    ),
-    StepSpec(
-        "采 3 个钻石",
+        "采 3 个钻石（识别普通与深层矿）",
         "mine_collect",
-        {"block": "deepslate_diamond_ore", "count": 3, "range": 48},
+        {"block": "diamond_ore", "count": 3, "range": 64},
         {"type": "inventory", "items": {"diamond": 3}},
         retries=2,
-        timeout_s=250,
+        timeout_s=300,
     ),
     StepSpec(
         "合成钻石镐",

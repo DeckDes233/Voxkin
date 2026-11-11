@@ -101,18 +101,28 @@ class Runtime:
                 device=config.audio.device,
                 volume=config.audio.volume,
             )
-        dispatcher = ActionDispatcher()
+        dispatcher = ActionDispatcher(require_protocol=True)
         arbiter = ActionArbiter(dispatcher, on_event=hub.publish)
 
         async def dispatch_task(
-            tool: str, arguments: dict[str, Any], timeout_s: float | None = None
+            tool: str,
+            arguments: dict[str, Any],
+            timeout_s: float | None = None,
+            *,
+            action_id: str = "",
+            goal_id: str = "",
+            intent_id: str = "",
+            origin: str = "goal",
         ) -> Any:
-            """任务步骤也走仲裁器：同一个世界里只允许一个动作在改世界。"""
+            """目标方法也经统一准入，并把 action_id 与目标关联交给 Bridge。"""
             ticket = ActionTicket(
                 tool=tool,
                 arguments=dict(arguments or {}),
-                origin="task",
+                origin=origin,
                 timeout_s=float(timeout_s or 0.0),
+                action_id=action_id,
+                goal_id=goal_id,
+                intent_id=intent_id,
             )
             return await arbiter.submit(ticket)
         store: MemoryStore | None = None
@@ -142,7 +152,11 @@ class Runtime:
             state_provider=dispatcher.state_snapshot,
             announce=pipeline.announce,
             store=task_store,
+            action_status=dispatcher.action_status,
+            state_age_provider=dispatcher.state_age_s,
+            cancel_actions=arbiter.cancel_all,
         )
+        pipeline.set_stop_handler(run_manager.request_stop)
         supervisor = ServiceSupervisor(Path("logs") / "services")
         if config.tts.manage_service:
             supervisor.register(
@@ -279,6 +293,7 @@ class Runtime:
                 "pending_actions": self.dispatcher.pending_count,
             },
             "arbiter": self.arbiter.status() if self.arbiter is not None else {"enabled": False},
+            "run": self.run_manager.status() if self.run_manager is not None else {"running": False},
             "memory": self.memory.counts() if self.memory is not None else {"enabled": False},
             "persona": self.config.persona.name,
             "project_root": str(Path.cwd()),

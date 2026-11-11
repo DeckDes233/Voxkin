@@ -26,6 +26,7 @@ from voxkin.world_state import format_world_state
 
 EventEmitter = Callable[[dict[str, Any]], Awaitable[None]]
 ActionHandler = Callable[[dict[str, Any], TurnTimeline], Awaitable[str]]
+StopHandler = Callable[[], Any]
 
 
 class ConversationPipeline:
@@ -78,6 +79,7 @@ class ConversationPipeline:
         self._accept_audio = False
         self._action_handler: ActionHandler | None = None
         self._action_controller: ActionController | None = None
+        self._stop_handler: StopHandler | None = None
         self._state_provider = None
         self._started = False
         self._summarize_task: asyncio.Task | None = None
@@ -92,6 +94,10 @@ class ConversationPipeline:
     def set_action_controller(self, controller: ActionController) -> None:
         """接上动作仲裁器。接上之后动作的优先级、取消与结果路由由仲裁器负责。"""
         self._action_controller = controller
+
+    def set_stop_handler(self, handler: StopHandler) -> None:
+        """在统一停止入口同步持久化自主目标的显式暂停意图。"""
+        self._stop_handler = handler
 
     def set_state_provider(self, provider) -> None:
         self._state_provider = provider
@@ -292,6 +298,8 @@ class ConversationPipeline:
         if intent is None or intent.name != "stop_movement":
             return False
         turn.mark("t_stop_sent")
+        if self._stop_handler is not None:
+            self._stop_handler()
         cancelled = await self._cancel_actions("玩家要求停止")
         turn.meta["cancelled_actions"] = cancelled
         await self._broadcast(

@@ -55,6 +55,14 @@ def test_tools_parse_as_function_schemas():
         json.dumps(tool, ensure_ascii=False)
 
 
+def test_mining_exploration_exposes_coordinate_array_schema():
+    parameter = tool_map()["explore_mining_site"]["parameters"]["properties"]["avoid_positions"]
+    assert parameter["type"] == "array"
+    assert parameter["items"]["type"] == "object"
+    assert parameter["items"]["required"] == ["x", "y", "z"]
+    assert parameter["items"]["properties"]["x"] == {"type": "number"}
+
+
 def test_tool_list_follows_the_manifest():
     """工具清单由 bridge/skills/manifest.json 生成，不手工维护。"""
     manifest = manifest_map()
@@ -91,7 +99,7 @@ def test_tool_parameters_follow_the_manifest():
 
 def test_hunt_material_schema_exposes_its_supported_item_values():
     schema = tool_map()["hunt_material"]["parameters"]["properties"]["item"]
-    assert schema["enum"] == ["feather", "string"]
+    assert schema["enum"] == ["wool", "feather", "string"]
 
 
 def test_existing_tools_keep_their_parameters():

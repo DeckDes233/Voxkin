@@ -148,7 +148,7 @@ class VoxkinConfig:
     def validate(self) -> None:
         if self.llm.provider not in {"openai_compat", "scripted"}:
             raise ValueError(f"未知的 LLM provider: {self.llm.provider}")
-        if self.tts.engine not in {"genie", "gpt_sovits"}:
+        if self.tts.engine not in {"genie", "gpt_sovits", "silent"}:
             raise ValueError(f"未知的 TTS engine: {self.tts.engine}")
         if self.audio.output not in {"speaker", "wav_dir", "minecraft_file", "websocket"}:
             raise ValueError(f"未知的音频输出: {self.audio.output}")

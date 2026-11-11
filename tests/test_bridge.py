@@ -184,10 +184,14 @@ async def test_death_event_fails_pending_action_and_respawn_refreshes_state(stac
     harness.arbiter = None
     harness.dispatcher.update_state(
         {
+            "session_id": "death-test-world",
+            "revision": 10,
+            "ready": True,
             "alive": True,
             "health": 20,
             "position": {"x": 4, "y": 64, "z": 8},
             "inventory": {"oak_log": 3},
+            "executor": {"active_action_id": None, "safety_active": False, "epoch": 1},
         }
     )
     ws = await client.ws_connect("/ws/bridge?name=death-test")
@@ -211,7 +215,7 @@ async def test_death_event_fails_pending_action_and_respawn_refreshes_state(stac
     assert error.value.status == "dead"
     assert death_event["type"] == "player_death"
     assert manager.deaths[0]["interrupted_actions"] == [request["action_id"]]
-    assert harness.dispatcher.state_snapshot()["inventory"] == {"oak_log": 3}
+    assert harness.dispatcher.state_snapshot() == {}
 
     await ws.send_json(
         {
@@ -227,6 +231,23 @@ async def test_death_event_fails_pending_action_and_respawn_refreshes_state(stac
     respawn_event = await asyncio.wait_for(event_queue.get(), timeout=1)
     assert respawn_event["type"] == "player_respawn"
     assert manager.respawns[0]["alive"] is True
+    assert harness.dispatcher.state_snapshot() == {}
+    await ws.send_json(
+        {
+            "type": "state",
+            "data": {
+                "session_id": "death-test-world",
+                "revision": 11,
+                "ready": True,
+                "alive": True,
+                "health": 20,
+                "position": {"x": 0, "y": 64, "z": 0},
+                "inventory": {"oak_log": 1},
+                "executor": {"active_action_id": None, "safety_active": False, "epoch": 2},
+            },
+        }
+    )
+    await asyncio.wait_for(event_queue.get(), timeout=1)
     assert harness.dispatcher.state_snapshot()["position"]["x"] == 0
     assert harness.dispatcher.state_snapshot()["inventory"] == {"oak_log": 1}
     harness.hub.unsubscribe(event_queue)

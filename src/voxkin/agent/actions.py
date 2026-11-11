@@ -7,7 +7,13 @@ from typing import Any, Awaitable, Callable
 
 from voxkin.agent.skills import find_skill, parameter_bounds
 from voxkin.agent.tools import BRIDGE_ONLY_SKILLS
-from voxkin.bridge.protocol import ActionCancel, ActionProgress, ActionRequest, ActionResult
+from voxkin.bridge.protocol import (
+    ActionCancel,
+    ActionProgress,
+    ActionRequest,
+    ActionResult,
+    ActionStatusResult,
+)
 
 # 桥接把 timeout_s 夹在 5 到 300 秒之间，Core 侧用同样的范围。
 MIN_TIMEOUT_S = 5.0
@@ -31,9 +37,19 @@ BLOCKED_KEYWORDS = ("没有", "材料不够")
 class ActionError(RuntimeError):
     """动作没有成功完成；status 说明失败属于哪一类。"""
 
-    def __init__(self, message: str, status: str = "failed") -> None:
+    def __init__(
+        self,
+        message: str,
+        status: str = "failed",
+        action_id: str = "",
+        data: dict[str, Any] | None = None,
+        receipt_confirmed: bool = False,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.action_id = action_id
+        self.data = dict(data or {})
+        self.receipt_confirmed = receipt_confirmed
 
 
 Sender = Callable[[dict[str, Any]], Awaitable[None]]
@@ -79,16 +95,23 @@ def _coerce(parameter: dict[str, Any], value: Any) -> Any:
 class ActionDispatcher:
     """把工具调用转发给已连接的 Minecraft 桥接，并等待可验证的执行结果。"""
 
-    def __init__(self, default_timeout_s: float = 120.0) -> None:
+    def __init__(self, default_timeout_s: float = 120.0, *, require_protocol: bool = False) -> None:
         self.default_timeout_s = default_timeout_s
+        self.require_protocol = require_protocol
         self._sender: Sender | None = None
         self._pending: dict[str, asyncio.Future[ActionResult]] = {}
+        self._pending_status: dict[str, asyncio.Future[ActionStatusResult]] = {}
+        self._request_sessions: dict[str, str] = {}
+        self._request_revisions: dict[str, int | None] = {}
+        self._status_sessions: dict[str, str] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._progress: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self.bridge_name = ""
         self.latest_state: dict[str, Any] = {}
         self._state_at = 0.0
+        self._state_valid = False
+        self._readiness_hold = False
 
     @property
     def connected(self) -> bool:
@@ -98,12 +121,55 @@ class ActionDispatcher:
     def pending_count(self) -> int:
         return len(self._pending)
 
-    def update_state(self, data: dict[str, Any]) -> None:
-        self.latest_state = data or {}
+    def update_state(self, data: dict[str, Any], *, source: str = "state") -> bool:
+        incoming = dict(data or {})
+        current_session = str(self.latest_state.get("session_id") or "")
+        incoming_session = str(incoming.get("session_id") or "")
+        current_revision = self._revision(self.latest_state.get("revision"))
+        incoming_revision = self._revision(incoming.get("revision"))
+        modern_state = any(key in incoming for key in ("session_id", "revision", "ready"))
+        if source != "state":
+            if not incoming_session or not current_session or incoming_session != current_session:
+                return False
+            if incoming_revision is None or current_revision is None or incoming_revision <= current_revision:
+                return False
+        elif modern_state and (not incoming_session or incoming_revision is None):
+            return False
+        elif current_session and not incoming_session:
+            return False
+        elif current_session and incoming_session == current_session:
+            if current_revision is not None and incoming_revision is not None:
+                if incoming_revision <= current_revision:
+                    return False
+            elif current_revision is not None or incoming_revision is not None:
+                return False
+        elif current_session and incoming_session != current_session:
+            # 只有经当前 Bridge WebSocket 收到的正常 state 才能切换 lifecycle。
+            pass
+        elif not current_session and incoming_session:
+            pass
+        elif current_revision is not None and incoming_revision is not None:
+            if incoming_revision <= current_revision:
+                return False
+        self.latest_state = incoming
         self._state_at = time.monotonic()
+        self._state_valid = True
+        return True
+
+    def invalidate_state(self, overlay: dict[str, Any] | None = None) -> None:
+        """处理 death/disconnect 等同 revision 生命周期通知，等待新 revision 再启用动作。"""
+        self.latest_state = {**self.latest_state, **dict(overlay or {})}
+        self._state_valid = False
+
+    @staticmethod
+    def _revision(value: Any) -> int | None:
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
 
     def state_snapshot(self, max_age_s: float = 30.0) -> dict[str, Any]:
-        if not self.latest_state:
+        if not self.latest_state or not self._state_valid or self._readiness_hold:
             return {}
         if time.monotonic() - self._state_at > max_age_s:
             return {}
@@ -111,15 +177,22 @@ class ActionDispatcher:
 
     def state_age_s(self) -> float:
         """最近一帧状态距今的秒数；没有状态时返回很大值。"""
-        if not self.latest_state:
+        if not self.latest_state or not self._state_valid or self._readiness_hold:
             return float("inf")
         return round(time.monotonic() - self._state_at, 2)
+
+    def set_readiness_hold(self, held: bool) -> None:
+        """临时封锁所有动作 admission，直到上下文恢复后再开放。"""
+        self._readiness_hold = bool(held)
 
     def attach(self, sender: Sender, bridge_name: str = "") -> None:
         if self._sender is not None:
             raise ActionError("已经有一个 Minecraft 桥接连接，请先断开旧连接")
         self._sender = sender
         self.bridge_name = bridge_name
+        self.latest_state = {}
+        self._state_valid = False
+        self._readiness_hold = False
 
     def detach(self, sender: Sender | None = None) -> None:
         if sender is not None and sender is not self._sender:
@@ -128,19 +201,51 @@ class ActionDispatcher:
         self.bridge_name = ""
         self.latest_state = {}
         self._state_at = 0.0
+        self._state_valid = False
+        self._readiness_hold = False
         for future in self._pending.values():
             if not future.done():
                 # 断桥是基础设施故障，不是用户取消；保留独立状态供上层决定重连与续跑。
                 future.set_exception(
-                    ActionError("Minecraft 桥接已断开", status="disconnected")
+                    ActionError("Minecraft 桥接已断开，动作结果未知", status="disconnected")
                 )
         self._pending.clear()
+        self._request_sessions.clear()
+        self._request_revisions.clear()
+        for action_id, future in self._pending_status.items():
+            if not future.done():
+                future.set_result(
+                    ActionStatusResult(action_id=action_id, status="unknown", detail="桥接已断开")
+                )
+        self._pending_status.clear()
+        self._status_sessions.clear()
 
     def resolve(self, result: ActionResult) -> None:
         future = self._pending.pop(result.action_id, None)
+        expected_session = self._request_sessions.pop(result.action_id, "")
         if future is None:
             return
+        observation = result.data.get("observation")
+        if isinstance(observation, dict):
+            observed_session = str(observation.get("session_id") or "")
+            current_session = str(self.latest_state.get("session_id") or "")
+            if expected_session and observed_session == expected_session == current_session:
+                self.update_state(observation, source="result")
         if not future.done():
+            future.set_result(result)
+
+    def resolve_action_status(self, result: ActionStatusResult) -> None:
+        future = self._pending_status.pop(result.action_id, None)
+        expected_session = self._status_sessions.pop(result.action_id, "")
+        if future is None:
+            return
+        observation = result.data.get("observation")
+        if isinstance(observation, dict):
+            observed_session = str(observation.get("session_id") or "")
+            current_session = str(self.latest_state.get("session_id") or "")
+            if expected_session and observed_session == expected_session == current_session:
+                self.update_state(observation, source="result")
+        if future is not None and not future.done():
             future.set_result(result)
 
     def fail_pending(self, status: str, detail: str) -> list[str]:
@@ -149,22 +254,54 @@ class ActionDispatcher:
             if not future.done():
                 future.set_exception(ActionError(detail, status=status))
         self._pending.clear()
+        self._request_sessions.clear()
+        self._request_revisions.clear()
         return action_ids
 
-    def on_progress(self, progress: ActionProgress) -> None:
+    def on_progress(self, progress: ActionProgress) -> bool:
         """记录桥接报上来的动作进度。桥接没报就是没有进度，不许自己编。"""
+        if progress.action_id not in self._request_sessions:
+            return False
+        if self.require_protocol and (
+            not progress.session_id
+            or progress.state_revision is None
+            or progress.executor_epoch is None
+        ):
+            return False
+        expected_session = self._request_sessions.get(progress.action_id, "")
+        current_session = str(self.latest_state.get("session_id") or "")
+        if progress.session_id and expected_session and progress.session_id != expected_session:
+            return False
+        if progress.session_id and current_session and progress.session_id != current_session:
+            return False
+        expected_revision = self._request_revisions.get(progress.action_id)
+        if (
+            expected_revision is not None
+            and progress.state_revision is not None
+            and progress.state_revision < expected_revision
+        ):
+            return False
         self._progress[progress.action_id] = {
             "phase": progress.phase,
             "detail": progress.detail,
             "progress": progress.progress,
+            "session_id": progress.session_id,
+            "state_revision": progress.state_revision,
+            "executor_epoch": progress.executor_epoch,
+            "data": dict(progress.data),
             "at": time.monotonic(),
         }
+        return True
 
     def progress_snapshot(self, action_id: str) -> dict[str, Any]:
         return dict(self._progress.get(action_id) or {})
 
     async def cancel(
-        self, action_id: str, reason: str = "cancelled", turn_id: str = ""
+        self,
+        action_id: str,
+        reason: str = "cancelled",
+        turn_id: str = "",
+        interrupt_status: str = "cancelled",
     ) -> bool:
         """按 action_id 请求桥接取消动作。返回是否真的把取消请求发出去了。"""
         sender = self._sender
@@ -174,7 +311,13 @@ class ActionDispatcher:
         if event is not None:
             event.set()
         payload = ActionCancel(
-            action_id=action_id, reason=reason, turn_id=turn_id, scope="action"
+            action_id=action_id,
+            reason=reason,
+            turn_id=turn_id,
+            scope="action",
+            interrupt_status=(
+                interrupt_status if interrupt_status in ("cancelled", "preempted") else "cancelled"
+            ),
         )
         try:
             await sender(payload.to_message())
@@ -247,6 +390,9 @@ class ActionDispatcher:
         timeout_s: float | None = None,
         action_id: str = "",
         priority: int = 3,
+        goal_id: str = "",
+        intent_id: str = "",
+        origin: str = "player",
     ) -> ActionResult:
         """执行一个动作并返回带结构化状态的结果。"""
         sender = self._sender
@@ -256,7 +402,27 @@ class ActionDispatcher:
             )
         payload = self.check_arguments(tool, arguments)
         limit = float(timeout_s) if timeout_s else self.timeout_for(tool)
-        request = ActionRequest(tool=tool, arguments=payload, timeout_s=limit, priority=priority)
+        snapshot = self.state_snapshot()
+        if self.require_protocol and (
+            snapshot.get("ready") is not True
+            or not str(snapshot.get("session_id") or "")
+            or self._revision(snapshot.get("revision")) is None
+        ):
+            raise ActionError(
+                "Minecraft Bridge 尚无新鲜 ready 状态，动作未派发",
+                status="blocked",
+            )
+        request = ActionRequest(
+            tool=tool,
+            arguments=payload,
+            timeout_s=limit,
+            priority=priority,
+            session_id=str(snapshot.get("session_id") or ""),
+            state_revision=self._revision(snapshot.get("revision")),
+            goal_id=goal_id,
+            intent_id=intent_id,
+            origin=origin,
+        )
         if action_id:
             request.action_id = action_id
         loop = asyncio.get_running_loop()
@@ -264,6 +430,8 @@ class ActionDispatcher:
         cancel_event = asyncio.Event()
         self._pending[request.action_id] = future
         self._cancel_events[request.action_id] = cancel_event
+        self._request_sessions[request.action_id] = request.session_id
+        self._request_revisions[request.action_id] = request.state_revision
         try:
             await sender(request.to_message())
             result = await self._await_result(request.action_id, future, cancel_event, limit)
@@ -277,20 +445,64 @@ class ActionDispatcher:
                 request.action_id, "Core 等待动作结果超时"
             )
             raise ActionError(
-                f"动作 {tool} 超时未返回结果（清单预算 {limit:.0f} 秒）", status="failed"
+                f"动作 {tool} 超时未返回结果（清单预算 {limit:.0f} 秒），执行结果未知",
+                status="unknown",
+                action_id=request.action_id,
+            ) from error
+        except ActionError:
+            raise
+        except Exception as error:
+            raise ActionError(
+                f"派发动作 {tool} 时连接中断，执行结果未知",
+                status="unknown",
+                action_id=request.action_id,
             ) from error
         finally:
             if not future.done():
                 future.cancel()
             self._pending.pop(request.action_id, None)
             self._cancel_events.pop(request.action_id, None)
+            self._request_sessions.pop(request.action_id, None)
+            self._request_revisions.pop(request.action_id, None)
         result = self._refine_status(result)
         # partial 是做了一部分，不是失败：交回调用方，由它决定怎么接着做。
+        if result.status == "unknown":
+            raise ActionError(
+                f"动作 {tool} 执行结果未知: {result.detail}",
+                status="unknown",
+                action_id=result.action_id,
+                data=result.data,
+            )
         if not result.ok and result.status != "partial":
             raise ActionError(
-                f"动作 {tool} 执行失败: {result.detail}", status=result.status
+                f"动作 {tool} 执行失败: {result.detail}",
+                status=result.status,
+                action_id=result.action_id,
+                data=result.data,
+                receipt_confirmed=result.status in {
+                    "succeeded", "partial", "failed", "blocked", "cancelled",
+                    "preempted", "dead", "disconnected",
+                },
             )
         return result
+
+    async def action_status(self, action_id: str, timeout_s: float = 2.0) -> ActionStatusResult:
+        """向 Bridge 对账指定 action_id；超时和无桥接都保守返回 unknown。"""
+        sender = self._sender
+        if sender is None or not action_id:
+            return ActionStatusResult(action_id=action_id, status="unknown", detail="桥接不可用")
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[ActionStatusResult] = loop.create_future()
+        self._pending_status[action_id] = future
+        self._status_sessions[action_id] = str(self.state_snapshot().get("session_id") or "")
+        try:
+            await sender({"type": "action_status", "action_id": action_id})
+            return await asyncio.wait_for(future, timeout=max(0.05, timeout_s))
+        except (asyncio.TimeoutError, Exception):
+            return ActionStatusResult(action_id=action_id, status="unknown", detail="对账无回执")
+        finally:
+            self._pending_status.pop(action_id, None)
+            self._status_sessions.pop(action_id, None)
 
     async def _await_result(
         self,
@@ -316,7 +528,11 @@ class ActionDispatcher:
             done, _ = await asyncio.wait({future}, timeout=CANCEL_GRACE_S)
             if future in done:
                 return future.result()
-            raise ActionError(f"动作 {action_id} 已取消，桥接没有回执", status="cancelled")
+            raise ActionError(
+                f"动作 {action_id} 取消请求没有桥接回执，执行结果未知",
+                status="unknown",
+                action_id=action_id,
+            )
         raise asyncio.TimeoutError()
 
     async def dispatch(
@@ -331,7 +547,15 @@ class ActionDispatcher:
     def _refine_status(result: ActionResult) -> ActionResult:
         """桥接没给明确状态时，用结果文本补出状态，结论与桥接一致。"""
         if result.ok:
-            return result
-        if result.status in ("partial", "cancelled", "disconnected", "blocked", "dead"):
+            return result if result.status else replace(result, status="succeeded")
+        if result.status in (
+            "partial",
+            "cancelled",
+            "disconnected",
+            "blocked",
+            "dead",
+            "preempted",
+            "unknown",
+        ):
             return result
         return replace(result, status=status_for_detail(result.detail))

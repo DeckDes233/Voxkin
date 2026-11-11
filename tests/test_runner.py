@@ -32,6 +32,37 @@ def test_inventory_verifier_counts_colored_wool_and_beds() -> None:
     ) == (True, "背包满足")
 
 
+def test_inventory_any_verifier_accepts_alternative_items() -> None:
+    verifier = Verifier()
+    rule = {"type": "inventory_any", "items": ["beef", "porkchop", "chicken"], "count": 3}
+
+    assert verifier.check(rule, {"inventory": {"porkchop": 2, "chicken": 1}}) == (
+        True,
+        "背包满足",
+    )
+    assert verifier.check(rule, {"inventory": {"beef": 1, "chicken": 1}}) == (
+        False,
+        "可用物品共 2 个，还差 1 个",
+    )
+
+
+def test_dimension_verifier_normalizes_only_vanilla_namespaces() -> None:
+    verifier = Verifier()
+
+    assert verifier.check(
+        {"type": "dimension", "value": "minecraft:the_nether"},
+        {"dimension": "the_nether"},
+    ) == (True, "维度 the_nether")
+    assert verifier.check(
+        {"type": "dimension", "value": "overworld"},
+        {"dimension": "minecraft:overworld"},
+    ) == (True, "维度 minecraft:overworld")
+    assert verifier.check(
+        {"type": "dimension", "value": "minecraft:the_end"},
+        {"dimension": "custom:the_end"},
+    ) == (False, "维度 custom:the_end")
+
+
 def test_daylight_verifier_confirms_day_and_survival():
     verifier = Verifier()
     rule = {"type": "daylight", "min_health": 1}

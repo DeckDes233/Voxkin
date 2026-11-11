@@ -91,6 +91,428 @@ function makeContext(sheep, { color = 'white', wool = 0, giveWool = true, woolPe
   };
 }
 
+test('hunt_material wool completes one color without shears and ignores babies and shorn sheep', async () => {
+  const ctx = makeContext([makeSheep(1, 15), makeSheep(2), makeSheep(3, 15),
+    makeSheep(4, 15, true), makeSheep(5, 15, false, true)],
+    { color: 'black', wool: 1, woolPerSheep: 1, shears: false });
+  const attacked = [];
+  ctx.attackEntity = async target => { attacked.push(target.id); target.isValid = false; };
+  const result = await skills.hunt_material.handler({ item: 'wool', count: 3 }, ctx);
+  assert.equal(result.status, 'succeeded');
+  assert.deepEqual(attacked, [1, 3]);
+  assert.equal(ctx.countItem('black_wool'), 3);
+});
+
+test('hunt_material wool wanders when no sheep are loaded and verifies drops after finding them', async () => {
+  const ctx = makeContext([], { woolPerSheep: 1, shears: false });
+  let walked = 0;
+  ctx.walkOnce = async (x, y, z) => {
+    walked += 1;
+    Object.assign(ctx.bot.entity.position, { x, y, z });
+    const sheep = makeSheep(walked);
+    sheep.position = { x: x + 1, y, z };
+    ctx.bot.entities[sheep.id] = sheep;
+    return 'reached';
+  };
+  ctx.attackEntity = async target => { target.isValid = false; };
+  assert.equal((await skills.hunt_material.handler({ item: 'wool', count: 3 }, ctx)).status, 'succeeded');
+  assert.equal(walked, 3);
+  assert.equal(ctx.countItem('white_wool'), 3);
+});
+
+function makePosition(x, y, z) {
+  return {
+    x,
+    y,
+    z,
+    distanceTo(other) { return Math.hypot(this.x - other.x, this.y - other.y, this.z - other.z); },
+    offset(dx, dy, dz) { return makePosition(this.x + dx, this.y + dy, this.z + dz); },
+  };
+}
+
+function makeCombatSearchContext({ species = 'spider', item = 'string', targetAtStep = 0, dropsPerKill = 1, initialCount = 0 } = {}) {
+  const inventory = { [item]: initialCount };
+  const position = makePosition(0, 1, 0);
+  const walked = [];
+  let hostileAtStep = 0;
+  const bot = {
+    entity: { position },
+    health: 20,
+    entities: {},
+    pathfinder: { movements: { liquidCost: 12, blocksToAvoid: new Set([99]) } },
+    blockAt(blockPosition) {
+      if (Math.floor(blockPosition.y) === 0) return { name: 'stone', boundingBox: 'block' };
+      return { name: 'air', boundingBox: 'empty' };
+    },
+    findBlocks({ matching, maxDistance }) {
+      const supports = [];
+      for (let dx = -18; dx <= 18; dx += 3) {
+        for (let dz = -18; dz <= 18; dz += 3) {
+          const candidate = {
+            x: Math.floor(position.x) + dx,
+            y: 0,
+            z: Math.floor(position.z) + dz,
+          };
+          if (Math.hypot(dx, dz) > maxDistance) continue;
+          if (matching({ name: 'stone', boundingBox: 'block', position: candidate })) supports.push(candidate);
+        }
+      }
+      return supports;
+    },
+    attack(target) { target.isValid = false; },
+    async lookAt() {},
+  };
+  const ctx = {
+    bot,
+    registry: {
+      blocksByName: {
+        water: { id: 8 },
+        flowing_water: { id: 9 },
+        bubble_column: { id: 10 },
+      },
+    },
+    interrupted: false,
+    countItem: (name) => inventory[name] || 0,
+    itemLabel: (name) => name,
+    nearbyHostiles: () => walked.length >= hostileAtStep ? (hostileAtStep ? [{ name: 'zombie' }] : []) : [],
+    blockIsWater: () => false,
+    findRangedWeapon: () => null,
+    async approach() {},
+    async attackEntity(target) { target.isValid = false; },
+    async collectDrops(_range, name) {
+      inventory[name] = (inventory[name] || 0) + dropsPerKill;
+      return { picked: { [name]: dropsPerKill }, missed: [] };
+    },
+    async syncInventory() {},
+    async sleep() {},
+    log() {},
+    random: () => 0.25,
+    walked,
+    setHostileAtStep(step) { hostileAtStep = step; },
+    async walkOnce(x, y, z) {
+      walked.push({ x, y, z });
+      position.x = x;
+      position.y = y;
+      position.z = z;
+      if (targetAtStep === walked.length) {
+        const target = {
+          id: 100 + walked.length,
+          name: species,
+          isValid: true,
+          position: makePosition(x + 2, y, z),
+        };
+        bot.entities[target.id] = target;
+      }
+      if (typeof ctx.onWalk === 'function') return ctx.onWalk();
+      return 'reached';
+    },
+  };
+  return { ctx, inventory, walked, bot };
+}
+
+function makeAnimalSearchContext(options = {}) {
+  const search = makeCombatSearchContext({
+    species: options.species || 'pig',
+    item: options.item || 'porkchop',
+    targetAtStep: options.targetAtStep || 0,
+  });
+  const { ctx } = search;
+  ctx.bot.food = 20;
+  ctx.bot.time = { day: 1, timeOfDay: 6000 };
+  ctx.isSleepTime = () => false;
+  ctx.isThunderstorm = () => false;
+  ctx.findHostile = () => ctx.nearbyHostiles(16).length > 0
+    ? { name: 'zombie', position: makePosition(ctx.bot.entity.position.x + 1, ctx.bot.entity.position.y, ctx.bot.entity.position.z) }
+    : null;
+  ctx.retreatFrom = async () => {};
+  return search;
+}
+
+test('combat material search advances to a new supported waypoint before hunting', async () => {
+  const { ctx, inventory, walked } = makeCombatSearchContext({ targetAtStep: 2 });
+
+  const result = await skills.hunt_material.handler({ item: 'string', count: 1, radius: 48, min_health: 12 }, ctx);
+
+  assert.equal(result.status, 'succeeded');
+  assert.equal(inventory.string, 1);
+  assert.equal(walked.length, 2);
+  assert.notDeepEqual(walked[0], walked[1]);
+});
+
+test('combat material search preserves partial drops when its waypoint budget is exhausted', async () => {
+  const { ctx, inventory, walked } = makeCombatSearchContext({ targetAtStep: 1, dropsPerKill: 1 });
+
+  await assert.rejects(
+    skills.hunt_material.handler({ item: 'string', count: 2, radius: 48, min_health: 12 }, ctx),
+    /还差 1 个string/,
+  );
+
+  assert.equal(inventory.string, 1);
+  assert.equal(walked.length, 8);
+  assert.equal(new Set(walked.map(({ x, z }) => `${x},${z}`)).size, walked.length);
+  // 固定朝 +Z 搜索，每一段都必须向前推进，不能绕回旧区域。
+  let previousZ = 0;
+  for (const waypoint of walked) {
+    assert.ok(waypoint.z > previousZ + 3, JSON.stringify(walked));
+    previousZ = waypoint.z;
+  }
+});
+
+test('hunt_material stops before attacking when health drops during the chase', async () => {
+  const { ctx, bot } = makeCombatSearchContext();
+  const spider = {
+    id: 70,
+    name: 'spider',
+    isValid: true,
+    position: makePosition(5, 1, 0),
+  };
+  bot.entities[spider.id] = spider;
+  bot.health = 13;
+  let attacks = 0;
+  ctx.approach = async () => {
+    bot.health = 10;
+    spider.position = makePosition(2, 1, 0);
+  };
+  ctx.attackEntity = async () => { attacks += 1; };
+
+  await assert.rejects(
+    skills.hunt_material.handler({ item: 'string', count: 1, min_health: 12 }, ctx),
+    /血量不足/,
+  );
+
+  assert.equal(attacks, 0);
+});
+
+test('hunt_material treats count as total inventory and gathers only the remaining amount', async () => {
+  const { ctx, inventory, walked } = makeCombatSearchContext({ targetAtStep: 1, initialCount: 1 });
+
+  const result = await skills.hunt_material.handler({ item: 'string', count: 2 }, ctx);
+
+  assert.equal(result.status, 'succeeded');
+  assert.equal(inventory.string, 2);
+  assert.equal(walked.length, 1);
+});
+
+test('enderman search advances across distinct waypoints and keeps the earned pearl', async () => {
+  const { ctx, inventory, walked } = makeCombatSearchContext({
+    species: 'enderman',
+    item: 'ender_pearl',
+    targetAtStep: 3,
+  });
+
+  const result = await skills.hunt_enderman.handler({ count: 1, radius: 48 }, ctx);
+
+  assert.equal(result.status, 'succeeded');
+  assert.equal(inventory.ender_pearl, 1);
+  assert.equal(walked.length, 3);
+  assert.equal(new Set(walked.map(({ x, z }) => `${x},${z}`)).size, walked.length);
+});
+
+test('hunt_enderman stops before engaging a visible target at its health floor', async () => {
+  const { ctx, bot } = makeCombatSearchContext({ species: 'enderman', item: 'ender_pearl' });
+  const enderman = {
+    id: 80,
+    name: 'enderman',
+    isValid: true,
+    position: makePosition(2, 1, 0),
+  };
+  bot.entities[enderman.id] = enderman;
+  bot.health = 8;
+  let attacks = 0;
+  bot.attack = () => { attacks += 1; };
+
+  await assert.rejects(
+    skills.hunt_enderman.handler({ count: 1, radius: 48 }, ctx),
+    /血量不足/,
+  );
+
+  assert.equal(attacks, 0);
+});
+
+test('hunt_enderman counts prior pearls toward the requested total', async () => {
+  const { ctx, inventory, walked } = makeCombatSearchContext({
+    species: 'enderman',
+    item: 'ender_pearl',
+    targetAtStep: 1,
+    initialCount: 1,
+  });
+
+  const result = await skills.hunt_enderman.handler({ count: 2, radius: 48 }, ctx);
+
+  assert.equal(result.status, 'succeeded');
+  assert.equal(inventory.ender_pearl, 2);
+  assert.equal(walked.length, 1);
+});
+
+test('hunt_enderman uses melee and does not spend arrows even when a bow is available', async () => {
+  const { ctx, inventory, bot } = makeCombatSearchContext({
+    species: 'enderman',
+    item: 'ender_pearl',
+    targetAtStep: 1,
+  });
+  ctx.bot.blockAt = () => ({ name: 'air', boundingBox: 'empty' });
+  let shots = 0;
+  let attacks = 0;
+  ctx.findRangedWeapon = () => ({ bow: { name: 'bow' }, arrows: { name: 'arrow' } });
+  ctx.shootAt = async () => { shots += 1; return true; };
+  bot.attack = (target) => {
+    attacks += 1;
+    target.isValid = false;
+  };
+
+  const result = await skills.hunt_enderman.handler({ count: 1, radius: 48 }, ctx);
+
+  assert.equal(result.status, 'succeeded');
+  assert.equal(inventory.ender_pearl, 1);
+  assert.equal(shots, 0);
+  assert.equal(attacks, 1);
+  assert.doesNotMatch(result.detail, /水源|硬追/);
+  assert.doesNotMatch(result.detail, /服务器曾报告末影人乘载状态/);
+});
+
+test('enderman search stops at its finite waypoint budget', async () => {
+  const { ctx, walked } = makeCombatSearchContext({ species: 'enderman', item: 'ender_pearl' });
+
+  const failure = await skills.hunt_enderman.handler({ count: 2, radius: 48 }, ctx).catch((error) => error);
+  assert.ok(failure instanceof Error);
+  assert.match(failure.message, /有限安全搜索未能确认附近有末影人.*有限安全搜索路线耗尽/);
+  assert.doesNotMatch(failure.message, /附近 48 格内没有末影人/);
+
+  assert.equal(walked.length, 8);
+  assert.equal(ctx.bot.pathfinder.movements.liquidCost, 12);
+  assert.deepEqual([...ctx.bot.pathfinder.movements.blocksToAvoid], [99]);
+});
+
+test('combat search stops on cancellation and restores pathfinder safety settings', async () => {
+  const { ctx, walked, bot } = makeCombatSearchContext();
+  ctx.onWalk = () => {
+    ctx.interrupted = true;
+    return 'stopped';
+  };
+
+  await assert.rejects(
+    skills.hunt_material.handler({ item: 'string', count: 1, radius: 48, min_health: 12 }, ctx),
+    /被新的指令打断/,
+  );
+
+  assert.equal(walked.length, 1);
+  assert.equal(bot.pathfinder.movements.liquidCost, 12);
+  assert.deepEqual([...bot.pathfinder.movements.blocksToAvoid], [99]);
+});
+
+test('enderman search observes cancellation at its first waypoint', async () => {
+  const { ctx, walked, bot } = makeCombatSearchContext({ species: 'enderman', item: 'ender_pearl' });
+  ctx.onWalk = () => {
+    ctx.interrupted = true;
+    return 'stopped';
+  };
+
+  await assert.rejects(
+    skills.hunt_enderman.handler({ count: 1, radius: 48 }, ctx),
+    /被新的指令打断/,
+  );
+
+  assert.equal(walked.length, 1);
+  assert.equal(bot.pathfinder.movements.liquidCost, 12);
+  assert.deepEqual([...bot.pathfinder.movements.blocksToAvoid], [99]);
+});
+
+test('combat search stops when hostiles appear after a waypoint without continuing the route', async () => {
+  const { ctx, walked, bot } = makeCombatSearchContext();
+  ctx.setHostileAtStep(1);
+
+  await assert.rejects(
+    skills.hunt_material.handler({ item: 'string', count: 1, radius: 48, min_health: 12 }, ctx),
+    /附近有敌对生物或无法确认安全/,
+  );
+
+  assert.equal(walked.length, 1);
+  assert.equal(bot.pathfinder.movements.liquidCost, 12);
+  assert.deepEqual([...bot.pathfinder.movements.blocksToAvoid], [99]);
+});
+
+test('hunt_animal exits after route cancellation even if an animal appears at the waypoint', async () => {
+  const { ctx, walked } = makeAnimalSearchContext({ targetAtStep: 1 });
+  let approaches = 0;
+  let attacks = 0;
+  ctx.onWalk = () => {
+    ctx.interrupted = true;
+    return 'stopped';
+  };
+  ctx.approach = async () => { approaches += 1; };
+  ctx.attackEntity = async () => { attacks += 1; };
+
+  await assert.rejects(
+    skills.hunt_animal.handler({ count: 1, species: 'pig' }, ctx),
+    /新的指令打断/,
+  );
+
+  assert.equal(walked.length, 1);
+  assert.equal(approaches, 0);
+  assert.equal(attacks, 0);
+});
+
+test('hunt_animal checks hostiles after a waypoint before chasing a discovered animal', async () => {
+  const { ctx, walked } = makeAnimalSearchContext({ targetAtStep: 1 });
+  let approaches = 0;
+  let attacks = 0;
+  ctx.setHostileAtStep(1);
+  ctx.approach = async () => { approaches += 1; };
+  ctx.attackEntity = async () => { attacks += 1; };
+
+  await assert.rejects(
+    skills.hunt_animal.handler({ count: 1, species: 'pig' }, ctx),
+    /附近仍有敌对生物/,
+  );
+
+  assert.equal(walked.length, 1);
+  assert.equal(approaches, 0);
+  assert.equal(attacks, 0);
+});
+
+test('hunt_animal stops when a waypoint is stopped without cancellation metadata', async () => {
+  const { ctx, walked } = makeAnimalSearchContext();
+  ctx.onWalk = () => 'stopped';
+
+  await assert.rejects(
+    skills.hunt_animal.handler({ count: 1, species: 'pig' }, ctx),
+    /搜索动物时移动已停止/,
+  );
+
+  assert.equal(walked.length, 1);
+});
+
+test('hunt_animal reports a finite search result without claiming the full radius is empty', async () => {
+  const { ctx, walked } = makeAnimalSearchContext();
+  const realNow = Date.now;
+  let currentTime = realNow();
+  Date.now = () => currentTime;
+  ctx.sleep = async (ms) => { currentTime += Number(ms) || 0; };
+
+  try {
+    const failure = await skills.hunt_animal.handler({ count: 1, species: 'pig', radius: 48 }, ctx)
+      .catch((error) => error);
+    assert.ok(failure instanceof Error);
+    assert.match(failure.message, /有限安全搜索未能确认附近有可猎的猪/);
+    assert.doesNotMatch(failure.message, /附近没有可以狩猎的动物/);
+    assert.equal(walked.length, 8);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test('combat material search does not move when health is at its configured minimum', async () => {
+  const { ctx, walked } = makeCombatSearchContext();
+  ctx.bot.health = 12;
+
+  await assert.rejects(
+    skills.hunt_material.handler({ item: 'string', count: 1, radius: 48, min_health: 12 }, ctx),
+    /血量不足/,
+  );
+
+  assert.equal(walked.length, 0);
+});
+
 test('hunt_material verifies the requested drop count', async () => {
   const inventory = { string: 0 };
   const position = {
@@ -117,6 +539,41 @@ test('hunt_material verifies the requested drop count', async () => {
 
   assert.equal(result.status, 'succeeded');
   assert.equal(inventory.string, 1);
+});
+
+test('hunt_animal can exclude sheep while hunting other meat sources', async () => {
+  const inventory = { beef: 0, porkchop: 0 };
+  const position = {
+    x: 0,
+    y: 0,
+    z: 0,
+    distanceTo(other) { return Math.hypot(this.x - other.x, this.y - other.y, this.z - other.z); },
+  };
+  const sheep = { id: 1, name: 'sheep', isValid: true, position: { x: 1, y: 0, z: 0 } };
+  const pig = { id: 2, name: 'pig', isValid: true, position: { x: 2, y: 0, z: 0 } };
+  const ctx = {
+    bot: { entity: { position }, entities: { 1: sheep, 2: pig }, health: 20, time: { timeOfDay: 6000 } },
+    interrupted: false,
+    countItem: (name) => inventory[name] || 0,
+    itemLabel: (name) => name,
+    async approach() {},
+    async attackEntity(target) { target.isValid = false; },
+    async collectDrops(_range, name) {
+      inventory[name] = (inventory[name] || 0) + 1;
+      return { picked: { [name]: 1 }, missed: [] };
+    },
+    async sleep() {},
+    log() {},
+  };
+
+  const result = await skills.hunt_animal.handler(
+    { count: 1, exclude_species: ['sheep'] },
+    ctx,
+  );
+
+  assert.equal(result.status, 'succeeded');
+  assert.equal(inventory.porkchop, 1);
+  assert.equal(sheep.isValid, true);
 });
 
 test('hunt_material does not claim success when a kill yields no requested drop', async () => {
@@ -195,6 +652,18 @@ test('shear_sheep verifies wool gain and skips already-sheared sheep', async () 
   assert.equal(sheep.metadata[17], 0x10);
 });
 
+test('shear_sheep treats omitted default wool metadata as an adult white sheep', async () => {
+  const sheep = makeSheep(1);
+  sheep.metadata = {};
+  const ctx = makeContext([sheep]);
+
+  const result = await skills.shear_sheep.handler({ count: 3, color: 'white' }, ctx);
+
+  assert.equal(result.status, 'succeeded');
+  assert.equal(ctx.countItem('white_wool'), 3);
+  assert.equal(sheep.metadata[17], 0x10);
+});
+
 test('shear_sheep skips lambs', async () => {
   const lamb = makeSheep(1, 0, false, true);
   const ctx = makeContext([lamb]);
@@ -205,6 +674,25 @@ test('shear_sheep skips lambs', async () => {
   );
   assert.equal(ctx.countItem('white_wool'), 0);
   assert.equal(lamb.metadata[17], 0);
+});
+
+test('shear_sheep skips an unreachable sheep and continues with another', async () => {
+  const unreachable = makeSheep(1);
+  unreachable.position.x = 10;
+  const reachable = makeSheep(2);
+  const ctx = makeContext([unreachable, reachable]);
+  ctx.approach = async (target) => {
+    if (target.id === reachable.id) {
+      ctx.bot.entity.position.x = target.position.x;
+      ctx.bot.entity.position.z = target.position.z;
+    }
+  };
+
+  const result = await skills.shear_sheep.handler({ count: 3, color: 'white' }, ctx);
+
+  assert.equal(result.status, 'succeeded');
+  assert.equal(unreachable.metadata[17], 0);
+  assert.equal(reachable.metadata[17], 0x10);
 });
 
 test('shear_sheep succeeds from inventory without nearby sheep', async () => {
@@ -228,7 +716,7 @@ test('shear_sheep explores random waypoints until it discovers a sheep', async (
   };
   ctx.walkOnce = async (x, y, z, radius, timeout, horizontalOnly) => {
     searches += 1;
-    assert.deepEqual([y, radius, timeout, horizontalOnly], [1, 3, 10000, true]);
+    assert.deepEqual([y, radius, timeout, horizontalOnly], [1, 3, 18000, true]);
     waypoints.push({ x, z });
     ctx.bot.entity.position.x = x;
     ctx.bot.entity.position.z = z;
@@ -244,7 +732,7 @@ test('shear_sheep explores random waypoints until it discovers a sheep', async (
 
   const result = await skills.shear_sheep.handler({ count: 3, color: 'auto' }, ctx);
 
-  assert.equal(searches, 6);
+  assert.equal(searches, 4);
   assert.equal(new Set(waypoints.map(({ x, z }) => `${x},${z}`)).size, waypoints.length);
   assert.ok(waypoints.every(({ x, z }) => Math.hypot(x, z) <= 48));
   assert.equal(result.status, 'succeeded');
@@ -319,7 +807,7 @@ test('shear_sheep revisits an eligible sheep discovered before walking farther a
 
   const result = await skills.shear_sheep.handler({ count: 3, color: 'auto' }, ctx);
 
-  assert.equal(searches, 5);
+  assert.equal(searches, 4);
   assert.equal(result.status, 'succeeded');
   assert.equal(ctx.countItem('white_wool'), 3);
 });
@@ -426,7 +914,84 @@ test('shear_sheep filters nearby supports before Mineflayer truncates block resu
   assert.ok(Math.hypot(selectedWaypoint.x, selectedWaypoint.z) <= 18);
 });
 
-test('shear_sheep falls back to a bounded random pathfinding waypoint without safe support data', async () => {
+test('shear_sheep expands its bounded search route instead of randomly revisiting nearby ground', async () => {
+  const ctx = makeContext([]);
+  const waypoints = [];
+  ctx.bot.findBlocks = ({ matching, maxDistance, count }) => {
+    const supports = [];
+    for (let x = -24; x <= 24; x += 1) {
+      for (let z = -24; z <= 24; z += 1) {
+        const position = { x, y: 0, z };
+        if (Math.hypot(x - ctx.bot.entity.position.x, z - ctx.bot.entity.position.z) > maxDistance) continue;
+        if (matching({ name: 'grass_block', boundingBox: 'block', position })) supports.push(position);
+      }
+    }
+    return supports
+      .sort((left, right) => Math.hypot(left.x - ctx.bot.entity.position.x, left.z - ctx.bot.entity.position.z) -
+        Math.hypot(right.x - ctx.bot.entity.position.x, right.z - ctx.bot.entity.position.z))
+      .slice(0, count);
+  };
+  ctx.random = () => 0;
+  ctx.walkOnce = async (x, y, z) => {
+    waypoints.push({ x, y, z });
+    ctx.bot.entity.position.x = x;
+    ctx.bot.entity.position.z = z;
+    if (waypoints.length === 6) ctx.interrupted = true;
+    return 'reached';
+  };
+
+  await assert.rejects(
+    skills.shear_sheep.handler({ count: 3, radius: 48 }, ctx),
+    /被新的指令打断/,
+  );
+
+  const radii = waypoints.map(({ x, z }) => Math.hypot(x, z));
+  assert.equal(waypoints.length, 6);
+  assert.ok(radii[0] >= 11 && radii[0] <= 15);
+  assert.ok(radii.every((radius) => radius <= 48));
+  assert.ok(Math.max(...radii) > radii[0]);
+  assert.equal(new Set(waypoints.map(({ x, z }) => `${x},${z}`)).size, waypoints.length);
+  assert.ok(waypoints.every(({ x, y, z }) => Number.isFinite(x) && y === 1 && Number.isFinite(z)));
+});
+
+test('shear_sheep expands searches to the requested radius', async () => {
+  const ctx = makeContext([]);
+  const waypoints = [];
+  ctx.bot.findBlocks = ({ matching, maxDistance, count }) => {
+    const supports = [];
+    for (let x = -72; x <= 72; x += 1) {
+      for (let z = -72; z <= 72; z += 1) {
+        const position = { x, y: 0, z };
+        if (Math.hypot(x - ctx.bot.entity.position.x, z - ctx.bot.entity.position.z) > maxDistance) continue;
+        if (matching({ name: 'grass_block', boundingBox: 'block', position })) supports.push(position);
+      }
+    }
+    return supports
+      .sort((left, right) => Math.hypot(left.x - ctx.bot.entity.position.x, left.z - ctx.bot.entity.position.z) -
+        Math.hypot(right.x - ctx.bot.entity.position.x, right.z - ctx.bot.entity.position.z))
+      .slice(0, count);
+  };
+  ctx.random = () => 0;
+  ctx.walkOnce = async (x, y, z) => {
+    waypoints.push({ x, y, z });
+    ctx.bot.entity.position.x = x;
+    ctx.bot.entity.position.z = z;
+    if (waypoints.length === 40) ctx.interrupted = true;
+    return 'reached';
+  };
+
+  await assert.rejects(
+    skills.shear_sheep.handler({ count: 3, radius: 64 }, ctx),
+    /被新的指令打断/,
+  );
+
+  assert.equal(waypoints.length, 40);
+  assert.ok(waypoints.at(-1));
+  assert.ok(Math.hypot(waypoints.at(-1).x, waypoints.at(-1).z) > 35);
+  assert.ok(waypoints.every(({ x, y, z }) => Math.hypot(x, z) <= 96 && y === 1));
+});
+
+test('shear_sheep uses a bounded pathfinding waypoint when no safe support data is available', async () => {
   const ctx = makeContext([]);
   let selectedWaypoint;
   const waypoints = [];
@@ -445,7 +1010,7 @@ test('shear_sheep falls back to a bounded random pathfinding waypoint without sa
     skills.shear_sheep.handler({ count: 3, radius: 48 }, ctx),
     /被新的指令打断/,
   );
-  assert.deepEqual(selectedWaypoint, { x: 10, y: 0, z: 0 });
+  assert.deepEqual(selectedWaypoint, { x: 13, y: 0, z: 0 });
   assert.ok(waypoints.every(({ x, z }) => Math.hypot(x, z) <= 48));
 });
 
@@ -546,7 +1111,7 @@ test('shear_sheep skips blocked waypoints and stops after the finite search', as
     skills.shear_sheep.handler({ count: 3, color: 'auto' }, ctx),
     /已尝试有限白天搜索/,
   );
-  assert.equal(attempts, 12);
+  assert.equal(attempts, 48);
 });
 
 test('shear_sheep stops random exploration when a hostile appears', async () => {
@@ -562,6 +1127,62 @@ test('shear_sheep stops random exploration when a hostile appears', async () => 
     skills.shear_sheep.handler({ count: 3, color: 'auto' }, ctx),
     /附近有敌对生物.*停止外出寻找羊/,
   );
+  assert.equal(searches, 1);
+});
+
+test('shear_sheep retreats from a hostile and resumes only after safety is confirmed', async () => {
+  const ctx = makeContext([]);
+  const hostile = { name: 'zombie', position: { x: 4, y: 0, z: 0 } };
+  let hostileNearby = false;
+  let searches = 0;
+  let retreats = 0;
+  ctx.nearbyHostiles = () => hostileNearby ? [hostile] : [];
+  ctx.findHostile = () => hostileNearby ? hostile : null;
+  ctx.retreatFrom = async () => {
+    retreats += 1;
+    hostileNearby = false;
+  };
+  ctx.walkOnce = async () => {
+    searches += 1;
+    if (searches === 1) hostileNearby = true;
+    if (searches === 2) {
+      for (const id of [3, 4, 5]) {
+        const sheep = makeSheep(id);
+        sheep.position.x = id - 2;
+        ctx.bot.entities[sheep.id] = sheep;
+      }
+    }
+    return 'reached';
+  };
+
+  const result = await skills.shear_sheep.handler({ count: 3, color: 'auto' }, ctx);
+
+  assert.equal(result.status, 'succeeded');
+  assert.equal(ctx.countItem('white_wool'), 3);
+  assert.equal(retreats, 1);
+  assert.equal(searches, 2);
+});
+
+test('shear_sheep stops after bounded retreats when the hostile remains nearby', async () => {
+  const ctx = makeContext([]);
+  const hostile = { name: 'creeper', position: { x: 4, y: 0, z: 0 } };
+  let hostileNearby = false;
+  let searches = 0;
+  let retreats = 0;
+  ctx.nearbyHostiles = () => hostileNearby ? [hostile] : [];
+  ctx.findHostile = () => hostileNearby ? hostile : null;
+  ctx.retreatFrom = async () => { retreats += 1; };
+  ctx.walkOnce = async () => {
+    searches += 1;
+    hostileNearby = true;
+    return 'reached';
+  };
+
+  await assert.rejects(
+    skills.shear_sheep.handler({ count: 3, color: 'auto' }, ctx),
+    /撤离后附近仍有敌对生物/,
+  );
+  assert.equal(retreats, 2);
   assert.equal(searches, 1);
 });
 

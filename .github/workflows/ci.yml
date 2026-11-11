@@ -27,12 +27,18 @@ jobs:
         run: python -m pytest tests -q
 
   bridge:
-    name: 桥接语法检查
+    name: 桥接测试（Node 20）
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: 检查 JavaScript 语法
+      - name: 安装桥接依赖
+        working-directory: bridge
+        run: npm install --no-package-lock --no-audit --no-fund
+      - name: 运行全部桥接单元测试
+        working-directory: bridge
+        run: node --test
+      - name: 检查桥接入口语法
         run: node --check bridge/minecraft_bridge.js

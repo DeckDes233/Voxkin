@@ -46,3 +46,49 @@ def test_steps_and_events(tmp_path: Path) -> None:
     assert store.has_event(task.id, "goal_event", "ender_dragon_killed")
     assert not store.has_event(task.id, "goal_event", "other_event")
     store.close()
+
+
+def test_latest_shelter_hint_can_come_from_completed_s2_and_skips_invalid_newer_context(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path / "tasks.db")
+    store.initialize()
+    s2 = store.create_task("准备过夜", stage="S2")
+    store.save_goal_state(
+        s2.id,
+        {
+            "status": "done",
+            "last_observation": {
+                "dimension": "minecraft:overworld",
+                "shelter": {
+                    "position": {"x": -34, "y": 72, "z": 130},
+                    "size": 4,
+                    "sealed": True,
+                    "inside": True,
+                },
+            },
+        },
+    )
+    store.set_status(s2.id, "done")
+
+    s3 = store.create_task("铁装、盾与空桶", stage="S3")
+    store.save_goal_state(
+        s3.id,
+        {
+            "status": "active",
+            "last_observation": {
+                "dimension": "overworld",
+                "shelter": {
+                    "position": {"x": 1, "y": float("nan"), "z": 3},
+                    "size": 4,
+                    "sealed": True,
+                    "inside": True,
+                },
+            },
+        },
+    )
+
+    assert store.latest_shelter_hint() == {
+        "position": {"x": -34, "y": 72, "z": 130},
+        "size": 4,
+        "dimension": "overworld",
+    }
+    store.close()

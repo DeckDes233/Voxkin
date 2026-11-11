@@ -220,7 +220,7 @@ def test_runner_preserves_checkpoint_on_bridge_disconnect(tmp_path: Path) -> Non
     assert not result.ok
     assert result.status == "disconnected"
     assert "断开" in result.detail
-    assert store.get_task(result.task_id).status == "failed"
+    assert store.get_task(result.task_id).status == "disconnected"
     checkpoint = store.load_checkpoint(result.task_id)
     assert checkpoint is not None
     assert checkpoint["cursor"] == 0

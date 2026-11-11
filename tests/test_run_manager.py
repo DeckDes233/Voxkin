@@ -10,17 +10,35 @@ from voxkin.agent.tasks import TaskStore
 from voxkin.agent.actions import ActionError
 
 
+def modern_state(inventory: dict[str, int] | None = None, *, revision: int = 1) -> dict:
+    return {
+        "session_id": "world-1",
+        "revision": revision,
+        "ready": True,
+        "alive": True,
+        "health": 20,
+        "food": 12,
+        "position": {"x": 0, "y": 64, "z": 0},
+        "dimension": "overworld",
+        "is_day": True,
+        "inventory": dict(inventory or {}),
+        "executor": {"active_action_id": None, "safety_active": False, "epoch": 1},
+    }
+
+
 def test_run_manager_completes_s0(tmp_path: Path) -> None:
     store = TaskStore(tmp_path / "tasks.db")
     store.initialize()
-    inventory: dict[str, int] = {}
+    state = modern_state()
+    inventory: dict[str, int] = state["inventory"]
     messages: list[str] = []
 
-    async def dispatch(tool: str, arguments: dict) -> str:
-        if tool == "collect_blocks":
-                inventory["oak_log"] = 4
+    async def dispatch(tool: str, arguments: dict, timeout_s: float = 0, **kwargs) -> str:
+        if tool == "mine_collect":
+            inventory["oak_log"] = 4
         elif tool == "craft":
             inventory[arguments["item"]] = int(arguments.get("count", 1))
+        state["revision"] += 1
         return "ok"
 
     async def announce(text: str) -> None:
@@ -28,7 +46,7 @@ def test_run_manager_completes_s0(tmp_path: Path) -> None:
 
     manager = RunManager(
         dispatch=dispatch,
-        state_provider=lambda: {"inventory": dict(inventory)},
+        state_provider=lambda: state,
         announce=announce,
         store=store,
         runs_dir=tmp_path / "runs",
@@ -39,9 +57,9 @@ def test_run_manager_completes_s0(tmp_path: Path) -> None:
         status = await manager.wait()
         assert status["running"] is False
         assert status["result"]["ok"] is True
-        assert status["result"]["steps_done"] == 5
+        assert status["result"]["steps_done"] == 2
         assert inventory["wooden_pickaxe"] == 1
-        assert messages[-1] == "这一阶段完成了。"
+        assert messages[-1] == "目标「木头与工作台」已由当前观察验收完成。"
 
     asyncio.run(scenario())
 
@@ -103,7 +121,7 @@ def test_run_manager_reconciles_world_when_resuming_without_checkpoint(
 
     manager = RunManager(
         dispatch=dispatch,
-        state_provider=lambda: {"inventory": dict(inventory)},
+        state_provider=lambda: modern_state(inventory),
         announce=lambda text: asyncio.sleep(0),
         store=store,
         runs_dir=tmp_path / "runs",
@@ -114,7 +132,7 @@ def test_run_manager_reconciles_world_when_resuming_without_checkpoint(
         result = await manager.wait()
         assert result["result"]["ok"] is True
         assert calls == []
-        assert store.resume_cursor(task.id) == 5
+        assert store.load_goal_state(task.id)["status"] == "done"
 
     asyncio.run(scenario())
 
@@ -122,14 +140,15 @@ def test_run_manager_reconciles_world_when_resuming_without_checkpoint(
 def test_run_manager_persists_forced_cancellation(tmp_path: Path) -> None:
     store = TaskStore(tmp_path / "tasks.db")
     store.initialize()
+    state = modern_state()
 
-    async def dispatch(tool: str, arguments: dict) -> str:
+    async def dispatch(tool: str, arguments: dict, timeout_s: float = 0, **kwargs) -> str:
         await asyncio.Event().wait()
         return "unreachable"
 
     manager = RunManager(
         dispatch=dispatch,
-        state_provider=lambda: {},
+        state_provider=lambda: state,
         announce=lambda text: asyncio.sleep(0),
         store=store,
         runs_dir=tmp_path / "runs",
@@ -140,11 +159,14 @@ def test_run_manager_persists_forced_cancellation(tmp_path: Path) -> None:
         task_id = status["task_id"]
         await asyncio.sleep(0.01)
         assert manager._task is not None
+        manager.request_stop()
         manager._task.cancel()
         result = await manager.wait()
         assert result["result"]["status"] == "cancelled"
         assert store.get_task(task_id).status == "cancelled"
-        assert store.load_checkpoint(task_id)["payload"]["reason"] == "run_manager_cancelled"
+        goal_state = store.load_goal_state(task_id)
+        assert goal_state["status"] == "paused_by_user"
+        assert goal_state["pending_action"]["status"] == "unknown"
 
     asyncio.run(scenario())
 
@@ -172,7 +194,7 @@ def test_run_manager_status_reads_stage_event_from_current_task(tmp_path: Path) 
     task = store.create_task("S6", stage="S6")
     manager = RunManager(
         dispatch=lambda tool, arguments: asyncio.sleep(0, result="ok"),
-        state_provider=lambda: {"inventory": {}},
+        state_provider=lambda: modern_state(),
         announce=lambda text: asyncio.sleep(0),
         store=store,
     )
@@ -199,7 +221,7 @@ def test_run_manager_restores_completed_stage_status_after_restart(tmp_path: Pat
     store.set_status(task.id, "done")
     manager = RunManager(
         dispatch=lambda tool, arguments: asyncio.sleep(0, result="ok"),
-        state_provider=lambda: {"inventory": {}},
+        state_provider=lambda: modern_state(),
         announce=lambda text: asyncio.sleep(0),
         store=store,
     )
@@ -225,15 +247,19 @@ def test_run_manager_resumes_latest_checkpointed_task(tmp_path: Path) -> None:
     store.set_status(task.id, "cancelled")
     inventory = {"oak_log": 4, "oak_planks": 12, "crafting_table": 1, "stick": 4}
     calls: list[str] = []
+    state = modern_state()
+    state["inventory"].update(inventory)
+    inventory = state["inventory"]
 
-    async def dispatch(tool: str, arguments: dict) -> str:
+    async def dispatch(tool: str, arguments: dict, timeout_s: float = 0, **kwargs) -> str:
         calls.append(tool)
         inventory[arguments["item"]] = int(arguments.get("count", 1))
+        state["revision"] += 1
         return "ok"
 
     manager = RunManager(
         dispatch=dispatch,
-        state_provider=lambda: {"inventory": dict(inventory)},
+        state_provider=lambda: state,
         announce=lambda text: asyncio.sleep(0),
         store=store,
         runs_dir=tmp_path / "runs",
@@ -244,7 +270,7 @@ def test_run_manager_resumes_latest_checkpointed_task(tmp_path: Path) -> None:
         assert status["task_id"] == task.id
         result = await manager.wait()
         assert result["result"]["ok"] is True
-        assert result["result"]["steps_done"] == 5
+        assert result["result"]["steps_done"] == 2
         assert calls == ["craft"]
         assert store.get_task(task.id).status == "done"
 
@@ -254,25 +280,25 @@ def test_run_manager_resumes_latest_checkpointed_task(tmp_path: Path) -> None:
 def test_death_recovery_skips_completed_collect_step_and_continues(tmp_path: Path) -> None:
     store = TaskStore(tmp_path / "tasks.db")
     store.initialize()
-    state = {
-        "alive": True,
-        "health": 20,
-        "position": {"x": 0, "y": 64, "z": 0},
-        "inventory": {},
-    }
+    state = modern_state()
     calls: list[str] = []
     first = {"value": True}
     messages: list[str] = []
     manager_holder: dict[str, RunManager] = {}
 
-    async def dispatch(tool: str, arguments: dict, timeout_s: float) -> str:
+    async def dispatch(tool: str, arguments: dict, timeout_s: float = 0, **kwargs) -> str:
         calls.append(tool)
         if first["value"]:
             first["value"] = False
-            manager_holder["manager"].on_death({"health": 0})
-            raise ActionError("角色死亡", status="dead")
+            state["alive"] = False
+            state["health"] = 0
+            manager_holder["manager"].on_death(
+                {"health": 0, "session_id": "world-1", "revision": state["revision"]}
+            )
+            raise ActionError("角色死亡", status="dead", action_id=kwargs.get("action_id", ""))
         item = arguments["item"]
         state["inventory"][item] = int(arguments.get("count", 1))
+        state["revision"] += 1
         return "ok"
 
     async def announce(text: str) -> None:
@@ -295,14 +321,17 @@ def test_death_recovery_skips_completed_collect_step_and_continues(tmp_path: Pat
         assert store.get_task(task_id).status == "dead"
         assert store.resume_cursor(task_id) == 0
 
+        state["alive"] = True
+        state["health"] = 20
         state["inventory"]["oak_log"] = 4
-        manager.on_respawn({"alive": True, "health": 20, "position": state["position"]})
+        state["revision"] += 1
+        manager.on_respawn(state)
         await asyncio.sleep(0.02)
         await manager.wait()
 
-        assert calls == ["collect_blocks", "craft", "craft", "craft", "craft"]
+        assert calls == ["mine_collect", "craft", "craft", "craft", "craft"]
         assert store.get_task(task_id).status == "done"
-        assert any(event["kind"] == "step_recovered" for event in store.events(task_id))
+        assert any(event["kind"] == "goal_recovery_started" for event in store.events(task_id))
 
     asyncio.run(scenario())
 

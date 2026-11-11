@@ -483,6 +483,7 @@ async function syncInventory(ctx) {
   try {
     await ctx.syncInventory();
   } catch (error) {
+    if (error?.code === 'UNKNOWN_WINDOW_STATE') throw error;
     if (typeof ctx.log === 'function') ctx.log('同步背包失败', error.message);
   }
 }
@@ -531,13 +532,13 @@ function describeReadPath(ctx, window) {
 // 让服务端把整个窗口重发一遍：本地模型这时才是服务端认可的状态。
 async function resyncWindow(ctx, window) {
   const bot = ctx.bot;
-  if (!bot || typeof bot._syncWindow !== 'function' || !window) return false;
-  try {
-    await Promise.race([bot._syncWindow(window).catch(() => {}), sleepCtx(ctx, RESYNC_TIMEOUT_MS)]);
-    return true;
-  } catch {
-    return false;
+  if (!bot || !window || typeof ctx.syncWindow !== 'function') {
+    const error = new Error('窗口同步接口不可用，容器状态未知');
+    error.code = 'UNKNOWN_WINDOW_STATE';
+    throw error;
   }
+  await ctx.syncWindow(window, RESYNC_TIMEOUT_MS);
+  return true;
 }
 
 // 点容器格子。优先 ctx.clickWindowSlot，没有就退回 mineflayer 的 bot.clickWindow。

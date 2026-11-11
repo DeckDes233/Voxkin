@@ -223,6 +223,7 @@ async def test_result_after_bridge_timeout_still_lands():
     with pytest.raises(ActionError) as error:
         await task
     assert error.value.status == "cancelled"
+    assert error.value.receipt_confirmed is True
 
 
 async def test_partial_result_is_not_a_failure():
@@ -455,7 +456,8 @@ async def test_cancel_sends_action_cancel_with_the_action_id():
 
     with pytest.raises(ActionError) as error:
         await task
-    assert error.value.status == "cancelled"
+    assert error.value.status == "unknown"
+    assert error.value.receipt_confirmed is False
 
 
 async def test_cancel_all_clears_scope_and_pending_actions():
@@ -480,7 +482,8 @@ async def test_cancel_all_clears_scope_and_pending_actions():
     for task in (first, second):
         with pytest.raises(ActionError) as error:
             await task
-        assert error.value.status == "cancelled"
+        assert error.value.status == "unknown"
+        assert error.value.receipt_confirmed is False
 
 
 async def test_bridge_cancelled_reply_is_cancelled_not_failed():
@@ -515,11 +518,48 @@ async def test_cancel_without_bridge_reports_false():
 
 async def test_progress_is_recorded_without_being_invented():
     """进度只记录桥接真报上来的，桥接没报就是没有。"""
-    dispatcher = ActionDispatcher()
-    dispatcher.on_progress(
-        ActionProgress(action_id="abc", phase="running", detail="已采集 2/5 泥土", progress=0.4)
+    dispatcher = ActionDispatcher(require_protocol=True)
+    sent: list[dict] = []
+
+    async def sender(message: dict) -> None:
+        sent.append(message)
+
+    dispatcher.attach(sender)
+    dispatcher.update_state({"session_id": "world-a", "revision": 5, "ready": True})
+    task = asyncio.create_task(
+        dispatcher.dispatch_result("collect_blocks", {"block": "dirt", "count": 5})
     )
-    snapshot = dispatcher.progress_snapshot("abc")
+    await asyncio.sleep(0.01)
+    action_id = sent[0]["action_id"]
+    assert dispatcher.on_progress(
+        ActionProgress.from_message(
+            {
+                "type": "action_progress",
+                "action_id": action_id,
+                "phase": "running",
+                "detail": "已采集 2/5 泥土",
+                "progress": 0.4,
+                "session_id": "world-a",
+                "state_revision": 6,
+                "executor_epoch": 2,
+                "data": {"item": "dirt", "collected": 2, "target": 5},
+            }
+        )
+    )
+    assert not dispatcher.on_progress(
+        ActionProgress(action_id=action_id, phase="running", session_id="old-world", state_revision=7, executor_epoch=2)
+    )
+    assert not dispatcher.on_progress(
+        ActionProgress(action_id="old-action", phase="running", session_id="world-a", state_revision=7, executor_epoch=2)
+    )
+    dispatcher.resolve(ActionResult(action_id=action_id, ok=True, status="succeeded"))
+    await task
+
+    snapshot = dispatcher.progress_snapshot(action_id)
     assert snapshot["detail"] == "已采集 2/5 泥土"
     assert snapshot["progress"] == 0.4
+    assert snapshot["session_id"] == "world-a"
+    assert snapshot["state_revision"] == 6
+    assert snapshot["executor_epoch"] == 2
+    assert snapshot["data"] == {"item": "dirt", "collected": 2, "target": 5}
     assert dispatcher.progress_snapshot("不存在的动作") == {}

@@ -750,14 +750,14 @@ export const skills = {
   // 落水脱困：确认脚下和身体是水，朝最近岸边游过去，上岸后回报。
   // skill_id 用 swim_escape，避开 survival.js 里的 swim_out。
   swim_escape: {
-    description: '落水脱困：确认脚下和身体是水，朝最近的岸边游过去并上岸。',
+    description: '落水自救：先恢复呼吸，再寻找并确认安全干地。',
     parameters: [
       {
         name: 'radius',
         type: 'number',
         required: false,
         default: 12,
-        description: '找岸边的半径。',
+        description: '局部出口搜索半径，最多搜索 8 格。',
       },
       {
         name: 'timeout_s',
@@ -768,60 +768,12 @@ export const skills = {
       },
     ],
     handler: async (args, ctx) => {
-      const bot = botOf(ctx);
-      const radius = clampNumber(args.radius, 12, 4, 32);
+      if (typeof ctx.swimToShore !== 'function') throw new Error('水中自救不可用');
       const timeoutMs = clampNumber(args.timeout_s, 25, 5, 120) * 1000;
-
-      if (!detectWater(ctx)) {
-        return { detail: '脚下和身体都不是水，现在不需要脱困', status: 'succeeded' };
+      if (!await ctx.swimToShore('主动水中自救', timeoutMs, clampNumber(args.radius, 12, 3, 32))) {
+        throw new Error('水中自救超时，未确认抵达安全岸边');
       }
-
-      let shore = null;
-      if (typeof ctx.findShore === 'function') {
-        shore = ctx.findShore(radius) || ctx.findShore(Math.min(radius * 2, 32));
-      }
-      if (!shore) {
-        throw new Error('附近没有找到能上岸的岸边，水里脱困失败');
-      }
-      const shorePosition = shore.position;
-      log(ctx, '往岸边游', `${shorePosition.x}, ${shorePosition.y}, ${shorePosition.z}`);
-
-      const start = bot.entity.position.clone();
-      const deadline = Date.now() + timeoutMs;
-      let landed = false;
-      while (Date.now() < deadline) {
-        if (!detectWater(ctx)) {
-          landed = true;
-          break;
-        }
-        await swimStep(ctx, shorePosition);
-      }
-      if (!landed && !detectWater(ctx)) landed = true;
-
-      // 上岸后清掉游泳时按下的控制键。
-      if (typeof bot.getControlState === 'function' && bot.getControlState('jump')) {
-        bot.setControlState('jump', false);
-      }
-      if (typeof bot.getControlState === 'function' && bot.getControlState('forward')) {
-        bot.setControlState('forward', false);
-      }
-
-      const position = bot.entity.position;
-      if (!landed) {
-        throw new Error(
-          `没有游到岸边（目标 ${shorePosition.x}, ${shorePosition.y}, ${shorePosition.z}），还在水里`
-        );
-      }
-      const distance = Math.hypot(position.x - start.x, position.z - start.z);
-      const ground = blockAt(ctx, Math.floor(position.x), Math.floor(position.y) - 1, Math.floor(position.z));
-      const onLand = classifyFooting(ground) === 'solid';
-      return {
-        detail:
-          `已游上岸，位置 (${position.x.toFixed(1)}, ${position.y.toFixed(1)}, ${position.z.toFixed(1)})，` +
-          `游了 ${distance.toFixed(1)} 格，岸边在 (${shorePosition.x}, ${shorePosition.y}, ${shorePosition.z})` +
-          `${onLand ? '' : '，脚下还不是实地'}`,
-        status: 'succeeded',
-      };
+      return { detail: '已确认抵达安全岸边', status: 'succeeded' };
     },
   },
 

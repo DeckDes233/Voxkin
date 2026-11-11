@@ -167,8 +167,8 @@ def test_world_actions_are_recognized_by_manifest_type():
     assert is_world_action("不存在的技能") is True
 
 
-async def test_world_actions_do_not_run_in_parallel():
-    """两个会改世界的动作不同时跑；只读动作不受影响。"""
+async def test_core_forwards_actions_to_bridge_without_a_second_execution_queue():
+    """Core 不再维护第二条执行队列，Bridge 接收动作并独占排序。"""
     dispatcher = FakeDispatcher()
     arbiter = ActionArbiter(dispatcher)
 
@@ -181,28 +181,19 @@ async def test_world_actions_do_not_run_in_parallel():
     second = asyncio.create_task(
         arbiter.submit(ActionTicket(tool="collect_blocks", arguments={"block": "oak_log"}))
     )
-    await asyncio.sleep(0.05)
-    # 第二个采集还在排队，没有发出去。
-    assert len(dispatcher.sent) == 1
+    await wait_for_sent(dispatcher, 2)
 
     observe = asyncio.create_task(arbiter.submit(ActionTicket(tool="observe")))
-    await wait_for_sent(dispatcher, 2)
-    assert len(dispatcher.sent) == 2
-    assert dispatcher.sent[1]["tool"] == "observe"
-    dispatcher.finish(dispatcher.sent[1]["action_id"])
-    assert (await observe).status == "succeeded"
-
-    dispatcher.finish(dispatcher.sent[0]["action_id"])
-    await first
     await wait_for_sent(dispatcher, 3)
     assert len(dispatcher.sent) == 3
-    assert dispatcher.sent[2]["tool"] == "collect_blocks"
-    dispatcher.finish(dispatcher.sent[2]["action_id"])
-    await second
+    assert [item["tool"] for item in dispatcher.sent] == ["collect_blocks", "collect_blocks", "observe"]
+    for item in dispatcher.sent:
+        dispatcher.finish(item["action_id"])
+    assert all(result.status == "succeeded" for result in await asyncio.gather(first, second, observe))
 
 
-async def test_stop_preempts_a_running_collect():
-    """停止比任务步骤优先级高，正在跑的采集要让位。"""
+async def test_stop_action_is_forwarded_without_core_claiming_a_preemption():
+    """Core 不声称停止成功或自行抢占，动作交给 Bridge 执行器处理。"""
     dispatcher = FakeDispatcher()
     arbiter = ActionArbiter(dispatcher)
 
@@ -214,18 +205,16 @@ async def test_stop_preempts_a_running_collect():
 
     stop = asyncio.create_task(arbiter.submit(ActionTicket(tool="stop")))
     await wait_for_sent(dispatcher, 2)
-    assert action_id in dispatcher.cancelled
-    with pytest.raises(ActionError) as error:
-        await collect
-    assert error.value.status == "cancelled"
-
+    assert action_id not in dispatcher.cancelled
     assert dispatcher.sent[-1]["tool"] == "stop"
+    dispatcher.finish(action_id)
     dispatcher.finish(dispatcher.sent[-1]["action_id"])
+    assert (await collect).status == "succeeded"
     assert (await stop).status == "succeeded"
 
 
-async def test_stop_preempts_even_a_non_cancellable_action():
-    """安全与停止可以抢占任何动作，否则玩家喊停也停不下来。"""
+async def test_bridge_owns_stop_handoff_for_non_cancellable_actions():
+    """Core 不在第二层模拟取消；Bridge 负责停止交接与 terminal 回执。"""
     dispatcher = FakeDispatcher()
     arbiter = ActionArbiter(dispatcher)
 
@@ -237,15 +226,15 @@ async def test_stop_preempts_even_a_non_cancellable_action():
 
     stop = asyncio.create_task(arbiter.submit(ActionTicket(tool="stop")))
     await wait_for_sent(dispatcher, 2)
-    assert action_id in dispatcher.cancelled
-    with pytest.raises(ActionError):
-        await place
+    assert action_id not in dispatcher.cancelled
+    dispatcher.finish(action_id)
     dispatcher.finish(dispatcher.sent[-1]["action_id"])
+    assert (await place).status == "succeeded"
     await stop
 
 
-async def test_equal_priority_does_not_preempt():
-    """同优先级的动作不互相抢占，只按先来先到排队。"""
+async def test_equal_priority_actions_are_both_associated_with_bridge():
+    """优先级策略和实际排队均由 Bridge 执行器判定。"""
     dispatcher = FakeDispatcher()
     arbiter = ActionArbiter(dispatcher)
 
@@ -256,17 +245,17 @@ async def test_equal_priority_does_not_preempt():
     second = asyncio.create_task(
         arbiter.submit(ActionTicket(tool="place_block", arguments={"block": "cobblestone"}))
     )
-    await asyncio.sleep(0.01)
+    await wait_for_sent(dispatcher, 2)
     assert dispatcher.cancelled == []
+    assert len(dispatcher.sent) == 2
     dispatcher.finish(dispatcher.sent[0]["action_id"])
     await first
-    await wait_for_sent(dispatcher, 2)
     dispatcher.finish(dispatcher.sent[-1]["action_id"])
     await second
 
 
-async def test_cancel_all_stops_running_and_queued():
-    """停止会清空在途与排队的动作，并让取消纪元加一。"""
+async def test_cancel_all_requests_bridge_to_stop_every_tracked_action():
+    """停止请求由 Bridge 交接；Core 只统计关联中的 action_id。"""
     dispatcher = FakeDispatcher()
     arbiter = ActionArbiter(dispatcher)
 
@@ -277,11 +266,11 @@ async def test_cancel_all_stops_running_and_queued():
     queued = asyncio.create_task(
         arbiter.submit(ActionTicket(tool="collect_blocks", arguments={"block": "oak_log"}))
     )
-    await asyncio.sleep(0.05)
+    await wait_for_sent(dispatcher, 2)
 
     epoch_before = arbiter.epoch
     ids = await arbiter.cancel_all("玩家要求停止")
-    assert epoch_before + 1 == arbiter.epoch
+    assert epoch_before == arbiter.epoch
     assert len(ids) == 2
     with pytest.raises(ActionError) as error:
         await running
@@ -308,6 +297,48 @@ async def test_wait_cancelled_separates_receipt_from_timeout():
     assert await arbiter.wait_cancelled([action_id], timeout_s=0.5) is True
 
 
+@pytest.mark.asyncio
+async def test_unknown_result_does_not_confirm_stop_receipt():
+    """Core 等待结束或收到 unknown 都不代表 Bridge 确认动作已停。"""
+    from voxkin.agent.actions import ActionDispatcher
+
+    dispatcher = ActionDispatcher()
+    sent: list[dict] = []
+
+    async def sender(message: dict) -> None:
+        sent.append(message)
+
+    dispatcher.attach(sender)
+    dispatcher.update_state(
+        {
+            "session_id": "world",
+            "revision": 1,
+            "ready": True,
+            "alive": True,
+            "health": 20,
+            "position": {"x": 0, "y": 64, "z": 0},
+            "executor": {"safety_active": False, "epoch": 1},
+        }
+    )
+    arbiter = ActionArbiter(dispatcher)
+    running = asyncio.create_task(
+        arbiter.submit(ActionTicket(tool="collect_blocks", arguments={"block": "dirt"}))
+    )
+    for _ in range(100):
+        if sent:
+            break
+        await asyncio.sleep(0.01)
+    assert sent
+    action_id = sent[0]["action_id"]
+    dispatcher.resolve(
+        ActionResult(action_id, False, "结果未知", status="unknown")
+    )
+    with pytest.raises(ActionError) as error:
+        await running
+    assert error.value.status == "unknown"
+    assert await arbiter.wait_cancelled([action_id], timeout_s=0.05) is False
+
+
 async def test_ticket_priority_is_sent_to_the_bridge():
     """优先级要跟着动作一起发给桥接，桥接才知道谁先跑。"""
     dispatcher = FakeDispatcher()
@@ -322,7 +353,7 @@ async def test_ticket_priority_is_sent_to_the_bridge():
     await task
 
 
-async def test_status_reports_current_and_waiting():
+async def test_status_reports_bridge_executor_and_associated_tickets():
     dispatcher = FakeDispatcher()
     arbiter = ActionArbiter(dispatcher)
 
@@ -330,18 +361,20 @@ async def test_status_reports_current_and_waiting():
         arbiter.submit(ActionTicket(tool="collect_blocks", arguments={"block": "dirt"}))
     )
     await wait_for_sent(dispatcher, 1)
+    assert dispatcher.sent
     waiting = asyncio.create_task(
         arbiter.submit(ActionTicket(tool="collect_blocks", arguments={"block": "oak_log"}))
     )
-    await asyncio.sleep(0.05)
+    await wait_for_sent(dispatcher, 2)
 
     status = arbiter.status()
-    assert status["current"]["tool"] == "collect_blocks"
-    assert len(status["waiting"]) == 1
+    assert status["current"] is None
+    assert status["waiting"] == []
+    assert status["tracked"] == 2
+    assert len(status["actions"]) == 2
     assert status["epoch"] == 0
 
     dispatcher.finish(dispatcher.sent[0]["action_id"])
     await running
-    await wait_for_sent(dispatcher, 2)
     dispatcher.finish(dispatcher.sent[-1]["action_id"])
     await waiting

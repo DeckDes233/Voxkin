@@ -227,6 +227,7 @@ async def test_stop_cancels_the_running_action(llm_port, tmp_path):
     """停止类指令要停掉正在跑的动作，只停语音不算数。"""
     config = make_config(llm_port)
     controller = FakeController()
+    stop_calls: list[str] = []
     pipeline = ConversationPipeline(
         config,
         OpenAICompatLLM(config.llm),
@@ -235,6 +236,7 @@ async def test_stop_cancels_the_running_action(llm_port, tmp_path):
         MetricsStore(),
     )
     pipeline.set_action_controller(controller)
+    pipeline.set_stop_handler(lambda: stop_calls.append("persisted"))
     await pipeline.start()
     try:
         await pipeline.respond("停下")
@@ -245,6 +247,7 @@ async def test_stop_cancels_the_running_action(llm_port, tmp_path):
 
     assert controller.cancels == ["玩家要求停止"]
     assert controller.tickets[0].tool == "stop"
+    assert stop_calls == ["persisted"]
 
 
 async def test_speech_interrupt_does_not_cancel_the_action(llm_port, tmp_path):

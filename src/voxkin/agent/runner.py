@@ -6,12 +6,27 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from voxkin.agent.runlog import RunLogger
+from voxkin.agent.action_effects import action_effect_class
 from voxkin.agent.tasks import TaskStore
 from voxkin.bridge.protocol import ActionResult
 
 Executor = Callable[..., Awaitable[Any]]
 StateProvider = Callable[[], dict[str, Any]]
 Announce = Callable[[str], Awaitable[None]]
+
+_VANILLA_DIMENSIONS = {
+    "overworld": "minecraft:overworld",
+    "minecraft:overworld": "minecraft:overworld",
+    "the_nether": "minecraft:the_nether",
+    "minecraft:the_nether": "minecraft:the_nether",
+    "the_end": "minecraft:the_end",
+    "minecraft:the_end": "minecraft:the_end",
+}
+
+
+def _dimension_id(value: Any) -> str:
+    dimension = str(value or "").strip().lower()
+    return _VANILLA_DIMENSIONS.get(dimension, dimension)
 
 
 @dataclass(frozen=True)
@@ -22,6 +37,7 @@ class StepSpec:
     verify: dict[str, Any]
     retries: int = 1
     timeout_s: float = 60.0
+    effect_class: str = "reconcile"
 
 
 class Verifier:
@@ -62,6 +78,15 @@ class Verifier:
                 if self._inventory_count(inventory, item) < count
             }
             return (not missing, "背包满足" if not missing else f"缺少 {missing}")
+        if kind == "inventory_any":
+            inventory = state.get("inventory") or {}
+            items = rule.get("items") or {}
+            available = sum(self._inventory_count(inventory, item) for item in items)
+            required = int(rule.get("count", 1))
+            return (
+                available >= required,
+                "背包满足" if available >= required else f"可用物品共 {available} 个，还差 {required - available} 个",
+            )
         if kind == "position":
             position = state.get("position") or {}
             target = rule.get("target") or {}
@@ -75,9 +100,11 @@ class Verifier:
             ) ** 0.5
             return (distance <= radius, f"距离 {distance:.1f} 格")
         if kind == "dimension":
+            actual = state.get("dimension")
+            expected = rule.get("value")
             return (
-                state.get("dimension") == rule.get("value"),
-                f"维度 {state.get('dimension')}",
+                _dimension_id(actual) == _dimension_id(expected),
+                f"维度 {actual}",
             )
         if kind == "health":
             health = float(state.get("health", 0))
@@ -280,7 +307,9 @@ class TaskRunner:
             skill_id = step.tool
             action_id = ""
             result_data: dict[str, Any] = {}
-            for attempt in range(step.retries + 1):
+            preemptions = 0
+            attempt = 0
+            while attempt <= step.retries:
                 result_data = {}
                 try:
                     outcome = await asyncio.wait_for(
@@ -359,11 +388,36 @@ class TaskRunner:
                             "action_id": action_id,
                         },
                     )
+                if status == "preempted":
+                    preemptions += 1
+                    refreshed, safe = await self._wait_after_preemption()
+                    verified, verify_reason = self._verifier.check(step.verify, refreshed)
+                    if safe and step.verify.get("type") != "always" and verified:
+                        ok = True
+                        detail = f"安全动作后状态验收通过：{verify_reason}"
+                        reason = "preempted_step_verified"
+                        status = "succeeded"
+                    elif (
+                        safe
+                        and step.verify.get("type") != "always"
+                        and action_effect_class(step.tool, step.effect_class) == "replan"
+                        and preemptions <= 3
+                    ):
+                        self._store.log_event(
+                            task.id,
+                            "step_preempted_retry",
+                            {"index": index, "reason": reason, "verify": verify_reason},
+                        )
+                        continue
+                    else:
+                        detail = "抢占后未取得安全结束与新观察，步骤已暂停"
+                        status = "blocked"
                 if ok:
                     status = "succeeded"
                     break
-                if status in ("cancelled", "disconnected", "dead"):
+                if status in ("cancelled", "disconnected", "dead", "preempted", "unknown"):
                     break
+                attempt += 1
                 await asyncio.sleep(0.2)
             if not ok:
                 self.cursor = index
@@ -383,6 +437,16 @@ class TaskRunner:
                     )
                     return RunResult(
                         False, task.id, index, "步骤已取消", done, total, status="cancelled"
+                    )
+                if status in ("disconnected", "dead", "unknown"):
+                    self._store.set_status(task.id, status)
+                    self._store.log_event(
+                        task.id,
+                        f"step_{status}",
+                        {"index": index, "reason": reason, "status": status},
+                    )
+                    return RunResult(
+                        False, task.id, index, detail or reason, done, total, status=status
                     )
                 self._store.set_status(
                     task.id, status if status in ("blocked", "dead") else "failed"
@@ -425,3 +489,36 @@ class TaskRunner:
         self._store.set_status(task.id, "done")
         await self._say("这一阶段完成了。")
         return RunResult(True, task.id, total, "阶段完成", done, total)
+
+    async def _wait_after_preemption(self) -> tuple[dict[str, Any], bool]:
+        before = self._state_provider()
+        before_session = str(before.get("session_id") or "")
+        try:
+            before_revision = int(before.get("revision"))
+        except (TypeError, ValueError):
+            before_revision = None
+        for _ in range(600):
+            if self._cancelled or self._interrupt_status in ("dead", "disconnected", "cancelled"):
+                return self._state_provider(), False
+            await asyncio.sleep(0.1)
+            state = self._state_provider()
+            executor = state.get("executor") or {}
+            try:
+                revision = int(state.get("revision"))
+            except (TypeError, ValueError):
+                revision = None
+            advanced = (
+                before_revision is None
+                or revision is None
+                or str(state.get("session_id") or "") != before_session
+                or revision > before_revision
+            )
+            safe = (
+                state.get("ready", True) is True
+                and not bool(executor.get("safety_active"))
+                and state.get("alive", True) is True
+                and advanced
+            )
+            if safe:
+                return state, True
+        return self._state_provider(), False
