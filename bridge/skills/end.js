@@ -1371,6 +1371,25 @@ async function reachEndIsland(ctx, deadline) {
   }
 }
 
+// 天然返回门紧邻 (0, 0) 的基岩柱。只读这四列，未加载时保留未知状态。
+function centralPortalState(bot) {
+  const origin = bot.entity.position;
+  const bottom = bot.game.minY ?? 0;
+  const top = bottom + (bot.game.height ?? 256);
+  let fullyLoaded = true;
+  for (const [x, z] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    for (let y = bottom; y < top; y++) {
+      const block = bot.blockAt(origin.offset(x - origin.x, y - origin.y, z - origin.z), false);
+      if (!block) {
+        fullyLoaded = false;
+        break;
+      }
+      if (block.name === PORTAL_BLOCK) return true;
+    }
+  }
+  return fullyLoaded ? false : null;
+}
+
 async function fightDragon(args, ctx) {
   throwIfInterrupted(ctx, '末地战斗');
   const bot = botOf(ctx);
@@ -1387,7 +1406,7 @@ async function fightDragon(args, ctx) {
   const onIsland = bot.entity.position.floored && bot.blockAt?.(bot.entity.position.floored().offset(0, -1, 0))?.name === 'end_stone';
   const canEngage = onIsland && findEntity(ctx, DRAGON_ENTITY, radius) && findEntity(ctx, CRYSTAL_ENTITY, radius);
   if (!canEngage) await reachEndIsland(ctx, deadline);
-  const returnPortalPresentAtStart = findBlockPositions(ctx, PORTAL_BLOCK, 128, 8).length > 0;
+  const returnPortalPresentAtStart = centralPortalState(bot);
 
   let dragon = findEntity(ctx, DRAGON_ENTITY, radius);
   if (!dragon && returnPortalPresentAtStart) {
@@ -1406,7 +1425,7 @@ async function fightDragon(args, ctx) {
     }
   }
   if (!dragon) {
-    if (findBlockPositions(ctx, PORTAL_BLOCK, radius, 4).length > 0) {
+    if (centralPortalState(bot)) {
       return {
         detail: '观察到中央返回传送门，但本次战斗没有观察到末影龙；不报告击杀事件',
         status: 'partial',
@@ -1433,8 +1452,8 @@ async function fightDragon(args, ctx) {
     if (!isEndDimension(currentDimension(ctx))) throw new Error('战斗期间离开末地，需要重新观察战场');
     dragon = findEntity(ctx, DRAGON_ENTITY, radius);
     if (!dragon) {
-      const returnPortalPresentNow = findBlockPositions(ctx, PORTAL_BLOCK, 128, 8).length > 0;
-      if (returnPortalPresentNow && !returnPortalPresentAtStart) {
+      const returnPortalPresentNow = centralPortalState(bot);
+      if (returnPortalPresentNow && returnPortalPresentAtStart === false) {
         return {
           detail:
             `确认中央返回传送门在本次战斗期间出现，末影龙已不在附近；打碎 ${crystalResult.broken} 个末地水晶` +

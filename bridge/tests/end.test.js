@@ -74,12 +74,12 @@ function makeStrongholdSearch({
 }
 
 function makeContext({ dimension = 'minecraft:the_end', dragon = true, portal = false } = {}) {
-  const botPosition = makePosition();
+  const botPosition = makeBlockPosition(0, 64, 0);
   const dragonEntity = dragon
     ? { id: 1, name: 'ender_dragon', position: makePosition(0, 64, 0), health: 200 }
     : null;
   const blocks = portal
-    ? [{ name: 'end_portal', position: makePosition(0, 63, 0) }]
+    ? [{ name: 'end_portal', position: makePosition(1, 63, 0) }]
     : [];
   const bot = {
     game: { dimension },
@@ -87,6 +87,9 @@ function makeContext({ dimension = 'minecraft:the_end', dragon = true, portal = 
     entities: dragonEntity ? { [dragonEntity.id]: dragonEntity } : {},
     inventory: { items: () => [] },
     health: 20,
+    blockAt(p) {
+      return blocks.find(b => b.position.distanceTo(p) < 0.01) || { name: 'air' };
+    },
     findBlocks({ matching }) {
       return blocks.filter(matching).map((block) => block.position);
     },
@@ -410,7 +413,7 @@ test('fight_dragon accepts dragon absence when the return portal appears during 
   const { blocks, ctx } = makeContext({ portal: false });
   ctx.attackEntity = async () => {
     delete ctx.bot.entities[1];
-    blocks.push({ name: 'end_portal', position: makePosition(0, 63, 0) });
+    blocks.push({ name: 'end_portal', position: makePosition(1, 63, 0) });
   };
 
   const result = await skills.fight_dragon.handler({ timeout_s: 30 }, ctx);
@@ -420,6 +423,20 @@ test('fight_dragon accepts dragon absence when the return portal appears during 
   assert.deepEqual(result.data, {
     events: ['ender_dragon_killed'],
     evidence: 'return_portal_appeared_dragon_absent',
+  });
+});
+
+test('an unloaded central column cannot establish that the return portal was absent', async () => {
+  const { ctx } = makeContext();
+  let visible = false;
+  ctx.bot.blockAt = () => visible ? { name: 'end_portal' } : null;
+  ctx.attackEntity = async () => {
+    delete ctx.bot.entities[1];
+    visible = true;
+  };
+  await withFakeClock(async ({ sleep }) => {
+    ctx.sleep = sleep;
+    await assert.rejects(skills.fight_dragon.handler({ timeout_s: 30 }, ctx), /还差 200 点血/);
   });
 });
 
@@ -497,7 +514,7 @@ test('fight_dragon delegates crystal clearing to the registered safe skill', asy
   };
   ctx.attackEntity = async () => {
     delete ctx.bot.entities[1];
-    blocks.push({ name: 'end_portal', position: makePosition(0, 63, 0) });
+    blocks.push({ name: 'end_portal', position: makePosition(1, 63, 0) });
   };
 
   const result = await skills.fight_dragon.handler({ timeout_s: 30 }, ctx);
