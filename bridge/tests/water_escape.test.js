@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Vec3 } from 'vec3';
+import { leaveMagmaBlock, netherRouteExclusion } from '../dry_footing.js';
 import { escapeWater, reachShore, waterLike, breathable, avoidWaterScaffolding, allowedDuringWaterEscape } from '../water_escape.js';
 
 const block = (name, box = 'empty', props = {}) => ({ name, boundingBox: box, getProperties: () => props });
@@ -142,4 +143,45 @@ test('执行器抢占原动作并完成共享低氧自救', async () => {
 test('低氧未恢复时只允许观察、停止和自救动作', () => {
   for (const tool of ['stop','chat','inventory','observe','locate_block','locate_entity','swim_escape','swim_out']) assert.equal(allowedDuringWaterEscape(tool),true,tool);
   for (const tool of ['safe_travel','leave_shelter','sleep_safe','mine_collect','goto']) assert.equal(allowedDuringWaterEscape(tool),false,tool);
+});
+test('下界绕开岩浆池相邻的岩浆块边沿', () => {
+  const position = new Vec3(19,91,18);
+  const bot = { game: { dimension: 'the_nether' }, blockAt: p => p.x === 19 && p.y === 90 ? block('magma_block','block') : air };
+  assert.ok(netherRouteExclusion(bot, {position}) > 100);
+  assert.ok(netherRouteExclusion(bot, {position: position.offset(1,0,0)}) > 100);
+  assert.equal(netherRouteExclusion(bot, {position: position.offset(2,0,0)}),0);
+});
+
+test('踩上岩浆块后潜行撤到实心干地再解除控制', async () => {
+  const controls = {};
+  const bot = {
+    entity: { position: new Vec3(0.5, 92, 0.5), onGround: true },
+    blockAt: p => p.y >= 92 ? air : block(p.x === 0 ? 'magma_block' : 'basalt', 'block'),
+    setControlState: (key, value) => { controls[key] = value; },
+    async lookAt() {},
+  };
+  const landed = await leaveMagmaBlock(bot, {}, async () => {
+    assert.ok(controls.sneak && controls.forward);
+    bot.entity.position.x += 0.6;
+  });
+  assert.ok(landed);
+  assert.equal(controls.sneak, false);
+  assert.equal(controls.forward, false);
+});
+
+test('气穴旁没有天然岸边时在完整岩壁开一级台阶', async () => {
+  const dug = [];
+  const f = fixture((x,y,z) => {
+    if (x === 21 && z === 63) return y >= 57 ? air : water;
+    if (dug.includes(`${x},${y},${z}`)) return air;
+    return {...block('stone','block'), position:new Vec3(x,y,z)};
+  }, (bot, controls) => {
+    if (controls.forward && dug.length === 2) bot.entity.position = new Vec3(22.5,57,63.5);
+  });
+  Object.assign(f.bot, {
+    oxygenLevel: 20, pathfinder: {bestHarvestTool: () => null}, canDigBlock: () => true, digTime: () => 250,
+    async dig(b) { dug.push([b.position.x,b.position.y,b.position.z].join(',')); },
+  });
+  assert.equal(await reachShore(f.bot, f.options), true);
+  assert.deepEqual(dug, ['22,58,63','22,57,63']);
 });

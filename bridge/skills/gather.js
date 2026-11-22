@@ -9,7 +9,7 @@
 //   如果 ctx 没有 craftItem，就只能在返回里说明缺什么。
 
 import { findBlocksWithExploration, resourceCandidates } from '../resource_search.js';
-import { dryMiningFooting, miningRouteExclusion } from './exploration.js';
+import { dryMiningFooting, miningRouteExclusion } from '../dry_footing.js';
 import { scanSurfaceLogs } from '../surface_wood_scan.js';
 import { setImmediate as yieldToGame } from 'node:timers/promises';
 
@@ -368,7 +368,7 @@ function fluidSearchState() {
 
 async function searchFluidSources(ctx, name, range, state = fluidSearchState()) {
   return findBlocksWithExploration(ctx, null, range, 64, (excludedCount) =>
-    findFluidSources(ctx, name, range, 64 + excludedCount).filter((position) =>
+    findFluidSources(ctx, name, range, Math.min(256, 64 + excludedCount)).filter((position) =>
       !state.excluded.has(`${position.x},${position.y},${position.z}`),
     ),
     state,
@@ -394,16 +394,46 @@ async function useBucketOn(ctx, bucketName, block, face = null) {
   const bot = ctx.bot;
   const bucket = findInventoryItem(ctx, bucketName);
   if (!bucket) throw new Error(`背包里没有${bucketName === 'bucket' ? '空桶' : '水桶'}`);
-  if (typeof bot.activateBlock !== 'function') throw new Error('桥接没有提供对准方块使用桶的接口');
   await bot.equip(bucket, 'hand');
   checkInterrupted(ctx);
-  await bot.activateBlock(block, face || undefined);
+  if (typeof bot.activateItem === 'function' && typeof bot.lookAt === 'function') {
+    // Java 桶使用物品的射线拾取液体源，视线落在指定方块或倾倒面上。
+    const hit = block.position.offset(0.5 + (face?.x || 0) * 0.5, 0.5 + (face?.y || 0) * 0.5, 0.5 + (face?.z || 0) * 0.5);
+    await bot.lookAt(hit, true);
+    checkInterrupted(ctx);
+    bot.activateItem();
+  } else {
+    await bot.activateBlock(block, face || undefined);
+  }
   await ctx.sleep(250);
   if (typeof ctx.syncInventory === 'function') await ctx.syncInventory();
 }
 
-async function moveNearBlock(ctx, position, action) {
+async function moveNearBlock(ctx, position, action, needsSight = false) {
   const bot = ctx.bot;
+  if (bot.pathfinder?.movements && typeof ctx.walkOnce === 'function') {
+    const origin = bot.entity.position;
+    const usable = () => dryMiningFooting(bot, bot.entity.position) && distanceBetween(bot.entity.position, position) <= MINE_REACH &&
+      (!needsSight || !bot.canSeeBlock || bot.canSeeBlock(blockAtPos(bot, position)));
+    if (usable()) return;
+    const banks = [];
+    for (const dir of CARDINAL_HEADINGS) {
+      for (const dy of [0, 1, -1]) {
+        for (const offset of [1, 2]) {
+          const feet = position.offset(dir.x * offset, dy, dir.z * offset);
+          if (dryMiningFooting(bot, feet)) banks.push(feet);
+        }
+      }
+    }
+    banks.sort((a, b) => a.distanceTo(origin) - b.distanceTo(origin));
+    for (const feet of banks.slice(0, needsSight ? 5 : 2)) {
+      const outcome = await ctx.walkOnce(feet.x, feet.y, feet.z, 0, 12000);
+      checkInterrupted(ctx);
+      if (outcome === 'cancelled') throw new Error(`${action}被取消`);
+      if (usable()) return;
+    }
+    throw new Error(`没有可安全接触${action}的干燥岸边`);
+  }
   if (distanceBetween(bot.entity.position, position) <= MINE_REACH) return;
   if (typeof ctx.travelToBlock !== 'function') throw new Error(`没有靠近${action}的寻路能力`);
   const outcome = await ctx.travelToBlock(position, 30000);
@@ -416,6 +446,36 @@ async function moveNearBlock(ctx, position, action) {
 }
 
 async function fillWaterBucket(args, ctx) {
+  return withDryMiningMovement(ctx, () => fillWaterFromBank(args, ctx));
+}
+
+async function nearbyShoreSources(ctx, range) {
+  const { bot } = ctx;
+  if (!bot.pathfinder?.movements) return [];
+  const origin = bot.entity.position.floored();
+  const found = [];
+  // 最近的几百格水可能全在脚下的含水层。按水平环带找同高度的水面，每批让出事件循环。
+  const heights = [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6, -7, -8];
+  for (let radius = 1; radius <= range; radius += 2) {
+    checkInterrupted(ctx);
+    for (let d = -radius; d <= radius; d += 2) {
+      for (const [dx, dz] of [[d, radius], [d, -radius], [radius, d], [-radius, d]]) {
+        for (const dy of heights) {
+          const pos = origin.offset(dx, dy, dz);
+          const water = blockAtPos(bot, pos);
+          if (water?.name !== 'water' || !isSourceFluid(water) || !isAirBlock(blockAtPos(bot, pos.offset(0, 1, 0)))) continue;
+          if (CARDINAL_HEADINGS.some(({ x, z }) => [0, 1, -1].some(h => dryMiningFooting(bot, pos.offset(x, h, z))))) found.push(pos);
+          break;
+        }
+      }
+      if ((d + radius) % 16 === 0) await yieldToGame();
+    }
+    if (found.length >= 4) break;
+  }
+  return found;
+}
+
+async function fillWaterFromBank(args, ctx) {
   requireConnected(ctx);
   if (ctx.countItem('water_bucket') > 0) {
     return { detail: `背包已有水桶 ${ctx.countItem('water_bucket')} 个`, status: 'succeeded' };
@@ -424,17 +484,21 @@ async function fillWaterBucket(args, ctx) {
   const range = clampInt(args.range, 32, 4, 64);
   const searchState = fluidSearchState();
   const failures = [];
+  let shores = await nearbyShoreSources(ctx, range);
   while (true) {
-    const sources = await searchFluidSources(ctx, 'water', range, searchState);
+    const sources = shores.length ? shores : await searchFluidSources(ctx, 'water', range, searchState);
+    shores = [];
     if (!sources.length) break;
-    for (const position of sources) {
+    for (const [index, position] of sources.entries()) {
       const key = `${position.x},${position.y},${position.z}`;
       if (searchState.excluded.has(key)) continue;
       searchState.excluded.add(key);
+      if (index % 8 === 7) await ctx.sleep(1);
       requireConnected(ctx);
       checkHealth(ctx);
+      if (ctx.bot.pathfinder?.movements && !isAirBlock(blockAtPos(ctx.bot, position.offset(0, 1, 0)))) continue;
       try {
-        await moveNearBlock(ctx, position, '取水');
+        await moveNearBlock(ctx, position, '取水', true);
         const block = blockAtPos(ctx.bot, position);
         if (block?.name !== 'water' || !isSourceFluid(block)) {
           failures.push(`${formatPosition(position)} 已不是静止水源`);
@@ -454,7 +518,31 @@ async function fillWaterBucket(args, ctx) {
     }
   }
   if (!failures.length) throw new Error(`附近 ${range} 格内没有已加载的静止水源`);
-  throw new Error(`没有装到水：${failures.join('；')}`);
+  throw new Error(`没有装到水：${failures.slice(-4).join('；')}`);
+}
+
+function castingFace(bot, lava) {
+  const above = lava.offset(0, 1, 0);
+  if (!isAirBlock(blockAtPos(bot, above))) return null;
+  const supports = [[above.offset(0, 1, 0), above]];
+  for (const { x, z } of CARDINAL_HEADINGS) {
+    supports.push([above.offset(x, 0, z), above]);
+    supports.push([lava.offset(x, 0, z), above.offset(x, 0, z)]);
+  }
+  const feet = bot.entity.position.floored();
+  const eye = bot.entity.position.offset(0, 1.62, 0);
+  for (const [position, water] of supports) {
+    const block = blockAtPos(bot, position);
+    if (block?.boundingBox !== 'block' || !isAirBlock(blockAtPos(bot, water)) || water.equals(feet)) continue;
+    const face = water.minus(position);
+    const hit = position.offset(0.5 + face.x / 2, 0.5 + face.y / 2, 0.5 + face.z / 2);
+    const ray = hit.minus(eye);
+    const reach = ray.norm();
+    if (reach > MINE_REACH || ray.dot(face) >= 0) continue;
+    if (bot.world?.raycast && !bot.world.raycast(eye, ray.scaled(1 / reach), reach + 0.02)?.position.equals(position)) continue;
+    return { block, face, water };
+  }
+  return null;
 }
 
 async function castOneObsidian(ctx, range, visited, searchState) {
@@ -495,17 +583,13 @@ async function castOneObsidian(ctx, range, visited, searchState) {
       }
       const lava = blockAtPos(bot, position);
       if (lava?.name !== 'lava' || !isSourceFluid(lava)) continue;
-      const waterPosition = { x: position.x, y: position.y + 1, z: position.z };
-      const waterSpace = blockAtPos(bot, waterPosition);
-      const support = blockAtPos(bot, { x: position.x, y: position.y + 2, z: position.z });
-      if (!isAirBlock(waterSpace) || support?.boundingBox !== 'block') continue;
+      const placement = castingFace(bot, position);
+      if (!placement) continue;
+      const waterPosition = placement.water;
 
       const beforeWaterBuckets = ctx.countItem('water_bucket');
       const beforeBuckets = ctx.countItem('bucket');
-      const basePosition = bot.entity.position;
-      const vector = basePosition.constructor;
-      if (typeof vector !== 'function') throw new Error('无法构造水桶交互方向');
-      await useBucketOn(ctx, 'water_bucket', support, new vector(0, -1, 0));
+      await useBucketOn(ctx, 'water_bucket', placement.block, placement.face);
       const deadline = Date.now() + 2500;
       let obsidian = null;
       while (Date.now() < deadline) {
@@ -523,6 +607,15 @@ async function castOneObsidian(ctx, range, visited, searchState) {
       if (emptyBuckets <= beforeBuckets || ctx.countItem('water_bucket') >= beforeWaterBuckets) {
         throw new Error(`已生成黑曜石 ${formatPosition(position)}，但背包水桶状态未确认`);
       }
+      // 池边的第一格会先凝固。保留水源数次流动更新，让水覆盖邻近的岩浆。
+      for (let tick = 0; tick < 16; tick++) {
+        const molten = CARDINAL_HEADINGS.some(({ x, z }) => [1, 2].some(d =>
+          blockAtPos(bot, position.offset(x * d, 0, z * d))?.name === 'lava'));
+        if (!molten) break;
+        checkInterrupted(ctx);
+        checkHealth(ctx, LOW_HEALTH + 2);
+        await ctx.sleep(250);
+      }
 
       const beforeRecovered = ctx.countItem('water_bucket');
       const waterBlock = blockAtPos(bot, waterPosition);
@@ -535,6 +628,10 @@ async function castOneObsidian(ctx, range, visited, searchState) {
 }
 
 async function collectObsidian(args, ctx) {
+  return withDryMiningMovement(ctx, () => collectObsidianOnLand(args, ctx));
+}
+
+async function collectObsidianOnLand(args, ctx) {
   requireConnected(ctx);
   const bot = ctx.bot;
   const dimension = String(bot.game?.dimension || '').toLowerCase();
@@ -553,7 +650,7 @@ async function collectObsidian(args, ctx) {
   const visited = lavaSearchState.excluded;
   let existingMiningFailure = '';
   try {
-    return await mineCollect({ block: 'obsidian', count: want, range }, ctx);
+    return await mineCollect({ block: 'obsidian', count: want, range }, ctx, true);
   } catch (error) {
     existingMiningFailure = error.message;
     requireConnected(ctx);
@@ -562,7 +659,7 @@ async function collectObsidian(args, ctx) {
     }
   }
   if (ctx.countItem('water_bucket') < 1 && ctx.countItem('bucket') > 0) {
-    await fillWaterBucket({ range }, ctx);
+    await fillWaterFromBank({ range }, ctx);
   }
   if (ctx.countItem('water_bucket') < 1) throw new Error('需要一个空桶和附近的静水源才能浇铸黑曜石');
   while (ctx.countItem('obsidian') < want) {
@@ -577,7 +674,7 @@ async function collectObsidian(args, ctx) {
       );
     }
     try {
-      const result = await mineCollect({ block: 'obsidian', count: want, range }, ctx);
+      const result = await mineCollect({ block: 'obsidian', count: want, range }, ctx, true);
       return { detail: `${result.detail}；黑曜石由安全浇铸后采集`, status: 'succeeded' };
     } catch (error) {
       existingMiningFailure = error.message;
@@ -658,7 +755,24 @@ async function digAt(ctx, position, options = {}) {
     return { ok: false, reason: 'tool', block, message: '工具不对或者离得太远，挖不动' };
   }
   try {
-    await bot.dig(block);
+    if (block.name === 'obsidian' && typeof bot.digTime === 'function') {
+      const duration = bot.digTime(block);
+      if (!Number.isFinite(duration) || duration > 25000) return { ok: false, message: '当前站位不能稳定开采黑曜石' };
+      ctx.reportProgress?.('mining', `开采黑曜石 ${formatPosition(position)}`, 0, { target: position, dig_time_ms: duration });
+      let timer;
+      try {
+        await Promise.race([bot.dig(block, true, 'raycast'), new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            if (bot.targetDigBlock?.position.equals(block.position)) bot.stopDigging();
+            reject(new Error('黑曜石开采超时'));
+          }, duration + 4000);
+        })]);
+      } finally {
+        clearTimeout(timer);
+      }
+    } else {
+      await bot.dig(block);
+    }
   } catch (error) {
     checkInterrupted(ctx);
     return { ok: false, reason: 'dig', block, message: `挖不动：${error.message}` };
@@ -1128,8 +1242,12 @@ async function walkToSurfaceLog(target, ctx) {
 
 async function approachSurfaceLog(target, ctx) {
   ctx.reportProgress?.('searching', '前往地表原木', 0, { surface_trunk: { x: target.x, y: target.y, z: target.z } });
+  return withDryMiningMovement(ctx, () => walkToSurfaceLog(target, ctx));
+}
+
+async function withDryMiningMovement(ctx, action) {
   const movements = ctx.bot.pathfinder?.movements;
-  if (!movements) return walkToSurfaceLog(target, ctx);
+  if (!movements) return action();
   const previous = {
     exclusionAreasStep: movements.exclusionAreasStep,
     allow1by1towers: movements.allow1by1towers,
@@ -1142,14 +1260,14 @@ async function approachSurfaceLog(target, ctx) {
   movements.allowParkour = false;
   movements.exclusionAreasStep = [...(previous.exclusionAreasStep || []), block => miningRouteExclusion(ctx.bot, block)];
   try {
-    return await walkToSurfaceLog(target, ctx);
+    return await action();
   } finally {
     pathfinder.tickTimeout = tickTimeout;
     Object.assign(movements, previous);
   }
 }
 
-async function mineCollect(args, ctx) {
+async function mineCollect(args, ctx, knownBlocksOnly = false) {
   const bot = ctx.bot;
   requireConnected(ctx);
   const registry = registryOf(ctx);
@@ -1227,7 +1345,7 @@ async function mineCollect(args, ctx) {
       return distanceBetween(origin, a) - distanceBetween(origin, b);
     })[0];
   };
-  for await (const position of resourceCandidates(ctx, ids, range, Math.max(need * 4, 8), scan, chooseCandidate, withinReach)) {
+  for await (const position of resourceCandidates(ctx, ids, range, Math.max(need * 4, 8), scan, chooseCandidate, () => knownBlocksOnly || withinReach())) {
     if (countOwned() - owned >= need) break;
     requireConnected(ctx);
     checkHealth(ctx);
@@ -1237,6 +1355,24 @@ async function mineCollect(args, ctx) {
     if (!block || !acceptedBlockNames.has(block.name)) {
       failures.push(`${formatPosition(position)} 的${blockLabel}已经不见了`);
       continue;
+    }
+    if (blockName === 'obsidian' && knownBlocksOnly && bot.pathfinder?.movements) {
+      const base = blockAtPos(bot, position.offset(0, -1, 0));
+      const feet = bot.entity.position.floored();
+      if (!base || base.boundingBox !== 'block' || isHazardBlock(base) ||
+          (feet.x === position.x && feet.z === position.z && feet.y === position.y + 1) ||
+          CARDINAL_HEADINGS.some(({ x, z }) => blockAtPos(bot, position.offset(x, 0, z))?.name === 'lava')) {
+        failures.push(`${formatPosition(position)} 挖开后缺少安全落脚点或会引入岩浆`);
+        continue;
+      }
+      try {
+        await moveNearBlock(ctx, position, '开采黑曜石', true);
+      } catch (error) {
+        requireConnected(ctx);
+        checkInterrupted(ctx);
+        failures.push(error.message);
+        continue;
+      }
     }
     const distance = distanceBetween(bot.entity.position, position);
     if (distance > MINE_REACH) {

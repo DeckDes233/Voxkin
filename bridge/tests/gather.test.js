@@ -1,27 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { Vec3 } from 'vec3';
 
 import { skills } from '../skills/gather.js';
 import { scanSurfaceLogs } from '../surface_wood_scan.js';
-
-class Vec3 {
-  constructor(x, y, z) {
-    this.x = x;
-    this.y = y;
-    this.z = z;
-  }
-
-  offset(dx, dy, dz) {
-    return new Vec3(this.x + dx, this.y + dy, this.z + dz);
-  }
-
-  distanceTo(other) {
-    return Math.hypot(this.x - other.x, this.y - other.y, this.z - other.z);
-  }
-
-  clone() { return new Vec3(this.x, this.y, this.z); }
-  floored() { return new Vec3(Math.floor(this.x), Math.floor(this.y), Math.floor(this.z)); }
-}
 
 function makeContext({ position = { x: 0, y: 10, z: 0 }, health = 20, blocks = new Map() } = {}) {
   const inventory = {};
@@ -536,7 +518,7 @@ function makeBucketContext({ flowingWater = false } = {}) {
     .filter(([, count]) => count > 0)
     .map(([name, count], index) => ({ name, count, type: index + 1 }));
   const bot = {
-    entity: { position: new Vec3(0, 1, 0), yaw: 0 },
+    entity: { position: new Vec3(0.5, 1, 0.5), yaw: 0 },
     game: { dimension: 'minecraft:overworld' },
     health: 20,
     registry: {
@@ -671,9 +653,38 @@ test('fill_water_bucket explores again after the first still source is unreachab
   assert.equal(ctx.countItem('water_bucket'), 1);
 });
 
+test('bucket collection walks onto a dry bank and uses the item toward the water source', async () => {
+  const { ctx, blocks, inventory } = makeBucketContext();
+  inventory.water_bucket = 0;
+  const source = new Vec3(8, 1, 0);
+  blocks.delete('2,1,0');
+  blocks.set('8,1,0', { name: 'water', position: source, boundingBox: 'empty', metadata: 0 });
+  const ground = new Vec3(7, 0, 0);
+  blocks.set('7,0,0', { name: 'stone', position: ground, boundingBox: 'block' });
+  ctx.bot.pathfinder = { movements: {} };
+  let aim;
+  ctx.bot.lookAt = async (point) => { aim = point; };
+  ctx.walkOnce = async (x, y, z, radius) => {
+    assert.deepEqual([x, y, z, radius], [7, 1, 0, 0]);
+    ctx.bot.entity.position = new Vec3(x + 0.5, y, z + 0.5);
+    return 'reached';
+  };
+  ctx.bot.activateItem = () => {
+    assert.deepEqual(aim, source.offset(0.5, 0.5, 0.5));
+    inventory.bucket--;
+    inventory.water_bucket++;
+  };
+  await skills.fill_water_bucket.handler({ range: 16 }, ctx);
+  assert.equal(inventory.water_bucket, 1);
+});
+
 test('collect_obsidian casts one still lava source, reclaims water, and verifies the mined drop', async () => {
   const { ctx, blocks } = makeBucketContext();
   ctx.inventory.water_bucket = 0;
+  ctx.bot.world = { raycast(_eye, direction, reach) {
+    assert.ok(Math.abs(direction.norm() - 1) < 1e-6);
+    return reach > 3 ? blocks.get('4,3,0') : null;
+  } };
 
   const result = await skills.collect_obsidian.handler({ count: 1, range: 16 }, ctx);
 

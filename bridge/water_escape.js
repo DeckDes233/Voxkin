@@ -138,12 +138,53 @@ async function clearBlockingLeaves(bot, block, token) {
   }
 }
 
+// 含水洞顶只有一个气穴时，在水面旁的实心岩壁中开出一级干燥台阶。
+async function openShoreStep(bot, pos, token, deadline, now) {
+  if (!bot.canDigBlock || !bot.dig || !bot.pathfinder?.bestHarvestTool || bot.oxygenLevel < 19) return false;
+  const origin = pos.floored();
+  const rock = /^(stone|granite|diorite|andesite|deepslate|tuff|dirt|cobblestone)$/;
+  for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    const feet = origin.offset(dx, 1, dz);
+    if (!rock.test(bot.blockAt(feet.offset(0, -1, 0))?.name)) continue;
+    const cells = [feet.offset(0, 1, 0), feet].map(p => bot.blockAt(p));
+    if (!cells.every(b => breathable(b) || (rock.test(b?.name) && bot.canDigBlock(b)))) continue;
+    const wall = cells.filter(b => !breathable(b));
+    if (!wall.length) continue;
+    const enclosed = wall.every(b => [[0,1,0],[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]].every(([x,y,z]) => {
+      const side = bot.blockAt(b.position.offset(x,y,z));
+      return side && !waterLike(side) && !/lava|sand$|gravel|concrete_powder|dripstone/.test(side.name);
+    }));
+    if (!enclosed) continue;
+    for (const block of wall) {
+      if (token?.cancelled || now() >= deadline || bot.oxygenLevel < 19) return false;
+      const tool = bot.pathfinder.bestHarvestTool(block);
+      if (tool) await bot.equip(tool, 'hand');
+      const waitMs = Math.min(deadline - now(), 4000);
+      if (!(bot.digTime(block) + 200 < waitMs)) return false;
+      let timeout;
+      try {
+        await Promise.race([bot.dig(block), new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('开靠岸台阶超时')), waitMs);
+        })]);
+      } catch {
+        bot.stopDigging?.();
+        return false;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
 export async function reachShore(bot, { token = null, timeoutMs = 25000, radius = 12,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), now = Date.now } = {}) {
   const deadline = now() + timeoutMs;
   const searchRadius = Math.max(1, Math.min(12, Math.floor(radius)));
   const excluded = new Set();
   let target = null, path = [], previous = null, still = 0;
+  let triedStep = false;
   release(bot);
   try {
     while (now() < deadline) {
@@ -168,6 +209,12 @@ export async function reachShore(bot, { token = null, timeoutMs = 25000, radius 
         const plan = shoreRoute(bot, pos, searchRadius, excluded);
         target = plan?.target || null;
         path = plan?.path || [];
+        if (!target && !triedStep && breathable(eye) && bot.oxygenLevel >= 19) {
+          triedStep = true;
+          bot.setControlState('forward', false);
+          bot.setControlState('jump', true);
+          if (await openShoreStep(bot, pos, token, deadline, now)) continue;
+        }
       }
       bot.setControlState('jump', true);
       bot.setControlState('forward', false);

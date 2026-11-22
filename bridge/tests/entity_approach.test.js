@@ -43,6 +43,16 @@ function makeBot() {
   return bot;
 }
 
+test('approachEntity keeps following until the entity is within three blocks', async () => {
+  const bot = makeBot();
+  const target = { position: { x: 4, y: 0, z: 0 }, isValid: true };
+  const approaching = approachEntity(bot, target, GoalFollow, { timeoutMs: 1000 });
+  await new Promise(resolve => setTimeout(resolve, 150));
+  assert.ok(bot.pathfinder.goal instanceof GoalFollow);
+  bot.entity.position.x = 2;
+  assert.equal(await approaching, true);
+});
+
 test('approachEntity follows a moving entity with a dynamic goal', async () => {
   const bot = makeBot();
   const target = { position: { x: 12, y: 0, z: 0 }, isValid: true };

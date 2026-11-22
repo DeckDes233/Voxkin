@@ -1,29 +1,8 @@
+import { dryMiningFooting, miningRouteExclusion } from '../dry_footing.js';
 import { waterLike } from '../water_escape.js';
-
-const HAZARDS = new Set(['lava', 'fire', 'soul_fire', 'magma_block', 'campfire', 'soul_campfire', 'cactus', 'sweet_berry_bush', 'powder_snow', 'wither_rose']);
+export { dryMiningFooting, miningRouteExclusion } from '../dry_footing.js';
 const horizontal = (a, b) => Math.hypot(a.x - b.x, a.z - b.z);
 const point = (p) => ({ x: p.x, y: p.y, z: p.z });
-
-export function miningRouteExclusion(bot, block) {
-  if (!block?.position) return 100;
-  // 液体代价只是偏好；换区路线必须直接排除水、含水方块和未知空间。
-  for (const dy of [0, 1]) {
-    const cell = bot.blockAt(block.position.offset(0, dy, 0));
-    if (!cell || waterLike(cell) || HAZARDS.has(cell.name)) return 100;
-  }
-  return 0;
-}
-
-export function dryMiningFooting(bot, position) {
-  const feet = position.floored();
-  const ground = bot.blockAt(feet.offset(0, -1, 0));
-  if (!ground || ground.boundingBox !== 'block' || waterLike(ground) || HAZARDS.has(ground.name)) return false;
-  for (const dy of [0, 1]) {
-    const block = bot.blockAt(feet.offset(0, dy, 0));
-    if (!block || block.boundingBox !== 'empty' || waterLike(block) || HAZARDS.has(block.name)) return false;
-  }
-  return true;
-}
 
 // 只从已加载地形选落脚点，必须实际到达才算换矿区。
 export function miningSiteCandidates(bot, origin, minimum, avoid) {

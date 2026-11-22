@@ -396,6 +396,9 @@ function scanDescentArea(ctx) {
   for (let depth = 1; depth <= DESCEND_SHAFT_SCAN; depth += 1) {
     cells.push({ dx: 0, dy: -depth, dz: 0, zone: `脚下${depth}格`, depth });
   }
+  for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    cells.push({ dx, dy: -1, dz, zone: '待挖方块侧面' });
+  }
   for (let step = 1; step <= DESCEND_AHEAD_SCAN; step += 1) {
     const cell = forwardCell(yaw, step);
     cells.push({ dx: cell.dx, dy: 0, dz: cell.dz, zone: `前方${step}格` });
@@ -628,6 +631,8 @@ export const skills = {
           if (dug >= maxLayers) break;
           const scan = scanDescentArea(ctx);
           const origin = scan.origin;
+          const inlet = scan.water.find(cell => cell.zone === '待挖方块侧面' || cell.depth === 1);
+          if (inlet) throw new Error(`下方竖井连通水层 (${inlet.x}, ${inlet.y}, ${inlet.z})，保留隔水方块，需换位下探`);
 
           // 岩浆：立刻停。竖井第 3 格只提醒，上面两层会挡住。
           const blockingLava = scan.lava.find((cell) => cell.depth !== 3);

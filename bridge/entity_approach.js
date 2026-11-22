@@ -28,7 +28,7 @@ export async function approachEntity(bot, target, GoalFollow, options = {}) {
         finish(null, false);
         return;
       }
-      if (bot.entity.position.distanceTo(target.position) <= 4.5) {
+      if (bot.entity.position.distanceTo(target.position) <= 3) {
         finish(null, true);
         return;
       }
