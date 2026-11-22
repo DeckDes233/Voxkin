@@ -130,6 +130,7 @@ class GoalSupervisor:
         action_status: StatusQuery | None = None,
         announce: Announce | None = None,
         state_age_provider: StateAge | None = None,
+        observation_event: asyncio.Event | None = None,
         require_protocol: bool = True,
         verifier: Verifier | None = None,
     ) -> None:
@@ -140,6 +141,7 @@ class GoalSupervisor:
         self.action_status = action_status
         self.announce = announce
         self.state_age_provider = state_age_provider
+        self._observation_event = observation_event
         self.require_protocol = require_protocol
         self.verifier = verifier or Verifier()
         self.task_id: int | None = None
@@ -154,6 +156,8 @@ class GoalSupervisor:
             self.state = dict(persisted or self.state)
             return
         self._stop_requested = True
+        if self._observation_event is not None:
+            self._observation_event.set()
         if not self.state:
             return
         self.state["status"] = "paused_by_user"
@@ -347,7 +351,7 @@ class GoalSupervisor:
                         self.state["status"] = "waiting"
                         self.state["block_reason"] = "等待下一次夜晚或新鲜状态变化"
                         self._save()
-                        await asyncio.sleep(0.5)
+                        await self._wait_for_observation()
                         continue
                     method_key = f"s2:{step.tool}:{step.arguments.get('block') or step.arguments.get('item') or 'default'}"
                     if method_key == "s2:hunt_material:wool":
@@ -383,7 +387,7 @@ class GoalSupervisor:
                             or "等待 S3 下矿前置条件满足"
                         )
                         self._save()
-                        await asyncio.sleep(0.5)
+                        await self._wait_for_observation()
                         continue
                     step = preflight_step or choose_s3_resource_action(state, self.state)
                     if step is None:
@@ -391,7 +395,7 @@ class GoalSupervisor:
                             self.state["status"] = "waiting"
                             self.state["block_reason"] = self.state["s3_preflight_wait_reason"]
                             self._save()
-                            await asyncio.sleep(0.5)
+                            await self._wait_for_observation()
                             continue
                         return self._block(
                             "s3_ore_route_exhausted",
@@ -407,6 +411,8 @@ class GoalSupervisor:
                         method_key = (f"s3:ore_return_surface:{int(self.state.get('s3_ore_regions', 0))}"
                                       if step.description == "换矿区受阻，沿已知庇护所路线返回地表"
                                       else "s3:surface_route:shelter_anchor")
+                    elif step.tool == "mine_collect" and resource == "wood_log" and step.arguments.get("within_reach"):
+                        method_key = "s3:surface_fuel_wood"
                     elif step.tool == "mine_collect" and resource in {*S3_OVERWORLD_WOOD_LOGS, "wood_log"}:
                         context = _s3_wood_search_context(state) or "unknown"
                         method_key = f"s3:wood_search:{context}:{resource}"
@@ -428,7 +434,7 @@ class GoalSupervisor:
                             or "等待 S4 下矿前置条件满足"
                         )
                         self._save()
-                        await asyncio.sleep(0.5)
+                        await self._wait_for_observation()
                         continue
                     self.state.pop("s4_resource_block_reason", None)
                     step = preflight_step or choose_s4_resource_action(state, self.state)
@@ -447,7 +453,7 @@ class GoalSupervisor:
                             self.state["status"] = "waiting"
                             self.state["block_reason"] = self.state["late_game_wait_reason"]
                             self._save()
-                            await asyncio.sleep(0.5)
+                            await self._wait_for_observation()
                             continue
                         return self._block("s5_dependencies", str(self.state.get("late_game_block_reason") or "等待 S5 补给或可用路线"))
                     resource = step.arguments.get("item") or step.arguments.get("block") or step.arguments.get("mode") or "default"
@@ -508,7 +514,7 @@ class GoalSupervisor:
                             self.state["status"] = "waiting"
                             self.state["block_reason"] = self.state["late_game_wait_reason"]
                             self._save()
-                            await asyncio.sleep(0.5)
+                            await self._wait_for_observation()
                             continue
                         return self._block("s6_dependencies", str(self.state.get("late_game_block_reason") or "等待 S6 补给或可用路线"))
                     resource = step.arguments.get("item") or step.arguments.get("block") or "default"
@@ -1499,12 +1505,26 @@ class GoalSupervisor:
             return False, "等待原 session revision 前进后的观察"
         return True, "ready"
 
+    async def _wait_for_observation(self, *, timeout: float | None = None) -> None:
+        # 正式 Bridge 推送时唤醒。独立调用者只提供快照时仍按原间隔轮询。
+        if self._observation_event is None:
+            await asyncio.sleep(0.5 if timeout is None else min(0.25, max(0.0, timeout)))
+            return
+        if timeout is None:
+            timeout = float(self.state["deadline_at"]) - time.time()
+        try:
+            await asyncio.wait_for(self._observation_event.wait(), min(5.0, max(0.0, timeout)))
+        except asyncio.TimeoutError:
+            pass
+
     async def _wait_for_usable_state(self, *, after: tuple[str, int | None] | None = None) -> dict[str, Any] | None:
         deadline = time.monotonic() + MAX_READY_WAIT_S
         latest: dict[str, Any] = {}
         while time.monotonic() < deadline:
             if self._stop_requested:
                 return None
+            if self._observation_event is not None:
+                self._observation_event.clear()
             latest = dict(self.state_provider() or {})
             usable, reason = self._state_usable(latest, after=after)
             if usable:
@@ -1520,7 +1540,7 @@ class GoalSupervisor:
             self.state["status"] = "waiting"
             self.state["block_reason"] = reason
             self._save()
-            await asyncio.sleep(0.25)
+            await self._wait_for_observation(timeout=deadline - time.monotonic())
         self.state["status"] = "disconnected" if not latest else ("waiting" if after is not None else "blocked")
         self.state["block_reason"] = "等待 ready 新鲜观察超时"
         self.state.setdefault("recovery", {}).update({"needs_reconcile": True, "reason": "bridge_unavailable"})

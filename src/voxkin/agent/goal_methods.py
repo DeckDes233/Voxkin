@@ -664,7 +664,33 @@ def choose_s3_preflight_action(
             250.0,
         )
     goal_state.pop("s3_preflight_wait_reason", None)
-    if inventory_count(inventory, "crafting_table") < 1 and state.get("nearby_owned_crafting_table") is not True:
+    has_table = inventory_count(inventory, "crafting_table") > 0 or state.get("nearby_owned_crafting_table") is True
+    ingots = inventory_count(inventory, "iron_ingot")
+    has_mining_pickaxe = any(inventory_count(inventory, item) > 0 for item in S3_MINING_PICKAXES)
+    if has_table:
+        if not has_mining_pickaxe and ingots >= 3 and inventory_count(inventory, "stick") < 2:
+            wood = early_planks(inventory, 2, "铁镐木棍")
+            if wood is None or wood.tool == "craft":
+                return False, _s3_ensure_sticks(inventory, 2, "铁镐", state, goal_state)
+        for item, cost in S3_IRON_COSTS.items():
+            if inventory_count(inventory, item) or ingots < cost:
+                continue
+            sticks = {"iron_pickaxe": 2, "iron_sword": 1}.get(item, 0)
+            if inventory_count(inventory, "stick") < sticks:
+                continue
+            if item == "shield" and early_planks(inventory, 6, "盾牌") is not None:
+                continue
+            return False, _s3_gear_step(item)
+
+    iron_gap = max(0, _s3_iron_ingot_requirement(inventory) - ingots)
+    has_any_pickaxe = any(inventory_count(inventory, item) > 0 for item in S3_ANY_PICKAXES)
+    raw = inventory_count(inventory, "raw_iron")
+    if (iron_gap and raw >= iron_gap and inventory_count(inventory, "furnace") and has_any_pickaxe
+            and (has_table or not ingots or early_planks(inventory, 4, "工作台") is not None)):
+        # 现有熔炉无需工作台。先做可执行的生产步骤，缺木只推迟用木的配方。
+        return True, None
+
+    if not has_table:
         plank_step = _s3_ensure_planks(inventory, 4, "工作台", state, goal_state)
         deferred = defer(plank_step)
         if deferred is not None:
@@ -677,16 +703,17 @@ def choose_s3_preflight_action(
             60.0,
         )
 
-    has_mining_pickaxe = any(inventory_count(inventory, item) > 0 for item in S3_MINING_PICKAXES)
-    has_any_pickaxe = any(inventory_count(inventory, item) > 0 for item in S3_ANY_PICKAXES)
-    needs_stone_pickaxe = not has_mining_pickaxe
-    needs_wooden_pickaxe = needs_stone_pickaxe and inventory_count(inventory, "cobblestone") < 3 and not has_any_pickaxe
+    needs_stone_pickaxe = not has_mining_pickaxe and raw < iron_gap
+    needs_wooden_pickaxe = not has_any_pickaxe and (
+        (needs_stone_pickaxe and inventory_count(inventory, "cobblestone") < 3)
+        or (not needs_stone_pickaxe and iron_gap > 0)
+    )
     final_sticks = (2 if inventory_count(inventory, "iron_pickaxe") < 1 else 0) + (
         1 if inventory_count(inventory, "iron_sword") < 1 else 0
     )
     mining_sticks = (2 if needs_stone_pickaxe else 0) + (2 if needs_wooden_pickaxe else 0)
 
-    if needs_wooden_pickaxe and inventory_count(inventory, "wooden_pickaxe") < 1:
+    if needs_wooden_pickaxe:
         plank_step = _s3_ensure_planks(inventory, 3, "木镐", state, goal_state)
         deferred = defer(plank_step)
         if deferred is not None:
@@ -696,7 +723,7 @@ def choose_s3_preflight_action(
         if deferred is not None:
             return deferred
         return False, _s3_action(
-            "合成采集圆石所需木镐",
+            "合成采石或回收熔炉所需木镐",
             "craft",
             {"item": "wooden_pickaxe", "count": 1},
             {"type": "inventory", "items": {"wooden_pickaxe": 1}},
@@ -732,8 +759,28 @@ def choose_s3_preflight_action(
         deferred = defer(stick_step)
         if deferred is not None:
             return deferred
-    if inventory_count(inventory, "shield") < 1:
-        plank_step = _s3_ensure_planks(inventory, 6, "盾牌", state, goal_state)
+    plank_target = 6 if inventory_count(inventory, "shield") < 1 else 0
+    wood_inventory = inventory
+    if (raw < iron_gap and isinstance(state.get("resource_sites"), dict)
+            and _is_day(state) and not _s3_needs_surface_route(state)):
+        # 地表出发前带足这一批铁的备用燃料。已携带的煤或木炭按整批抵扣。
+        coal_units = inventory_count(inventory, "coal") + inventory_count(inventory, "charcoal")
+        fuel_planks = _s3_smelt_fuel_need(max(0, iron_gap - 8 * coal_units), "oak_planks")
+        if fuel_planks:
+            wood_inventory = {name: count for name, count in inventory.items() if not name.startswith(("crimson_", "warped_"))}
+            plank_target += fuel_planks
+    if plank_target:
+        plank_step = _s3_ensure_planks(wood_inventory, plank_target, "盾牌与熔炼燃料", state, goal_state)
+        shield_wood = 0 if inventory_count(inventory, "shield") else 6
+        if plank_step and plank_step.tool == "mine_collect" and plank_target > shield_wood:
+            required = early_planks(inventory, shield_wood, "盾牌")
+            if required:
+                return False, required
+            # 可选备用燃料只顺手采一次。收据失败后仍可按原计划下矿。
+            attempts = (goal_state.get("counters") or {}).get("attempts") or {}
+            if state.get("collection_within_reach") is not True or attempts.get("s3:surface_fuel_wood", 0):
+                return True, None
+            plank_step = replace(plank_step, arguments={**plank_step.arguments, "within_reach": True})
         deferred = defer(plank_step)
         if deferred is not None:
             return deferred
@@ -746,6 +793,11 @@ def _s3_iron_ingot_requirement(inventory: dict[str, Any]) -> int:
         for item, cost in S3_IRON_COSTS.items()
         if inventory_count(inventory, item) < 1
     )
+
+
+def _s3_gear_step(item: str) -> StepSpec:
+    return _s3_action(f"合成{item}以满足 S3 目标", "craft", {"item": item, "count": 1},
+                      {"type": "inventory", "items": {item: 1}}, 60.0)
 
 
 def _s3_smelt_fuel_need(count: int, fuel_item: str) -> int:
@@ -858,23 +910,26 @@ def choose_s3_resource_action(state: dict[str, Any], goal_state: dict[str, Any])
         # 单批至多 8 个，使用当前能支撑的燃料；先留足尚未制作盾牌所需木板。
         batch_count = min(batch_count, 8)
         coal = inventory_count(inventory, "coal")
-        if (isinstance(state.get("resource_sites"), dict)
-                and not goal_state.get("s3_coal_search_attempted")
-                and coal < 16
-                and any(inventory_count(inventory, item) > 0 for item in S3_MINING_PICKAXES)):
-            return _s3_action(
-                "优先寻找煤矿补足燃料和火把储备",
-                "mine_collect",
-                {"block": "coal_ore", "count": 16, "minimum_count": coal + 1, "range": 48},
-                {"type": "inventory", "items": {"coal": coal + 1}},
-                250.0,
-            )
         reserve = 6 if inventory_count(inventory, "shield") < 1 else 0
+        if not inventory_count(inventory, "crafting_table") and state.get("nearby_owned_crafting_table") is not True:
+            reserve += 4
+        sticks = (2 if not inventory_count(inventory, "iron_pickaxe") else 0) + (1 if not inventory_count(inventory, "iron_sword") else 0)
+        if inventory_count(inventory, "stick") < sticks:
+            reserve += 2
         available = {name: max(0, inventory_count(inventory, name) - (reserve if name.endswith("_planks") else 0))
                      for name in S3_FUEL_BURN}
         fuel_item = max(available, key=lambda name: available[name] * S3_FUEL_BURN[name])
         capacity = math.floor(available[fuel_item] * S3_FUEL_BURN[fuel_item])
         if capacity < 1:
+            if (isinstance(state.get("resource_sites"), dict) and not goal_state.get("s3_coal_search_attempted")
+                    and (_is_day(state) is True or state.get("collection_within_reach") is True)
+                    and any(inventory_count(inventory, item) > 0 for item in S3_ANY_PICKAXES)):
+                return _s3_action(
+                    "缺少熔炼燃料，采煤并顺路补充储备", "mine_collect",
+                    {"block": "coal_ore", "count": 16, "minimum_count": coal + 1, "range": 48,
+                     **({"within_reach": True} if _is_day(state) is not True else {})},
+                    {"type": "inventory", "items": {"coal": coal + 1}}, 250.0,
+                )
             fuel_inventory = {name: count for name, count in inventory.items() if not name.startswith(("crimson_", "warped_"))}
             return _s3_ensure_planks(fuel_inventory, reserve + math.ceil(batch_count / 1.5), "熔炼燃料", state, goal_state)
         batch_count = min(batch_count, capacity)
@@ -889,13 +944,7 @@ def choose_s3_resource_action(state: dict[str, Any], goal_state: dict[str, Any])
 
     for item in ("iron_pickaxe", "iron_sword", "shield", "bucket"):
         if inventory_count(inventory, item) < 1:
-            return _s3_action(
-                f"合成{item}以满足 S3 目标",
-                "craft",
-                {"item": item, "count": 1},
-                {"type": "inventory", "items": {item: 1}},
-                60.0,
-            )
+            return _s3_gear_step(item)
     goal_state.pop("s3_resource_block_reason", None)
     return None
 

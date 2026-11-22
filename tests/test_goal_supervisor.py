@@ -40,6 +40,36 @@ def modern_state(**updates: object) -> dict:
     return state
 
 
+@pytest.mark.asyncio
+async def test_observation_wakes_goal_and_requires_revision_progress(tmp_path):
+    store = TaskStore(tmp_path / "observation.db")
+    store.initialize()
+    event = asyncio.Event()
+    sampled = asyncio.Event()
+    current = modern_state()
+
+    def observe():
+        sampled.set()
+        return current
+
+    supervisor = GoalSupervisor(GOALS["S3"], store, None, observe, observation_event=event)
+    supervisor.state = supervisor._new_state()
+    task = asyncio.create_task(supervisor._wait_for_usable_state(after=("world-1", 1)))
+    try:
+        await asyncio.wait_for(sampled.wait(), 1)
+        sampled.clear()
+        event.set()
+        await asyncio.wait_for(sampled.wait(), 1)
+        assert not task.done()
+        current["revision"] = 2
+        event.set()
+        assert (await asyncio.wait_for(task, 1))["revision"] == 2
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        store.close()
+
+
 def test_early_survival_finds_food_instead_of_repeatedly_resuming_wood():
     hungry = modern_state(food=8, inventory={})
     step = choose_early_survival_action(hungry)
@@ -3399,14 +3429,17 @@ async def test_s2_exhausted_sheep_search_relocates_before_new_region_retry(tmp_p
     store.close()
 
 
-def test_s3_prefers_coal_reserve_and_falls_back_after_search():
+def test_s3_uses_available_fuel_before_seeking_extra_coal():
     state = modern_state(resource_sites={}, inventory={"stone_pickaxe": 1, "furnace": 1,
         "raw_iron": 9, "oak_planks": 12, "coal": 2})
     step = choose_s3_resource_action(state, {})
-    assert step is not None and step.tool == "mine_collect"
-    assert step.arguments == {"block": "coal_ore", "count": 16, "minimum_count": 3, "range": 48}
+    assert step is not None and step.tool == "smelt_batch"
+    assert step.arguments["fuel"] == "coal"
+    state["inventory"].update(coal=0, oak_planks=4)
+    search = choose_s3_resource_action(state, {})
+    assert search.arguments == {"block": "coal_ore", "count": 16, "minimum_count": 1, "range": 48}
     fallback = choose_s3_resource_action(state, {"s3_coal_search_attempted": True})
-    assert fallback is not None and fallback.tool == "smelt_batch"
+    assert fallback.arguments["block"] == "wood_log"
 
 
 def test_s3_relocation_requires_fresh_observed_progress_and_preserves_budget(tmp_path):

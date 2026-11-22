@@ -47,6 +47,7 @@ class RunManager:
         self._runs_dir = Path(runs_dir)
         self._runner: TaskRunner | None = None
         self._goal_supervisor: GoalSupervisor | None = None
+        self._observation_event = asyncio.Event()
         self._goal_starting = False
         self._goal_launch_task: asyncio.Task | None = None
         self._auto_resume_key: tuple[int, str, int | None] | None = None
@@ -389,6 +390,7 @@ class RunManager:
             action_status=self._action_status,
             announce=self._announce,
             state_age_provider=self._state_age_provider,
+            observation_event=self._observation_event,
             require_protocol=True,
         )
         self._started_at = time.time()
@@ -455,6 +457,7 @@ class RunManager:
         }
 
     def on_bridge_unavailable(self, reason: str = "bridge disconnected") -> None:
+        self._observation_event.set()
         task_id = self._task_id if self._task_id is not None else None
         if task_id is None:
             task = self._store.latest_resumable()
@@ -482,6 +485,7 @@ class RunManager:
     def on_state_update(self, state: dict[str, Any]) -> bool:
         """只在 ready、alive、安全动作结束且观察前进后自动恢复持久化目标。"""
         if self.running:
+            self._observation_event.set()
             return False
         task = self._store.get_task(self._task_id) if self._task_id is not None else self._store.latest_resumable()
         if task is None:
