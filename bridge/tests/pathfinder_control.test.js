@@ -4,6 +4,13 @@ import test from 'node:test';
 import goto from 'mineflayer-pathfinder/lib/goto.js';
 import { gotoWithTimeout, stopPathfinderAndClearGoal } from '../pathfinder_control.js';
 
+test('an empty path cannot report arrival eight blocks away', async () => {
+  const pathfinder = { goto: async () => {} };
+  const goal = { isEnd: p => p.x === 8 };
+  await assert.rejects(gotoWithTimeout(pathfinder, goal, 50, '', () => ({ floored: () => ({ x: 0 }) })), { name: 'NoPath' });
+  await gotoWithTimeout(pathfinder, goal, 50, '', () => ({ floored: () => ({ x: 8 }) }));
+});
+
 function makePathfinder(bot) {
   return {
     goal: null,

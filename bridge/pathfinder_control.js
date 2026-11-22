@@ -6,7 +6,7 @@ export function stopPathfinderAndClearGoal(pathfinder) {
 }
 
 // stop() 是软停止；清空 goal 才会让当前 goto 的 Promise 结束并释放监听器。
-export async function gotoWithTimeout(pathfinder, goal, timeoutMs, message = '寻路超时') {
+export async function gotoWithTimeout(pathfinder, goal, timeoutMs, message = '寻路超时', currentPosition) {
   let timedOut = false;
   const movement = pathfinder.goto(goal);
   const timer = setTimeout(() => {
@@ -14,7 +14,13 @@ export async function gotoWithTimeout(pathfinder, goal, timeoutMs, message = '�
     stopPathfinderAndClearGoal(pathfinder);
   }, timeoutMs);
   try {
-    return await movement;
+    const result = await movement;
+    if (currentPosition && !goal.isEnd(currentPosition().floored())) {
+      const error = new Error('寻路已结束，但实际坐标尚未进入目标范围');
+      error.name = 'NoPath';
+      throw error;
+    }
+    return result;
   } finally {
     clearTimeout(timer);
     if (timedOut) {

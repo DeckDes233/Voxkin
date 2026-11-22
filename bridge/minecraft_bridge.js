@@ -948,7 +948,7 @@ function classifyPathFailure(error) {
 
 async function gotoWithDeadline(goal, timeoutMs = 30000, message = '寻路超时') {
   if (!bot?.pathfinder) throw new Error('当前没有寻路能力');
-  const result = await gotoWithTimeout(bot.pathfinder, goal, timeoutMs, message);
+  const result = await gotoWithTimeout(bot.pathfinder, goal, timeoutMs, message, () => bot.entity.position);
   if (interrupted) throw new Error('被新的指令打断');
   return result;
 }
