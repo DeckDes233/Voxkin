@@ -77,7 +77,12 @@ test('observation reports a verified owned table without inventing an inventory 
     executor: {}, nearbyOwnedCraftingTable: true,
   });
   assert.equal(state.nearby_owned_crafting_table, true);
+  assert.equal(state.nearby_crafting_table, true);
   assert.equal(state.inventory.crafting_table, undefined);
+  const nearby = createObservation(world.bot, { executor: {}, nearbyCraftingTable: true });
+  assert.equal(nearby.nearby_crafting_table, true);
+  assert.equal(nearby.nearby_owned_crafting_table, false);
+  assert.equal(nearby.inventory.crafting_table, undefined);
 });
 
 test('副手盾计入装备持有数且不会重复统计，副手材料仍与合成库存分开', () => {

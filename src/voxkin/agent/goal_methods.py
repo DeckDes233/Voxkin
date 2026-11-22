@@ -308,12 +308,16 @@ def choose_early_survival_action(state: dict[str, Any]) -> StepSpec | None:
                     retries=2, timeout_s=250, effect_class="replan")
 
 
+def _nearby_crafting_table(state: dict[str, Any]) -> bool:
+    return state.get("nearby_crafting_table") is True or state.get("nearby_owned_crafting_table") is True
+
+
 def choose_early_action(stage: str, state: dict[str, Any]) -> StepSpec | None:
     inventory = state.get("inventory") or {}
     targets = ("crafting_table", "wooden_pickaxe") if stage == "S0" else ("stone_pickaxe", "stone_sword", "furnace")
     for item in targets:
         if inventory_count(inventory, item) < 1:
-            return early_craft(inventory, item, state.get("nearby_owned_crafting_table") is True)
+            return early_craft(inventory, item, _nearby_crafting_table(state))
     return None
 
 
@@ -393,7 +397,7 @@ def choose_s2_action(state: dict[str, Any], goal_state: dict[str, Any]) -> StepS
                 return action("用现有铁锭合成剪刀", "craft", {"item": "shears", "count": 1}, {"type": "inventory", "items": {"shears": 1}}, 60.0)
             return action("寻找成年羊，收集三块同色羊毛", "hunt_material", {"item": "wool", "count": 3, "radius": 64, "min_health": 10}, {"type": "inventory", "items": {"wool": 3}}, 250.0)
 
-        if inventory_count(inventory, "crafting_table") < 1 and state.get("nearby_owned_crafting_table") is not True:
+        if inventory_count(inventory, "crafting_table") < 1 and not _nearby_crafting_table(state):
             return early_craft(inventory, "crafting_table")
         plank_step = early_planks(inventory, 3, "床")
         if plank_step:
@@ -664,7 +668,7 @@ def choose_s3_preflight_action(
             250.0,
         )
     goal_state.pop("s3_preflight_wait_reason", None)
-    has_table = inventory_count(inventory, "crafting_table") > 0 or state.get("nearby_owned_crafting_table") is True
+    has_table = inventory_count(inventory, "crafting_table") > 0 or _nearby_crafting_table(state)
     ingots = inventory_count(inventory, "iron_ingot")
     has_mining_pickaxe = any(inventory_count(inventory, item) > 0 for item in S3_MINING_PICKAXES)
     if has_table:
@@ -911,7 +915,7 @@ def choose_s3_resource_action(state: dict[str, Any], goal_state: dict[str, Any])
         batch_count = min(batch_count, 8)
         coal = inventory_count(inventory, "coal")
         reserve = 6 if inventory_count(inventory, "shield") < 1 else 0
-        if not inventory_count(inventory, "crafting_table") and state.get("nearby_owned_crafting_table") is not True:
+        if not inventory_count(inventory, "crafting_table") and not _nearby_crafting_table(state):
             reserve += 4
         sticks = (2 if not inventory_count(inventory, "iron_pickaxe") else 0) + (1 if not inventory_count(inventory, "iron_sword") else 0)
         if inventory_count(inventory, "stick") < sticks:
@@ -954,6 +958,7 @@ S4_FOOD_RESERVE = 2
 S4_MIN_HEALTH = 10
 S4_DESCENT_STEP = 12
 S4_TARGET_Y = -56
+S4_DIAMOND_SEARCH_TOP_Y = 16
 S4_MAX_DESCENT_SEGMENTS = 12
 S4_MAX_SAFE_ROUTE_FALLBACKS = 1
 S4_HORIZONTAL_LENGTH = 12
@@ -1179,7 +1184,7 @@ def choose_s4_preflight_action(
     needs_iron_pickaxe = needs_diamond_mining and not any(
         inventory_count(inventory, item) > 0 for item in S4_DIAMOND_MINING_PICKAXES
     )
-    if inventory_count(inventory, "crafting_table") < 1 and state.get("nearby_owned_crafting_table") is not True:
+    if inventory_count(inventory, "crafting_table") < 1 and not _nearby_crafting_table(state):
         step = wood_step(4, "工作台")
         if step is not None:
             return False, step
@@ -1280,7 +1285,11 @@ def choose_s4_resource_action(state: dict[str, Any], goal_state: dict[str, Any])
             effect_class="non_replayable",
         )
 
-    if int(goal_state.get("s4_diamond_no_progress", 0)) <= 0:
+    y = _position_y(state)
+    if not math.isfinite(y):
+        goal_state["s4_resource_block_reason"] = "缺少有效位置观察，不能安全选择下探高度"
+        return None
+    if y <= S4_DIAMOND_SEARCH_TOP_Y and int(goal_state.get("s4_diamond_no_progress", 0)) <= 0:
         return _s3_action(
             "从当前新鲜观察位置采集钻石总目标",
             "mine_collect",
@@ -1289,10 +1298,6 @@ def choose_s4_resource_action(state: dict[str, Any], goal_state: dict[str, Any])
             300.0,
         )
 
-    y = _position_y(state)
-    if not math.isfinite(y):
-        goal_state["s4_resource_block_reason"] = "缺少有效位置观察，不能安全选择下探高度"
-        return None
     segments = int(goal_state.get("s4_descent_segments", 0))
     if y <= S4_TARGET_Y or segments >= S4_MAX_DESCENT_SEGMENTS:
         goal_state["s4_resource_block_reason"] = (

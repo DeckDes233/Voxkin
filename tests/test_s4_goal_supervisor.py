@@ -82,6 +82,19 @@ def test_s4_final_depth_segment_clamps_shaft_to_one_for_fractional_y():
     assert step.verify == {"type": "s4_depth_reached", "target_y": -56}
 
 
+def test_s4_descends_before_searching_for_diamonds_on_the_surface():
+    step = choose_s4_resource_action(s4_state(y=74), {})
+    assert step.tool == "strip_mine"
+    assert step.verify == {"type": "s4_depth_reached", "target_y": 62}
+
+
+def test_s4_uses_a_table_still_present_after_reconnecting_underground():
+    state = s4_state(y=-10, nearby_crafting_table=True, inventory={"diamond": 3, "stick": 3})
+    ready, preparation = choose_s4_preflight_action(state, {})
+    assert ready and preparation is None
+    assert choose_s4_resource_action(state, {}).arguments == {"item": "diamond_pickaxe", "count": 1}
+
+
 @pytest.mark.parametrize(("food_item", "hunt_target"), [("porkchop", 2), ("apple", 1)])
 def test_s4_food_hunt_uses_the_inventory_total_as_its_count_target(food_item, hunt_target):
     state = s4_state(
@@ -283,13 +296,13 @@ async def test_supervisor_crafts_existing_diamonds_without_food_or_day_gates(tmp
 @pytest.mark.asyncio
 async def test_supervisor_records_only_fresh_verified_descent_then_searches_diamonds(tmp_path):
     store, task = make_store_task(tmp_path)
-    state = s4_state()
+    state = s4_state(y=26)
     calls = []
 
     async def dispatch(tool, arguments, timeout_s=0.0, action_id="", **kwargs):
         calls.append((tool, dict(arguments), action_id))
         if tool == "strip_mine":
-            state["position"]["y"] = 47.0
+            state["position"]["y"] = 14.0
             state["revision"] += 1
             return ActionResult(
                 action_id,
@@ -317,7 +330,7 @@ async def test_supervisor_records_only_fresh_verified_descent_then_searches_diam
     assert calls[0][1]["shaft"] == 12
     assert saved["s4_descent_segments"] == 1
     assert saved["s4_diamond_no_progress"] == 0
-    assert saved["counters"]["method_failures"].get("s4:descend:0:47", 0) == 0
+    assert saved["counters"]["method_failures"].get("s4:descend:0:14", 0) == 0
     assert saved["pending_action"]["tool"] == "mine_collect"
     assert saved["pending_action"]["baseline_diamond_count"] == 0
     store.close()

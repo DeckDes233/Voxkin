@@ -100,6 +100,7 @@ export function createObservation(bot, options) {
     executor,
     shelter,
     nearbyOwnedCraftingTable = false,
+    nearbyCraftingTable = false,
     makeVec = (x, y, z) => ({ x, y, z }),
   } = options;
   const health = Number(bot?.health);
@@ -144,6 +145,7 @@ export function createObservation(bot, options) {
     inventory,
     off_hand: offHand?.name || '',
     nearby_owned_crafting_table: Boolean(nearbyOwnedCraftingTable),
+    nearby_crafting_table: Boolean(nearbyCraftingTable || nearbyOwnedCraftingTable),
     inventory_free_slots: typeof bot?.inventory?.emptySlotCount === 'function' ? bot.inventory.emptySlotCount() : null,
     resource_sites: inspectResourceSites(bot, shelter, sessionId),
     collection_within_reach: true,

@@ -976,6 +976,11 @@ test('mine_collect treats regular and deepslate diamond ore as interchangeable t
 
 test('deep_mine completes its requested tunnel length at the target depth', async () => {
   const ctx = makeContext({ position: { x: 0, y: -56, z: 0 } });
+  const walk = ctx.walkOnce;
+  ctx.walkOnce = async (x, y, z, radius, timeout) => {
+    assert.equal(radius, 0, '相邻格不能算作已经走进挖开的巷道');
+    return walk(x, y, z, radius, timeout);
+  };
   ctx.bot.blockAt = (point) => {
     const key = `${point.x},${point.y},${point.z}`;
     if (ctx.blocks.has(key)) return ctx.blocks.get(key);

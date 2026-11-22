@@ -1141,7 +1141,8 @@ async function travelToBlock(position, timeoutMs = COLLECT_WALK_TIMEOUT_MS) {
   const targetName = target?.name || '';
   const place = `${targetName} (${position.x}, ${position.y}, ${position.z})`;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    let outcome = await walkOnce(position.x, Math.max(0, position.y - 1), position.z, 2, timeoutMs);
+    const approachY = Math.max(bot.game.minY, position.y - 1);
+    let outcome = await walkOnce(position.x, approachY, position.z, 2, timeoutMs);
     if (outcome === 'reached' && bot.entity.position.distanceTo(position) > 4.5) {
       // 离原木还远，靠近一点再挖。
       const close = await walkOnce(position.x, position.y, position.z, 2, 8000);
@@ -3587,6 +3588,7 @@ function buildStateObservation() {
     ready: ordinaryActionReady(),
     executor: executor.snapshot(),
     nearbyOwnedCraftingTable: Boolean(ownedTableNearby(bot, temporaryCraftingTable)),
+    nearbyCraftingTable: Boolean(bot?.entity && terrainReady && nearbyBlock('crafting_table', 4)),
     shelter: !bot?.entity || (rememberedShelter?.dimension && rememberedShelter.dimension !== String(bot.game?.dimension || ''))
       ? null
       : rememberedShelter,

@@ -735,7 +735,7 @@ function dropFailureState(ctx, position) {
 async function stepForward(ctx, position) {
   checkInterrupted(ctx);
   if (typeof ctx.walkOnce !== 'function') return 'unreachable';
-  const outcome = await ctx.walkOnce(position.x, position.y, position.z, 1, 8000);
+  const outcome = await ctx.walkOnce(position.x, position.y, position.z, 0, 8000);
   checkInterrupted(ctx);
   if (outcome === 'cancelled') throw new Error('挖矿被取消：收到新的指令或连接断开');
   return outcome;
