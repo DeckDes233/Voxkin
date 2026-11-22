@@ -2402,7 +2402,7 @@
           "type": "number",
           "required": false,
           "default": null,
-          "description": "可选最低背包总量；count 是顺路储备目标，有限搜索耗尽且最低量已满足时可继续任务。"
+          "description": "可选最低背包总量。达到后只采触手可及的方块以补足 count，按实际库存回报。"
         },
         {
           "name": "avoid_positions",

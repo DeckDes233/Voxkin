@@ -100,6 +100,27 @@ test('bulk iron accepts the explicit minimum after a finite search, while the st
   }
 });
 
+test('粗铁达到最低库存后顺手挖近矿，不再为储备远行', async () => {
+  const ctx = makeContext();
+  ctx.inventory.raw_iron = 8;
+  const veins = [1, 2, 24].map(x => new Vec3(x, 10, 0));
+  for (const position of veins) {
+    ctx.blocks.set(`${position.x},10,0`, { name: 'iron_ore', position, boundingBox: 'block' });
+  }
+  ctx.bot.findBlocks = () => veins.filter(p => ctx.bot.blockAt(p).name === 'iron_ore');
+  ctx.collectDrops = async () => { ctx.inventory.raw_iron++; };
+  ctx.travelToBlock = async () => assert.fail('满足最低库存后不应向远处矿点寻路');
+  ctx.exploreResource = async () => assert.fail('满足最低库存后不应换区');
+  const args = { block: 'iron_ore', count: 24, minimum_count: 9 };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await skills.mine_collect.handler(args, ctx);
+    assert.equal(result.status, 'succeeded');
+    assert.equal(result.data.inventory_count, 10);
+    assert.equal(result.data.reserve_met, false);
+  }
+  assert.deepEqual(ctx.digs.map(p => p.x), [1, 2]);
+});
+
 test('换区采矿排除之前低氧的矿点，继续采集其他候选', async () => {
   const ctx = makeContext({ position: { x: 20, y: 10, z: 0 } });
   const dangerous = new Vec3(0, 10, 0), safe = new Vec3(21, 10, 0);

@@ -4,7 +4,7 @@ function searchState() {
   return { steps: 0, heading: Math.random() * Math.PI * 2, scanned: false, excluded: new Set(), visited: new Set() };
 }
 
-export async function findBlocksWithExploration(ctx, ids, range, count, scanOverride = null, state = searchState()) {
+export async function findBlocksWithExploration(ctx, ids, range, count, scanOverride = null, state = searchState(), localOnly = null) {
   const bot = ctx.bot;
   const scan = () => {
     const positions = scanOverride
@@ -21,7 +21,7 @@ export async function findBlocksWithExploration(ctx, ids, range, count, scanOver
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     check();
     const positions = scan();
-    if (positions.length) return positions;
+    if (positions.length || localOnly?.()) return positions;
     if (attempts === 1) break;
     if (typeof bot.waitForChunksToLoad === 'function') {
       await Promise.race([bot.waitForChunksToLoad().catch(() => {}), ctx.sleep(3000)]);
@@ -32,6 +32,7 @@ export async function findBlocksWithExploration(ctx, ids, range, count, scanOver
   if (typeof ctx.exploreResource !== 'function') return [];
   while (state.steps < 5) {
     check();
+    if (localOnly?.()) return [];
     const outcome = await ctx.exploreResource(state.steps++, state.heading, state);
     check();
     if (outcome === 'cancelled' || outcome === 'stopped') {
@@ -56,10 +57,10 @@ export async function findBlocksWithExploration(ctx, ids, range, count, scanOver
 }
 
 // 一次动作共用探索预算；目标消失、走不到或采完后继续搜，不重试同一坐标。
-export async function* resourceCandidates(ctx, ids, range, count, scanOverride = null, selectPosition = null) {
+export async function* resourceCandidates(ctx, ids, range, count, scanOverride = null, selectPosition = null, localOnly = null) {
   const state = searchState();
   while (state.excluded.size < 512) {
-    const positions = await findBlocksWithExploration(ctx, ids, range, count, scanOverride, state);
+    const positions = await findBlocksWithExploration(ctx, ids, range, count, scanOverride, state, localOnly);
     if (!positions.length) return;
     const candidates = positions.filter((position) => !state.excluded.has(`${position.x},${position.y},${position.z}`));
     if (!candidates.length) return;

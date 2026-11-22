@@ -11,13 +11,13 @@ A real-time voice companion and autonomous-action prototype for Minecraft Java 1
 
 A persistent `GoalSupervisor` selects actions using inventory, environment and dimension observations and reconciles action receipts. Current stage policies are rule based, with resource reserves, village supplies, iron-golem harvesting and group-threat assessment implemented.
 
-This summary uses evidence through **October 28, 2026**. Documentation was reorganized on **November 4, 2026**; no new live test is implied.
+See the [November 22 headless Paper test](docs/evidence/HEADLESS_S3_20261122.md) for the latest live results.
 
 | Area | Evidence boundary |
 | --- | --- |
 | Conversation, TTS/STT and game bridge | Implemented; engines and models require local configuration. [Benchmarks](docs/BENCHMARK_RESULTS.md) distinguish real APIs from the local test LLM |
 | S0–S2 | Fresh-world passes recorded; recent S2 passes cover daytime preparation, not actual overnight sleep or three-night survival |
-| S3 | Incomplete; subsequent recovery runs encountered Bridge exceptions and V8 fatal exits. Low-oxygen recovery still needs live verification |
+| S3 | Collected 12 raw iron and reached the stage time limit while waiting for daylight to gather wood. The reserve collection receipt passed a live retest. Low-oxygen recovery awaits verification |
 | S4–S6, village supplies, iron-golem harvesting | Implementation and offline tests exist; no recorded live pass |
 | Skills | 67 skills, 66 model tools exposed by Core (excluding `chat`); see [catalog](docs/SKILLS.md) |
 | Fabric audio mod | Builds; real-client playback and spatial audio remain unverified |
