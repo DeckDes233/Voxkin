@@ -416,11 +416,15 @@ class GoalSupervisor:
                     elif step.tool == "mine_collect" and resource in {*S3_OVERWORLD_WOOD_LOGS, "wood_log"}:
                         context = _s3_wood_search_context(state) or "unknown"
                         method_key = f"s3:wood_search:{context}:{resource}"
+                        if resource == "wood_log":
+                            step = replace(step, arguments={**step.arguments, "surface_wood": True})
+                            if self._method_failure_count(method_key):
+                                step, method_key = self._expand_wood_search(step, state, method_key)
                     else:
                         method_key = f"s3:{step.tool}:{resource}"
                     if step.tool == "strip_mine":
                         method_key = f"s3:ore_expose:region{int(self.state.get('s3_ore_regions', 0))}:{int(self.state.get('s3_ore_expose_used', 0)) + 1}"
-                    elif step.tool == "explore_mining_site":
+                    elif step.tool == "explore_mining_site" and step.verify.get("type") == "s3_mining_relocation":
                         method_key = f"s3:ore_relocate:{int(self.state.get('s3_ore_regions', 0))}"
                 elif self.goal.stage == "S4":
                     preflight_ready, preflight_step = choose_s4_preflight_action(state, self.state)
@@ -842,7 +846,9 @@ class GoalSupervisor:
         status: str,
         data: dict[str, Any],
     ) -> tuple[bool, str]:
-        if (self.goal.stage, condition.get("type")) in {("S3", "s3_mining_relocation"), ("S2", "s2_wool_relocation")}:
+        if (self.goal.stage, condition.get("type")) in {
+            ("S3", "s3_mining_relocation"), ("S3", "s3_wood_relocation"), ("S2", "s2_wool_relocation")
+        }:
             observation = _fresh_terminal_observation(pending, data)
             if status != "succeeded" or pending.get("receipt_confirmed") is not True or observation is None or not _fresh_terminal_state(pending, status, state):
                 return False, "换矿区缺少成功回执及同 session 新鲜观察"
@@ -1214,9 +1220,11 @@ class GoalSupervisor:
                 and pending.get("receipt_confirmed") is True):
             self.state["s3_relocation_surface_return_used"] = True
         if self.goal.stage == "S3" and pending.get("tool") == "explore_mining_site":
-            self.state["s3_relocation_failed"] = True
+            wood = (pending.get("expected_condition") or {}).get("type") == "s3_wood_relocation"
+            if not wood:
+                self.state["s3_relocation_failed"] = True
             attempted = (data.get("relocation") or {}).get("attempted_positions") or data.get("attempted_positions") or []
-            ledger = self.state.setdefault("s3_ore_avoid_positions", [])
+            ledger = self.state.setdefault("s3_wood_avoid_positions" if wood else "s3_ore_avoid_positions", [])
             for position in attempted:
                 if isinstance(position, dict) and all(isinstance(position.get(a), (int, float)) and math.isfinite(position[a]) for a in "xyz"):
                     ledger.append({a: float(position[a]) for a in "xyz"})
@@ -1880,7 +1888,8 @@ class GoalSupervisor:
             self.state["s2_wool_search_region"] = int(self.state.get("s2_wool_search_region", 0)) + 1
         if self.goal.stage == "S3" and str(pending.get("method_key") or "").startswith("s3:ore_return_surface:"):
             self.state["s3_relocation_surface_return_used"] = True
-        if self.goal.stage == "S3" and pending.get("tool") == "explore_mining_site":
+        if (self.goal.stage == "S3" and pending.get("tool") == "explore_mining_site"
+                and (pending.get("expected_condition") or {}).get("type") != "s3_wood_relocation"):
             self.state["s3_ore_regions"] = int(self.state.get("s3_ore_regions", 0)) + 1
             self.state.pop("s3_relocation_failed", None)
             self.state.pop("s3_relocation_surface_return_used", None)
@@ -2009,6 +2018,21 @@ class GoalSupervisor:
             method_failures = counters.get("method_failures")
             if not isinstance(method_failures, dict):
                 counters["method_failures"] = {}
+
+    def _expand_wood_search(self, step: StepSpec, state: dict, local_key: str) -> tuple[StepSpec, str]:
+        wide_key = f"{local_key}:wide"
+        if not self._method_failure_count(wide_key):
+            return replace(step, arguments={**step.arguments, "range": 128}), wide_key
+        position = state["position"]
+        avoid = self.state.setdefault("s3_wood_avoid_positions", [])
+        if not any(math.hypot(p["x"] - position["x"], p["z"] - position["z"]) < 8 for p in avoid):
+            avoid.append({axis: position[axis] for axis in "xyz"})
+        del avoid[:-128]
+        relocation = StepSpec("离开已搜索的林木区域，寻找新的干燥落脚点", "explore_mining_site",
+                              {"min_distance": 40, "avoid_positions": list(avoid)},
+                              {"type": "s3_wood_relocation", "min_distance": 40},
+                              retries=1, timeout_s=180, effect_class="replan")
+        return relocation, f"{local_key}:relocate"
 
     def _method_failure_count(self, method_key: str) -> int:
         counters = self.state.get("counters") or {}

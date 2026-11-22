@@ -9,6 +9,9 @@
 //   如果 ctx 没有 craftItem，就只能在返回里说明缺什么。
 
 import { findBlocksWithExploration, resourceCandidates } from '../resource_search.js';
+import { dryMiningFooting, miningRouteExclusion } from './exploration.js';
+import { scanSurfaceLogs } from '../surface_wood_scan.js';
+import { setImmediate as yieldToGame } from 'node:timers/promises';
 
 // 掉落在这一格之外的掉落物就算离得太远，捡不到。
 const COLLECT_DROP_RANGE = 6;
@@ -17,6 +20,7 @@ const MINE_REACH = 4.5;
 // 挖矿途中血量低于这个值就中止。
 const LOW_HEALTH = 8;
 const MINE_HOSTILE_RADIUS = 8;
+const SURFACE_HEIGHT_OFFSETS = [0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8];
 // 火把间隔：每挖多少格放一个。
 const TORCH_INTERVAL = 8;
 // 钻石矿的两种 id，普通钻石矿在深层是 deepslate_diamond_ore。
@@ -1050,6 +1054,101 @@ function scanOre(ctx, name, radius = 8) {
 
 // 挖指定方块：换工具 → 挖 → 等掉落物 → 走过去真的捡起来 → 核对背包数量。
 // 三类失败都会说清楚：挖完没掉、掉落物掉进岩浆或水里、距离太远。
+function surfaceFooting(bot, column) {
+  for (const dy of SURFACE_HEIGHT_OFFSETS) {
+    const feet = column.offset(0, dy, 0);
+    if (bot.blockAt(feet, false)?.skyLight > 0 && dryMiningFooting(bot, feet)) return feet;
+  }
+  return null;
+}
+
+async function selectSurfaceTrunk(ctx, positions) {
+  const bot = ctx.bot;
+  const base = bot.entity.position.floored();
+  const trunks = new Map();
+  const samples = new Map();
+  for (const p of positions) {
+    const key = `${p.x},${p.z}`;
+    if (!trunks.has(key) || trunks.get(key).y > p.y) trunks.set(key, p);
+  }
+  let best;
+  let bestCost = Infinity;
+  for (const trunk of trunks.values()) {
+    await yieldToGame();
+    checkInterrupted(ctx);
+    const dx = trunk.x - base.x, dz = trunk.z - base.z;
+    const distance = Math.hypot(dx, dz);
+    let cost = base.distanceTo(trunk);
+    // 每十二格采样一次已加载地形。同一批候选共用采样，优先选择干路较连续的树。
+    for (let step = 12; step < distance && cost < bestCost; step += 12) {
+      const ratio = step / distance;
+      const column = base.offset(Math.round(dx * ratio), Math.round((trunk.y - base.y) * ratio), Math.round(dz * ratio));
+      const key = `${column.x},${column.y},${column.z}`;
+      if (!samples.has(key)) samples.set(key, Boolean(surfaceFooting(bot, column)));
+      if (!samples.get(key)) cost += 24;
+    }
+    if (cost < bestCost) {
+      best = trunk;
+      bestCost = cost;
+    }
+  }
+  return best;
+}
+
+async function walkToSurfaceLog(target, ctx) {
+  const { bot } = ctx;
+  const horizontal = p => Math.hypot(target.x - p.x, target.z - p.z);
+  // 长距离整段寻路经常在规划中超时。沿朝向分段找日照干地，每段核对实际位移。
+  for (let segment = 0; segment < 10 && horizontal(bot.entity.position) > 24; segment++) {
+    const origin = bot.entity.position.clone();
+    const distance = horizontal(origin);
+    const heading = Math.atan2(target.z - origin.z, target.x - origin.x);
+    let advanced = false;
+    for (const angle of [heading, heading + Math.PI / 5, heading - Math.PI / 5]) {
+      checkInterrupted(ctx);
+      checkHealth(ctx);
+      checkNearbyHostiles(ctx);
+      const column = origin.floored().offset(Math.round(16 * Math.cos(angle)), 0, Math.round(16 * Math.sin(angle)));
+      const waypoint = surfaceFooting(bot, column);
+      if (!waypoint) continue;
+      const outcome = await ctx.walkOnce(waypoint.x, waypoint.y, waypoint.z, 2, 12000);
+      if (outcome === 'cancelled' || outcome === 'stopped') return outcome;
+      if (horizontal(bot.entity.position) <= distance - 4) {
+        advanced = true;
+        break;
+      }
+    }
+    if (!advanced) break;
+  }
+  checkInterrupted(ctx);
+  checkHealth(ctx);
+  checkNearbyHostiles(ctx);
+  return ctx.travelToBlock(target, 30000);
+}
+
+async function approachSurfaceLog(target, ctx) {
+  ctx.reportProgress?.('searching', '前往地表原木', 0, { surface_trunk: { x: target.x, y: target.y, z: target.z } });
+  const movements = ctx.bot.pathfinder?.movements;
+  if (!movements) return walkToSurfaceLog(target, ctx);
+  const previous = {
+    exclusionAreasStep: movements.exclusionAreasStep,
+    allow1by1towers: movements.allow1by1towers,
+    allowParkour: movements.allowParkour,
+  };
+  const pathfinder = ctx.bot.pathfinder;
+  const tickTimeout = pathfinder.tickTimeout;
+  if (Number.isFinite(tickTimeout)) pathfinder.tickTimeout = Math.min(tickTimeout, 10);
+  movements.allow1by1towers = false;
+  movements.allowParkour = false;
+  movements.exclusionAreasStep = [...(previous.exclusionAreasStep || []), block => miningRouteExclusion(ctx.bot, block)];
+  try {
+    return await walkToSurfaceLog(target, ctx);
+  } finally {
+    pathfinder.tickTimeout = tickTimeout;
+    Object.assign(movements, previous);
+  }
+}
+
 async function mineCollect(args, ctx) {
   const bot = ctx.bot;
   requireConnected(ctx);
@@ -1062,7 +1161,7 @@ async function mineCollect(args, ctx) {
   if (!Number.isInteger(minimum) || minimum < 1 || minimum > want) throw new Error('minimum_count 必须是 1 到 count 的整数');
   const avoided = Array.isArray(args.avoid_positions) ? args.avoid_positions : [];
   if (avoided.some(p => !p || !['x', 'y', 'z'].every(axis => Number.isFinite(p[axis])))) throw new Error('avoid_positions 必须是有效坐标列表');
-  const range = clampInt(args.range, 32, 8, 64);
+  const range = clampInt(args.range, 32, 8, blockName === 'wood_log' ? 128 : 64);
   const oreBase = blockName.replace(/^deepslate_/, '');
   const family = blockName === 'wood_log' ? OVERWORLD_LOGS
     : ['iron_ore', 'coal_ore', 'diamond_ore'].includes(oreBase) ? [oreBase, `deepslate_${oreBase}`]
@@ -1094,9 +1193,22 @@ async function mineCollect(args, ctx) {
   // 满足硬需求后只取手边的储备，把远程寻路的时间留给下一步。
   const reserveOnly = () => minimum < want && countOwned() >= minimum;
   const withinReach = () => args.within_reach === true || reserveOnly();
-  const scan = (excludedCount) => {
+  const surfaceWood = blockName === 'wood_log' && args.surface_wood === true;
+  const startY = bot.entity.position.y;
+  const failedTrunks = new Set();
+  // 只在地表补木时筛选；在区块扫描阶段就排除深处构件，避免它们占满最近候选。
+  const surfaceLog = (position) => position.y >= startY - 16 && position.y <= startY + 32 &&
+    !failedTrunks.has(`${position.x},${position.z}`) &&
+    CARDINAL_HEADINGS.some(({ x, z }) =>
+      (bot.blockAt(position.offset(x, 0, z), false)?.skyLight ?? 0) > 0);
+  const scan = async (excludedCount) => {
     const nearby = withinReach();
-    const positions = bot.findBlocks({ matching: ids, maxDistance: nearby ? Math.ceil(MINE_REACH) : range, count: avoided.length ? 512 : Math.max(need * 4, 8) + excludedCount })
+    const count = avoided.length ? 512 : Math.max(need * 4, surfaceWood && !nearby ? 128 : 8) + excludedCount;
+    const matches = surfaceWood && !nearby && bot.world?.getColumn
+      ? await scanSurfaceLogs(bot, targetEntries, range, count, startY, surfaceLog, () => checkInterrupted(ctx))
+      : bot.findBlocks({ matching: ids, maxDistance: nearby ? Math.ceil(MINE_REACH) : range, count,
+        ...(surfaceWood ? { useExtraInfo: block => surfaceLog(block.position) } : {}) });
+    const positions = matches
       .filter(p => !nearby || distanceBetween(bot.entity.position, p) <= MINE_REACH)
       .filter(p => !avoided.some(danger => Math.hypot(p.x - danger.x, p.z - danger.z) < 8));
     if (blockName.endsWith('_log') || blockName.endsWith('_stem')) {
@@ -1106,6 +1218,7 @@ async function mineCollect(args, ctx) {
     return positions;
   };
   const chooseCandidate = (positions) => {
+    if (surfaceWood && !lastMinedPosition) return selectSurfaceTrunk(ctx, positions);
     const origin = lastMinedPosition || bot.entity.position;
     return positions.sort((a, b) => {
       const aAdjacent = lastMinedPosition && Math.abs(a.x - lastMinedPosition.x) + Math.abs(a.y - lastMinedPosition.y) + Math.abs(a.z - lastMinedPosition.z) === 1;
@@ -1128,11 +1241,12 @@ async function mineCollect(args, ctx) {
     const distance = distanceBetween(bot.entity.position, position);
     if (distance > MINE_REACH) {
       if (withinReach()) continue;
-      const outcome = await ctx.travelToBlock(position, 30000);
+      const outcome = surfaceWood ? await approachSurfaceLog(position, ctx) : await ctx.travelToBlock(position, 30000);
       checkInterrupted(ctx);
       if (outcome === 'cancelled' || outcome === 'stopped') throw new Error('采集被取消：收到新的指令或连接断开');
       if (outcome === 'low_health') throw new Error(`血量不足，撤退中止采集（血量 ${bot.health}）`);
       if (outcome !== 'reached') {
+        if (surfaceWood) failedTrunks.add(`${position.x},${position.z}`);
         failures.push(`${formatPosition(position)} 距离 ${distance.toFixed(1)} 格，太远走不过去`);
         continue;
       }
@@ -1634,9 +1748,10 @@ export const skills = {
       { name: 'count', type: 'number', required: true, default: 1, description: '背包掉落物总目标，范围 1-2304，可跨多堆；已有数量算在内。' },
       { name: 'minimum_count', type: 'number', required: false, default: null, description: '可选最低背包总量。达到后只采触手可及的方块以补足 count，按实际库存回报。' },
       { name: 'within_reach', type: 'boolean', required: false, default: false, description: '只采挖掘距离内的方块，候选耗尽即回报。' },
+      { name: 'surface_wood', type: 'boolean', required: false, default: false, description: '地表补木时仅搜索接近出发高度且相邻空间有天空光的主世界原木。' },
       { name: 'avoid_positions', type: 'array', required: false, default: [], description: '已确认的危险坐标；跳过其水平八格范围内的矿点，换区后也不返回危险点。',
         items: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } }, required: ['x', 'y', 'z'], additionalProperties: false } },
-      { name: 'range', type: 'number', required: false, default: 32, description: '搜索目标的半径，8-64 格。' },
+      { name: 'range', type: 'number', required: false, default: 32, description: '搜索已加载方块的半径，8-64 格；wood_log 可扩大到 128 格。' },
     ],
     handler: mineCollect,
   },

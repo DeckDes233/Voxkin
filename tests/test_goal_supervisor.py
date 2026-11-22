@@ -1619,7 +1619,7 @@ async def test_legacy_s3_terminal_stripmine_migrates_to_fresh_ore_collection(tmp
 
     assert result["status"] == "done", result
     assert calls[0] == ("goto", {"x": -5, "y": 73, "z": 151})
-    assert calls[1] == ("mine_collect", {"block": "wood_log", "count": 1, "range": 64})
+    assert calls[1] == ("mine_collect", {"block": "wood_log", "count": 1, "range": 64, "surface_wood": True})
     assert ("mine_collect", {"block": "iron_ore", "count": 9, "range": 64}) in calls
     assert all(tool != "strip_mine" for tool, _ in calls)
     persisted = store.load_goal_state(task.id)
@@ -1673,6 +1673,46 @@ async def test_s3_confirmed_wood_search_failure_persists_context_and_budget(tmp_
     ready, next_step = choose_s3_preflight_action(state, supervisor.state)
     assert not ready and next_step is not None
     assert next_step.arguments["block"] == "wood_log"
+
+
+async def test_s3_exhausted_wood_search_expands_then_relocates_before_retry(tmp_path):
+    store = TaskStore(tmp_path / "wood.db")
+    store.initialize()
+    task = store.create_task("S3", "S3")
+    state = modern_state(food=20, inventory={
+        "porkchop": 8, "iron_pickaxe": 1, "iron_sword": 1, "bucket": 1, "iron_ingot": 1,
+        "crafting_table": 1, "oak_planks": 2,
+    }, shelter={"inside": False})
+    calls = []
+
+    async def dispatch(tool, arguments, timeout_s=0, **kwargs):
+        calls.append((tool, arguments))
+        state["revision"] += 1
+        data = {}
+        if tool == "explore_mining_site":
+            origin = state["position"]
+            assert origin in arguments["avoid_positions"]
+            state["position"] = {**origin, "x": origin["x"] + arguments["min_distance"]}
+            data["relocation"] = {"origin": origin, "destination": state["position"]}
+        elif tool == "mine_collect" and len(calls) <= 2:
+            raise ActionError("附近没有原木", status="blocked", receipt_confirmed=True,
+                              action_id=kwargs["action_id"], data={"observation": dict(state)})
+        elif tool == "mine_collect":
+            state["inventory"]["oak_log"] = 2
+        elif tool == "craft" and arguments["item"] == "oak_planks":
+            state["inventory"].update(oak_planks=10, oak_log=0)
+        elif tool == "craft" and arguments["item"] == "shield":
+            state["inventory"]["shield"] = 1
+        data["observation"] = dict(state)
+        return ActionResult(action_id=kwargs["action_id"], ok=True, status="succeeded", detail="完成", data=data)
+
+    supervisor = GoalSupervisor(GOALS["S3"], store, dispatch, lambda: state)
+    result = await supervisor.run(task.id)
+    assert result["status"] == "done", result
+    assert [args.get("range") for _, args in calls[:4]] == [64, 128, None, 64]
+    assert all(args["surface_wood"] for tool, args in calls if tool == "mine_collect")
+    assert calls[2][0] == "explore_mining_site"
+    assert not supervisor.state.get("s3_ore_regions")
 
 
 @pytest.mark.asyncio

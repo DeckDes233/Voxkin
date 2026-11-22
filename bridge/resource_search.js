@@ -7,9 +7,9 @@ function searchState() {
 export async function findBlocksWithExploration(ctx, ids, range, count, scanOverride = null, state = searchState(), localOnly = null) {
   const bot = ctx.bot;
   const wait = ctx.actionToken?.wait ?? (ms => ctx.sleep(ms));
-  const scan = () => {
+  const scan = async () => {
     const positions = scanOverride
-      ? scanOverride(state.excluded.size)
+      ? await scanOverride(state.excluded.size)
       : bot.findBlocks({ matching: ids, maxDistance: range, count: count + state.excluded.size });
     return positions.filter((p) => !state.excluded.has(`${p.x},${p.y},${p.z}`));
   };
@@ -21,7 +21,8 @@ export async function findBlocksWithExploration(ctx, ids, range, count, scanOver
   state.scanned = true;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     check();
-    const positions = scan();
+    const positions = await scan();
+    check();
     if (positions.length || localOnly?.()) return positions;
     if (attempts === 1) break;
     if (typeof bot.waitForChunksToLoad === 'function') {
@@ -51,7 +52,8 @@ export async function findBlocksWithExploration(ctx, ids, range, count, scanOver
       await Promise.race([bot.waitForChunksToLoad().catch(() => {}), wait(3000)]);
       check();
     }
-    const positions = scan();
+    const positions = await scan();
+    check();
     if (positions.length) return positions;
   }
   return [];
@@ -66,7 +68,7 @@ export async function* resourceCandidates(ctx, ids, range, count, scanOverride =
     const candidates = positions.filter((position) => !state.excluded.has(`${position.x},${position.y},${position.z}`));
     if (!candidates.length) return;
     if (selectPosition) {
-      const position = selectPosition(candidates);
+      const position = await selectPosition(candidates);
       const key = `${position.x},${position.y},${position.z}`;
       if (state.excluded.size >= 512) return;
       state.excluded.add(key);

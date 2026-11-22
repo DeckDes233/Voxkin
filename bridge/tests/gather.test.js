@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { skills } from '../skills/gather.js';
+import { scanSurfaceLogs } from '../surface_wood_scan.js';
 
 class Vec3 {
   constructor(x, y, z) {
@@ -17,6 +18,9 @@ class Vec3 {
   distanceTo(other) {
     return Math.hypot(this.x - other.x, this.y - other.y, this.z - other.z);
   }
+
+  clone() { return new Vec3(this.x, this.y, this.z); }
+  floored() { return new Vec3(Math.floor(this.x), Math.floor(this.y), Math.floor(this.z)); }
 }
 
 function makeContext({ position = { x: 0, y: 10, z: 0 }, health = 20, blocks = new Map() } = {}) {
@@ -139,12 +143,13 @@ test('wood_log collects mixed available species and verifies their combined actu
     ctx.registry.items[40 + index] = { id: 40 + index, name };
     ctx.blocks.set(`${index},10,0`, { name, position: new Vec3(index, 10, 0), boundingBox: 'block' });
   }
-  ctx.bot.findBlocks = ({ matching }) => {
+  ctx.bot.findBlocks = ({ matching, maxDistance }) => {
     assert.deepEqual(matching, [20, 21]);
+    assert.equal(maxDistance, 128);
     return [new Vec3(0, 10, 0), new Vec3(1, 10, 0)];
   };
   ctx.collectDrops = async (_range, name) => { ctx.inventory[name] = (ctx.inventory[name] || 0) + 1; };
-  const result = await skills.mine_collect.handler({ block: 'wood_log', count: 2 }, ctx);
+  const result = await skills.mine_collect.handler({ block: 'wood_log', count: 2, range: 128 }, ctx);
   assert.equal(result.status, 'succeeded');
   assert.deepEqual(ctx.inventory, { spruce_log: 1, birch_log: 1 });
   assert.equal(ctx.digs.length, 2);
@@ -157,6 +162,76 @@ test('iron search accepts deepslate iron even above zero and counts raw iron', a
   ctx.bot.findBlocks = ({ matching }) => { assert.deepEqual(matching, [1, 20]); return [new Vec3(0, 10, 0)]; };
   ctx.collectDrops = async (_range, name) => { assert.equal(name, 'raw_iron'); ctx.inventory.raw_iron = 1; };
   assert.equal((await skills.mine_collect.handler({ block: 'iron_ore', count: 1 }, ctx)).status, 'succeeded');
+});
+
+test('地表补木先过滤深层和无天空光的原木，同一不可达树干只走一次', async () => {
+  const ctx = makeContext({ position: { x: 0, y: 68, z: 0 } });
+  ctx.registry.blocksByName.oak_log = { id: 20, name: 'oak_log', drops: [40] };
+  ctx.registry.items[40] = { id: 40, name: 'oak_log' };
+  const logs = [[0, -1], [1, 67], [12, 69], [12, 70], [93, 63]].map(([x, y]) => {
+    const position = new Vec3(x, y, 0);
+    const log = { name: 'oak_log', position, boundingBox: 'block' };
+    ctx.blocks.set(`${x},${y},0`, log);
+    ctx.blocks.set(`${x},${y},1`, { skyLight: x === 1 ? 0 : 14 });
+    return log;
+  });
+  const islandTree = { name: 'oak_log', position: new Vec3(0, 68, 60), boundingBox: 'block' };
+  logs.push(islandTree);
+  ctx.blocks.set('0,68,60', islandTree);
+  ctx.blocks.set('0,68,61', { skyLight: 15 });
+  ctx.bot.findBlocks = ({ useExtraInfo }) => logs.filter(useExtraInfo).map(block => block.position);
+  const visits = [];
+  const waypoints = [];
+  for (const x of [16, 24, 32, 36, 48, 60, 64, 72, 80, 84]) {
+    for (const y of [68, 69]) {
+      ctx.blocks.set(`${x},${y},0`, { name: 'air', boundingBox: 'empty', skyLight: 15, position: new Vec3(x, y, 0) });
+    }
+  }
+  const walk = ctx.walkOnce;
+  ctx.walkOnce = async (...args) => { waypoints.push(args[0]); return walk(...args); };
+  ctx.travelToBlock = async position => {
+    visits.push(position.x);
+    if (position.x !== 93) return 'unreachable';
+    ctx.bot.entity.position = position.offset(0, 0, 1);
+    return 'reached';
+  };
+  ctx.collectDrops = async () => { ctx.inventory.oak_log = 1; };
+  const result = await skills.mine_collect.handler({ block: 'wood_log', count: 1, range: 128, surface_wood: true }, ctx);
+  assert.equal(result.status, 'succeeded');
+  assert.deepEqual(visits, [12, 93]);
+  assert.deepEqual(waypoints, [16, 32, 48, 64, 80]);
+  assert.equal(ctx.inventory.oak_log, 1);
+});
+
+test('分批搜索只从已加载区块取符合半径与高度的原木', async () => {
+  const Chunk = (await import('prismarine-chunk')).default('1.21.1');
+  const registry = (await import('prismarine-registry')).default('1.21.1');
+  const column = new Chunk();
+  const oak = registry.blocksByName.oak_log;
+  for (const y of [30, 64, 67, 69, 120]) column.setBlockStateId(new Vec3(15, y, 0), oak.minStateId);
+  const bot = { entity: { position: new Vec3(0, 68, 0) }, world: {
+    getColumn: (x, z) => x === -1 && z === 0 ? column : null,
+  } };
+  const found = await scanSurfaceLogs(bot, [oak], 64, 1, 68, p => p.y < 69, () => {});
+  assert.deepEqual(found, [new Vec3(-1, 67, 0)]);
+  assert.deepEqual(await scanSurfaceLogs(bot, [oak], 2, 10, 68, () => true, () => {}), [
+    new Vec3(-1, 67, 0), new Vec3(-1, 69, 0),
+  ]);
+});
+
+test('密集原木搜索期间事件循环可接收取消', async () => {
+  const section = { palette: [1], get: () => 1 };
+  const column = { minY: -64, sections: Array(24).fill(section) };
+  const bot = { entity: { position: new Vec3(0, 68, 0) }, world: { getColumn: () => column } };
+  let cancelled = false;
+  const cancel = setImmediate(() => { cancelled = true; });
+  try {
+    const search = scanSurfaceLogs(bot, [{ minStateId: 1, maxStateId: 1 }], 128, 16, 68,
+      () => false, () => { if (cancelled) throw new Error('已取消'); });
+    await assert.rejects(search, /已取消/);
+  } finally {
+    clearImmediate(cancel);
+  }
 });
 
 test('mining does not destroy ore when held tool cannot harvest its drop', async () => {

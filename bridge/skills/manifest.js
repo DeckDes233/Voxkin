@@ -2045,6 +2045,7 @@ module.exports = {
           description: "可选最低背包总量。达到后只采触手可及的方块以补足 count，按实际库存回报。",
         },
         { name: 'within_reach', type: 'boolean', required: false, default: false, description: '只采挖掘距离内的方块，候选耗尽即回报。' },
+        { name: 'surface_wood', type: 'boolean', required: false, default: false, description: '地表补木时仅搜索接近出发高度且相邻空间有天空光的主世界原木。' },
         {
           name: 'avoid_positions',
           type: 'array',
@@ -2058,7 +2059,7 @@ module.exports = {
           type: 'number',
           required: false,
           default: 32,
-          description: "搜索目标的半径，8-64 格。",
+          description: "搜索已加载方块的半径，8-64 格；wood_log 可扩大到 128 格。",
         },
       ],
       preconditions: "桥接已连接且 bot 已进入世界。",
