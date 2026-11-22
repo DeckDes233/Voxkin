@@ -17,11 +17,14 @@ def prepare_late_action(step: StepSpec | None, index: int | None, state: dict, l
     ledger.pop("late_game_wait_reason", None)
     if step is None:
         return None, index
-    combat = step.tool in {"hunt_animal", "hunt_material", "hunt_enderman", "raid_fortress", "collect_blaze_rods", "fight_dragon"}
-    if combat and isinstance(state.get("health"), (int, float)) and state["health"] <= 10:
+    needs_health = step.tool in {
+        "hunt_animal", "hunt_material", "hunt_enderman", "raid_fortress", "collect_blaze_rods", "fight_dragon",
+        "collect_obsidian", "mine_collect", "safe_descend", "strip_mine", "explore_mining_site",
+    }
+    if needs_health and isinstance(state.get("health"), (int, float)) and state["health"] <= 10:
         inventory = state.get("inventory") or {}
         if state.get("food", 20) < 20 and any(inventory_count(inventory, name) for name in FOOD_ITEMS):
-            return StepSpec("战斗前进食以恢复血量", "eat_if_hungry", {"threshold": 20, "count": 0},
+            return StepSpec("先吃一份口粮恢复血量", "eat_if_hungry", {"threshold": 20, "count": 0},
                             {"type": "food", "min": min(20, math.floor(state["food"]) + 1)}, retries=2, timeout_s=60, effect_class="replan"), None
         ledger["late_game_wait_reason"] = "血量不足，先由安全控制撤离并等待恢复"
         return None, None

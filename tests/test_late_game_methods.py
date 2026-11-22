@@ -181,6 +181,19 @@ def test_s6_end_dimension_does_not_hunt_overworld_resources_after_arrows_are_spe
     assert choose_s6_action(state, {}, {"ender_dragon_killed"})[0].tool == "return_home"
 
 
+def test_s5_mining_waits_for_recovery_without_spending_another_mining_attempt():
+    state = world(porkchop=1, diamond_pickaxe=1, water_bucket=1)
+    state.update(health=8, food=18)
+    step = StepSpec("采集黑曜石", "collect_obsidian", {"count": 2}, {})
+    ledger = {}
+    meal, _ = prepare_late_action(step, 4, state, ledger)
+    assert meal.tool == "eat_if_hungry"
+    state["food"] = 20
+    assert prepare_late_action(step, 4, state, ledger) == (None, None)
+    state["health"] = 14
+    assert prepare_late_action(step, 4, state, ledger) == (step, 4)
+
+
 def test_late_combat_eats_and_waits_for_health_before_reengaging():
     state = world("the_nether", cooked_beef=4)
     state.update(health=8, food=15)
