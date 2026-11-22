@@ -41,4 +41,4 @@
 - [Windows 原生崩溃只读分析（2026-10-27）](WINDOWS_NATIVE_ANALYSIS_20261027.md)
 
 - [推送前离线复核（2026-11-11）](PRE_PUSH_REVIEW_20261111.md)
-- [无头 Paper 验证与 S3 采铁回执（2026-11-22）](HEADLESS_S3_20261122.md)
+- [无头 Paper 实测：S3 采铁、采木、补给与采矿中查询背包（2026-11-22）](HEADLESS_S3_20261122.md)
