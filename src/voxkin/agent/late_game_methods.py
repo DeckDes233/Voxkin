@@ -6,7 +6,7 @@ from typing import Any
 
 from voxkin.agent.goal_methods import (
     FOOD_ITEMS, S3_FUEL_BURN, S3_MINING_PICKAXES, early_craft, early_planks,
-    _s3_needs_surface_route, _s3_return_to_known_surface,
+    _danger_now, _s3_needs_surface_route, _s3_return_to_known_surface,
 )
 from voxkin.agent.goals import inventory_count
 from voxkin.agent.plans import S5_STEPS, S6_STEPS
@@ -35,11 +35,14 @@ def prepare_late_action(step: StepSpec | None, index: int | None, state: dict, l
     if outdoor and str(state.get("dimension") or "").removeprefix("minecraft:") == "overworld" and _s3_needs_surface_route(state):
         ledger.pop("s3_preflight_terminal_reason", None)
         ledger.pop("s3_preflight_wait_reason", None)
-        route = _s3_return_to_known_surface(state, ledger)
+        route = _s3_return_to_known_surface(state, ledger, staged_supply_route=True)
         if route is None:
             ledger["late_game_block_reason"] = ledger.get("s3_preflight_terminal_reason")
             ledger["late_game_wait_reason"] = ledger.get("s3_preflight_wait_reason")
         return route, None
+    if step.tool == "hunt_animal" and state.get("is_day") is False:
+        ledger["late_game_wait_reason"] = "等天亮后再寻找食物，保留狩猎预算"
+        return None, None
     return step, index
 
 
@@ -114,6 +117,17 @@ def choose_s5_action(state: dict[str, Any], ledger: dict[str, Any]) -> tuple[Ste
         return None, None
     supply = sustenance(state, reserve=4)
     if supply:
+        # 地下等天亮补粮时，先用背包现成的材料准备点火器；仍在出发前检查口粮。
+        health = state.get("health")
+        if (supply.tool == "hunt_animal" and _s3_needs_surface_route(state)
+                and state.get("is_day") is False and state.get("food", 0) >= 12
+                and isinstance(health, (int, float)) and health > 10 and not _danger_now(state)
+                and cursor < 6 and not rods and not inventory_count(inventory, "flint_and_steel")):
+            dependency = ingot_dependency(inventory, 1)
+            if dependency and dependency.tool == "smelt_batch":
+                return dependency, None
+            if dependency is None and inventory_count(inventory, "flint"):
+                return S5_STEPS[3], 3
         return supply, None
     if rods:
         return S5_STEPS[9], 9

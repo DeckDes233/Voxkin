@@ -40,6 +40,31 @@ def test_s5_igniter_needs_one_iron_and_uses_non_oak_fuel():
     assert ingot_dependency({"iron_ingot": 1}, 1) is None
 
 
+def test_s5_uses_the_night_underground_for_stationary_preparation_before_hunting():
+    state = world(raw_iron=3, furnace=1, coal=2)
+    state.update(position={"y": -10}, is_day=False, food=17, health=17)
+    step, _ = choose_s5_action(state, {})
+    assert step.tool == "smelt_batch"
+    state["inventory"].update(iron_ingot=1, flint=1)
+    step, _ = choose_s5_action(state, {})
+    assert step.arguments == {"item": "flint_and_steel", "count": 1}
+    state["inventory"]["flint_and_steel"] = 1
+    assert choose_s5_action(state, {})[0].tool == "hunt_animal"
+
+
+def test_late_supply_climbs_in_short_verified_segments_before_dawn():
+    state = world()
+    state.update(position={"x": 0, "y": -10, "z": 0}, is_day=False,
+                 shelter={"position": {"x": 40, "y": 67, "z": 0}, "size": 4})
+    ledger = {}
+    step, _ = prepare_late_action(*choose_s5_action(state, ledger), state, ledger)
+    assert step.tool == "goto" and step.arguments == {"x": 6, "z": 0, "y": -2}
+    assert step.verify["target"] == step.arguments
+    state["position"]["y"] = 53
+    step, _ = prepare_late_action(*choose_s5_action(state, ledger), state, ledger)
+    assert step is None and ledger["late_game_wait_reason"]
+
+
 def test_s6_respects_existing_equipment_eyes_and_recipe_yields():
     state = world(cooked_beef=4, bow=1, arrow=60, feather=1, flint=1)
     step, index = choose_s6_action(state, {}, set())

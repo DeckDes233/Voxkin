@@ -513,7 +513,7 @@ def _s3_needs_surface_route(state: dict[str, Any]) -> bool:
 
 
 def _s3_return_to_known_surface(
-    state: dict[str, Any], goal_state: dict[str, Any]
+    state: dict[str, Any], goal_state: dict[str, Any], *, staged_supply_route: bool = False,
 ) -> StepSpec | None:
     dimension = str(state.get("dimension") or "").strip().lower()
     if dimension not in {"overworld", "minecraft:overworld"}:
@@ -534,11 +534,18 @@ def _s3_return_to_known_surface(
         return None
     horizontal = math.hypot(target["x"] - current["x"], target["z"] - current["z"])
     vertical = target["y"] - current["y"]
-    if horizontal > S3_SURFACE_ROUTE_MAX_HORIZONTAL or vertical < S3_SURFACE_ROUTE_MIN_VERTICAL or vertical > 96:
+    if horizontal > S3_SURFACE_ROUTE_MAX_HORIZONTAL or vertical < S3_SURFACE_ROUTE_MIN_VERTICAL or (vertical > 96 and not staged_supply_route):
         goal_state["s3_preflight_terminal_reason"] = "已知庇护所锚点不在有界返地表路线范围内"
         return None
+    if staged_supply_route and vertical > 16 and not _danger_now(state):
+        # 暗洞白天也可能刷怪。先分段靠近已知出口，临近地表时再按昼夜决定是否外出。
+        scale = min(1.0, 6 / max(1.0, horizontal))
+        waypoint = {axis: round(current[axis] + (target[axis] - current[axis]) * scale) for axis in ("x", "z")}
+        waypoint["y"] = math.floor(current["y"]) + min(8, math.floor(vertical) - 10)
+        return _s3_action("分段向已知庇护所上行补给", "goto", waypoint,
+                          {"type": "position", "target": waypoint, "radius": 3.0}, 90.0)
     if _is_day(state) is not True:
-        goal_state["s3_preflight_wait_reason"] = "夜间留在当前位置，白天再沿已知庇护所路线返回采木"
+        goal_state["s3_preflight_wait_reason"] = "等待白天再沿已知庇护所路线外出补给" if staged_supply_route else "夜间留在当前位置，白天再沿已知庇护所路线返回采木"
         return None
     target_position = {axis: round(target[axis]) for axis in "xyz"}
     target_position["y"] += 1
