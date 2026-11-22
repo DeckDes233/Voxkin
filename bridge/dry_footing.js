@@ -24,6 +24,19 @@ export function miningRouteExclusion(bot, block) {
   return 0;
 }
 
+// 侦察时要给横移和被击退留出一步余地。相邻列下方三格都没有支撑就是悬崖边沿。
+export function besideDrop(bot, position) {
+  for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    let supported = false;
+    for (let dy = 0; dy >= -3; dy--) {
+      const cell = bot.blockAt(position.offset(dx, dy, dz), false);
+      if (cell?.boundingBox === 'block') { supported = true; break; }
+    }
+    if (!supported) return true;
+  }
+  return false;
+}
+
 export function dryMiningFooting(bot, position) {
   const feet = position.floored();
   const ground = bot.blockAt(feet.offset(0, -1, 0));

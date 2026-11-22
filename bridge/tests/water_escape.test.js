@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Vec3 } from 'vec3';
-import { leaveMagmaBlock, netherRouteExclusion } from '../dry_footing.js';
+import { besideDrop, leaveMagmaBlock, netherRouteExclusion } from '../dry_footing.js';
 import { escapeWater, reachShore, waterLike, breathable, avoidWaterScaffolding, allowedDuringWaterEscape } from '../water_escape.js';
 
 const block = (name, box = 'empty', props = {}) => ({ name, boundingBox: box, getProperties: () => props });
@@ -184,4 +184,13 @@ test('气穴旁没有天然岸边时在完整岩壁开一级台阶', async () =>
   });
   assert.equal(await reachShore(f.bot, f.options), true);
   assert.deepEqual(dug, ['22,58,63','22,57,63']);
+});
+test('a scout rejects solid footing beside a deep open shaft and permits a shallow step', () => {
+  const p = new Vec3(2, 90, 2);
+  const terrain = bottom => ({ blockAt(cell) {
+    const ground = cell.x === 3 ? bottom : 89;
+    return { boundingBox: cell.y <= ground ? 'block' : 'empty' };
+  } });
+  assert.equal(besideDrop(terrain(26), p), true);
+  assert.equal(besideDrop(terrain(88), p), false);
 });

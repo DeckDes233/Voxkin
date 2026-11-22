@@ -1,5 +1,5 @@
 // 下界模块：黑曜石下界门、维度坐标换算、堡垒探索、烈焰棒收集。
-import { dryMiningFooting, netherRouteExclusion } from '../dry_footing.js';
+import { besideDrop, dryMiningFooting, netherRouteExclusion } from '../dry_footing.js';
 // 契约见 docs/plans/SKILL_MODULE_CONTRACT.md；对应路线图 M7.1-M7.4。
 //
 // 约束：
@@ -1087,7 +1087,7 @@ function nextSurveyPoint(ctx, route) {
       const p = here.offset(Math.round(dx * distance), 0, Math.round(dz * distance));
       for (const dy of [0,1,-1,2,-2,3,-3,4,-4,5,-5,6,-6,8,-8,10,-10,12,-12]) {
         const stand = p.offset(0, dy, 0);
-        if (!dryMiningFooting(bot, stand) || netherRouteExclusion(bot, {position: stand})) continue;
+        if (!dryMiningFooting(bot, stand) || netherRouteExclusion(bot, {position: stand}) || besideDrop(bot, stand)) continue;
         const clearance = Math.min(...route.surveyed.map(v => Math.hypot(v.x - stand.x, v.z - stand.z)));
         if (clearance >= 4) candidates.push({stand, clearance});
         break;
@@ -1140,7 +1140,8 @@ async function raidFortress(args, ctx) {
   const bot = botOf(ctx);
   const movements = bot.pathfinder?.movements;
   if (!args.scout_only || !movements || !isNetherDimension(currentDimension(ctx))) return searchFortress(args, ctx);
-  const previous = { allowParkour: movements.allowParkour, canDig: movements.canDig, maxDropDown: movements.maxDropDown,
+  const previous = { allowParkour: movements.allowParkour, allowSprinting: movements.allowSprinting,
+    allow1by1towers: movements.allow1by1towers, canDig: movements.canDig, maxDropDown: movements.maxDropDown,
     exclusionAreasStep: movements.exclusionAreasStep };
   let hazards = [], nextScan = 0;
   const avoidCubes = block => {
@@ -1152,7 +1153,9 @@ async function raidFortress(args, ctx) {
     return hazards.some(e => Math.abs(e.position.y - block.position.y) < 5 &&
       Math.hypot(e.position.x - block.position.x - 0.5, e.position.z - block.position.z - 0.5) < 6) ? 1000 : 0;
   };
-  Object.assign(movements, { allowParkour: false, canDig: false, maxDropDown: 1, exclusionAreasStep: [...previous.exclusionAreasStep, avoidCubes] });
+  const avoidCliffs = block => !block?.position || besideDrop(bot, block.position) ? 1000 : 0;
+  Object.assign(movements, { allowParkour: false, allowSprinting: false, allow1by1towers: false, canDig: false,
+    maxDropDown: 1, exclusionAreasStep: [...previous.exclusionAreasStep, avoidCubes, avoidCliffs] });
   try {
     return await searchFortress(args, ctx);
   } finally {
@@ -1304,7 +1307,7 @@ async function searchFortress(args, ctx) {
     if (Date.now() - lastSearch > 1500) {
       lastSearch = Date.now();
       const moved = await fallbackStep(ctx, route);
-        if (!moved && (route.exhausted || route.attemptedWaypoints >= route.budgetWaypoints)) break;
+      if (!moved && (route.exhausted || route.attemptedWaypoints >= route.budgetWaypoints)) break;
       if (!moved) await sleepMs(ctx, 1000);
     } else {
       await sleepMs(ctx, 500);
