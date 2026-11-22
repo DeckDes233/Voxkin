@@ -80,6 +80,22 @@ test('observation reports a verified owned table without inventing an inventory 
   assert.equal(state.inventory.crafting_table, undefined);
 });
 
+test('副手盾计入装备持有数且不会重复统计，副手材料仍与合成库存分开', () => {
+  const { bot } = makeWorld();
+  const shield = { name: 'shield', count: 1, slot: 45 };
+  bot.inventory.slots = [];
+  bot.inventory.slots[45] = shield;
+  bot.inventory.items = () => [{ name: 'shield', count: 1, slot: 9 }];
+  const observe = () => createObservation(bot, { sessionId: 'shield-test', revision: 1, ready: true });
+  assert.equal(observe().inventory.shield, 2);
+  bot.inventory.items = () => [shield];
+  assert.equal(observe().inventory.shield, 1);
+  bot.inventory.items = () => [];
+  bot.inventory.slots[45] = { name: 'oak_planks', count: 3, slot: 45 };
+  assert.equal(observe().off_hand, 'oak_planks');
+  assert.equal(observe().inventory.oak_planks, undefined);
+});
+
 test('shelter observation rechecks every wall and roof block on each snapshot', () => {
   const world = makeWorld();
   const shelter = { position: { x: 0, y: 0, z: 0 }, size: 4 };

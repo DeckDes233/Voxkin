@@ -105,8 +105,14 @@ export function createObservation(bot, options) {
   const health = Number(bot?.health);
   const position = bot?.entity?.position;
   const inventory = {};
-  for (const item of bot?.inventory?.items?.() || []) {
+  const items = bot?.inventory?.items?.() || [];
+  for (const item of items) {
     inventory[item.name] = (inventory[item.name] || 0) + item.count;
+  }
+  const offHand = bot?.inventory?.slots?.[45];
+  // Java 1.21.1 的副手是单独的格子。已装备的盾仍满足持有装备的验收。
+  if (offHand?.name === 'shield' && !items.some(item => item === offHand || item.slot === 45)) {
+    inventory.shield = (inventory.shield || 0) + offHand.count;
   }
   const players = Object.values(bot?.players || {})
     .filter((player) => position && player.username !== bot?.username && player.entity?.position)
@@ -136,6 +142,7 @@ export function createObservation(bot, options) {
     weather: bot?.thunderState > 0 ? 'thunder' : bot?.rainState > 0 ? 'rain' : 'clear',
     players,
     inventory,
+    off_hand: offHand?.name || '',
     nearby_owned_crafting_table: Boolean(nearbyOwnedCraftingTable),
     inventory_free_slots: typeof bot?.inventory?.emptySlotCount === 'function' ? bot.inventory.emptySlotCount() : null,
     resource_sites: inspectResourceSites(bot, shelter, sessionId),

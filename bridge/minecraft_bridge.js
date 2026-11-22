@@ -510,10 +510,11 @@ function worldReaderFor(message) {
 }
 
 function readInventory() {
-  const items = bot.inventory.items();
-  return items.length
-    ? items.map((item) => `${blockLabel(item.name)} x${item.count}`).join('、').slice(0, 400)
-    : '背包是空的';
+  const items = bot.inventory.items().filter(item => item.slot !== 45);
+  const labels = items.map(item => `${blockLabel(item.name)} x${item.count}`);
+  const offHand = bot.inventory.slots?.[45];
+  if (offHand) labels.unshift(`副手 ${blockLabel(offHand.name)} x${offHand.count}`);
+  return labels.length ? labels.join('、').slice(0, 400) : '背包是空的';
 }
 
 function enqueueActionTask(message) {
