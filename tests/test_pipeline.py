@@ -101,6 +101,28 @@ async def test_new_request_interrupts_previous_turn(llm_port, tmp_path):
     assert tts.stopped
 
 
+async def test_concurrent_turns_keep_the_latest_audio_owner(llm_port, tmp_path):
+    config = make_config(llm_port)
+    started = asyncio.Event()
+
+    async def observe(event):
+        if event["type"] == "turn_started" and event["request_id"] == "turn-3":
+            started.set()
+
+    pipeline = ConversationPipeline(config, OpenAICompatLLM(config.llm), SlowTTS(),
+                                    WavDirSink(tmp_path), MetricsStore(), emit=observe)
+    try:
+        turns = [asyncio.create_task(pipeline.respond("你好", f"turn-{i}")) for i in range(4)]
+        await asyncio.wait_for(started.wait(), 2)
+        await pipeline.interrupt("mic_stopped", request_id="turn-0")
+        summaries = await asyncio.wait_for(asyncio.gather(*turns), 10)
+        assert all(summary["meta"].get("interrupted") for summary in summaries[:-1])
+        assert not summaries[-1]["meta"].get("interrupted")
+        assert summaries[-1]["first_audible_ms"] is not None
+    finally:
+        await pipeline.close()
+
+
 async def test_history_keeps_user_and_assistant(llm_port, tmp_path):
     config = make_config(llm_port)
     pipeline = ConversationPipeline(

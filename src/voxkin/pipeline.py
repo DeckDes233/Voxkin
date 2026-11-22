@@ -70,6 +70,7 @@ class ConversationPipeline:
             maxlen=config.persona.max_history_turns * 2
         )
         self._generation = 0
+        self._turn_handoff = asyncio.Lock()
         self._turn_seq = 0
         self._active_turn: TurnTimeline | None = None
         self._active_tasks: list[asyncio.Task] = []
@@ -86,7 +87,6 @@ class ConversationPipeline:
         self.sink.set_playback_start_callback(self._on_playback_start)
         self._spoken_texts: dict[str, list[str]] = {}
         self._action_notes: deque[str] = deque(maxlen=5)
-        self._ack_task: asyncio.Task | None = None
 
     def set_action_handler(self, handler: ActionHandler) -> None:
         self._action_handler = handler
@@ -229,7 +229,7 @@ class ConversationPipeline:
         turn.meta["ack_source"] = "dynamic"
         return True
 
-    async def _run_fast_path(self, turn: TurnTimeline, user_text: str) -> IntentPlan | None:
+    async def _run_fast_path(self, turn: TurnTimeline, user_text: str) -> asyncio.Task | None:
         """本地规则命中就提交动作并播确认语，不等云端模型。"""
         if not self.config.fast_path.enabled:
             return None
@@ -257,9 +257,7 @@ class ConversationPipeline:
         ack_task = asyncio.create_task(
             self._speak_ack(turn, plan), name=f"ack-{turn.request_id}"
         )
-        self._ack_task = ack_task
-        self._background_tasks.add(ack_task)
-        ack_task.add_done_callback(self._background_tasks.discard)
+        self._active_tasks.append(ack_task)
         action_task = asyncio.create_task(
             self._run_action(
                 call, turn, ack_text=plan.ack_text, announce_ack=False, origin="fast_path"
@@ -278,7 +276,7 @@ class ConversationPipeline:
                 "arguments": plan.arguments,
             }
         )
-        return plan
+        return ack_task
 
     def _turn_is_live(self, turn: TurnTimeline) -> bool:
         """回合还算不算数。被新回合取代的旧回合不再播报结果，只留记录。"""
@@ -332,9 +330,15 @@ class ConversationPipeline:
             turn.mark("t_stop_done")
         self.metrics.update(turn)
 
-    async def interrupt(self, reason: str = "user_interrupt") -> None:
-        self._generation += 1
+    async def interrupt(self, reason: str = "user_interrupt", *, request_id: str | None = None) -> None:
+        async with self._turn_handoff:
+            await self._interrupt(reason, request_id)
+
+    async def _interrupt(self, reason: str, request_id: str | None = None) -> None:
         turn = self._active_turn
+        if request_id is not None and (turn is None or turn.request_id != request_id):
+            return
+        self._generation += 1
         if turn is not None:
             turn.meta["interrupted"] = reason
             await self._broadcast(
@@ -358,13 +362,15 @@ class ConversationPipeline:
         await self.tts.stop()
         await self.sink.flush()
 
-    async def respond(self, user_text: str, request_id: str | None = None) -> dict[str, Any]:
+    async def _begin_turn(
+        self, user_text: str, request_id: str | None
+    ) -> tuple[TurnTimeline, int, asyncio.Queue[str | None], asyncio.Task]:
         if not self._started:
             await self.start()
         if self._summarize_task is not None and not self._summarize_task.done():
             self._summarize_task.cancel()
         if self._active_turn is not None:
-            await self.interrupt("superseded")
+            await self._interrupt("superseded")
         self._generation += 1
         generation = self._generation
         self._turn_seq += 1
@@ -385,12 +391,18 @@ class ConversationPipeline:
             self._tts_worker(turn, queue, generation), name=f"tts-{turn.request_id}"
         )
         self._active_tasks = [tts_task]
+        return turn, generation, queue, tts_task
+
+    async def respond(self, user_text: str, request_id: str | None = None) -> dict[str, Any]:
+        async with self._turn_handoff:
+            turn, generation, queue, tts_task = await self._begin_turn(user_text, request_id)
         await self._broadcast(
             {"type": "turn_started", "request_id": turn.request_id, "text": user_text}
         )
         # 停止类指令先停动作，再走快路播确认语；顺序反了就会出现「说了停但还在挖」。
-        await self._handle_stop(turn, user_text)
-        await self._run_fast_path(turn, user_text)
+        if self._turn_is_live(turn):
+            await self._handle_stop(turn, user_text)
+        ack_task = await self._run_fast_path(turn, user_text) if self._turn_is_live(turn) else None
         turn.mark("t_intent_done")
         splitter = SentenceSplitter(max_chars=self.config.tts.max_chars_per_request)
         collected: list[str] = []
@@ -435,16 +447,19 @@ class ConversationPipeline:
                     )
                     self._background_tasks.add(action_task)
                     action_task.add_done_callback(self._background_tasks.discard)
-            for sentence in splitter.flush():
-                await self._enqueue_sentence(turn, sentence, queue)
-            self._accept_audio = False
-            await queue.put(None)
             if generation == self._generation:
+                for sentence in splitter.flush():
+                    await self._enqueue_sentence(turn, sentence, queue)
+                if generation == self._generation:
+                    self._accept_audio = False
+                await queue.put(None)
                 try:
                     await tts_task
                 except asyncio.CancelledError:
                     if generation == self._generation:
                         raise
+            if ack_task is not None:
+                await asyncio.gather(ack_task, return_exceptions=True)
         except asyncio.CancelledError:
             if generation == self._generation:
                 turn.meta["cancelled"] = True
@@ -466,9 +481,6 @@ class ConversationPipeline:
                 self._accept_audio = False
             await stream.aclose()
         turn.meta["spoken"] = "".join(self._spoken_texts.get(turn.request_id, []))
-        if self._ack_task is not None:
-            await asyncio.gather(self._ack_task, return_exceptions=True)
-            self._ack_task = None
         if generation != self._generation:
             self.metrics.add(turn)
             summary = turn.summary()
