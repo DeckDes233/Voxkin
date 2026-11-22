@@ -3,6 +3,16 @@ import test from 'node:test';
 
 import { buildActionResult, mergeActionErrorData, validateActionState } from '../action_response.js';
 
+test('a latest-state read can cross revisions only within a ready matching session', () => {
+  const current = { sessionId: 'world', revision: 4, ready: true, readLatest: true };
+  const query = { tool: 'inventory', session_id: 'world', state_revision: 2 };
+  assert.equal(validateActionState(query, current), null);
+  assert.equal(validateActionState({ ...query, state_revision: 5 }, current).status, 'blocked');
+  assert.equal(validateActionState({ ...query, session_id: 'other' }, current).status, 'blocked');
+  assert.equal(validateActionState(query, { ...current, ready: false }).status, 'blocked');
+  assert.equal(validateActionState(query, { ...current, readLatest: false }).status, 'blocked');
+});
+
 test('action admission rejects mismatched sessions and revisions, and waits for ready lifecycle state', () => {
   const current = { sessionId: 'session-b', revision: 12, ready: true };
   const wrongSession = validateActionState({ session_id: 'session-a', state_revision: 12 }, current);

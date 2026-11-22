@@ -6,6 +6,7 @@ function searchState() {
 
 export async function findBlocksWithExploration(ctx, ids, range, count, scanOverride = null, state = searchState(), localOnly = null) {
   const bot = ctx.bot;
+  const wait = ctx.actionToken?.wait ?? (ms => ctx.sleep(ms));
   const scan = () => {
     const positions = scanOverride
       ? scanOverride(state.excluded.size)
@@ -24,10 +25,10 @@ export async function findBlocksWithExploration(ctx, ids, range, count, scanOver
     if (positions.length || localOnly?.()) return positions;
     if (attempts === 1) break;
     if (typeof bot.waitForChunksToLoad === 'function') {
-      await Promise.race([bot.waitForChunksToLoad().catch(() => {}), ctx.sleep(3000)]);
+      await Promise.race([bot.waitForChunksToLoad().catch(() => {}), wait(3000)]);
     }
     check();
-    await ctx.sleep(1200);
+    await wait(1200);
   }
   if (typeof ctx.exploreResource !== 'function') return [];
   while (state.steps < 5) {
@@ -47,7 +48,7 @@ export async function findBlocksWithExploration(ctx, ids, range, count, scanOver
     });
     if (outcome === 'no_target') continue;
     if (typeof bot.waitForChunksToLoad === 'function') {
-      await Promise.race([bot.waitForChunksToLoad().catch(() => {}), ctx.sleep(3000)]);
+      await Promise.race([bot.waitForChunksToLoad().catch(() => {}), wait(3000)]);
       check();
     }
     const positions = scan();

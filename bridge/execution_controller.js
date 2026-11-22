@@ -1,3 +1,5 @@
+import { setTimeout as delay } from 'node:timers/promises';
+
 const TERMINAL_STATUSES = new Set([
   'succeeded',
   'partial',
@@ -125,6 +127,19 @@ export class ExecutionController {
     return record ? { ...record, data: record.data ? structuredCloneSafe(record.data) : undefined } : null;
   }
 
+  // 同步读取当前世界，只记回执；移动和交互仍由活动动作持有。
+  read(id, tool, reader, statusForError) {
+    const existing = this.records.get(id);
+    if (existing) return existing;
+    let result;
+    try {
+      result = { status: 'succeeded', detail: reader() };
+    } catch (error) {
+      result = { status: statusForError(error), detail: String(error?.message || error) };
+    }
+    return this._remember(id, result.status, { tool }, result);
+  }
+
   updateRecord(id, result) {
     const record = this.records.get(String(id || ''));
     if (!record || !result || typeof result !== 'object') return false;
@@ -146,6 +161,7 @@ export class ExecutionController {
       token.cancelCause = status === 'preempted'
         ? (cause || (task.kind === 'safety' ? 'safety_priority' : 'player_priority'))
         : '';
+      task.abortController.abort();
       if (!token.cancelHookCalled && typeof task.onCancel === 'function') {
         token.cancelHookCalled = true;
         try {
@@ -180,7 +196,10 @@ export class ExecutionController {
           this._finishQueued(task, this.closedStatus, this.closedStatus);
           continue;
         }
+        const abortController = new AbortController();
+        task.abortController = abortController;
         const token = {
+          wait: ms => delay(ms, undefined, { signal: abortController.signal }),
           actionId: task.id,
           deadlineAt: Number.isFinite(task.deadlineAt) ? task.deadlineAt : null,
           progress: 0,
@@ -250,11 +269,13 @@ export class ExecutionController {
       data: result.data && typeof result.data === 'object' ? structuredCloneSafe(result.data) : undefined,
       updated_at: Date.now(),
     };
+    this.records.delete(id);
     this.records.set(id, record);
-    while (this.records.size > this.ledgerLimit) {
-      const oldest = this.records.keys().next().value;
-      if (oldest === this.active?.id) break;
-      this.records.delete(oldest);
+    if (this.records.size > this.ledgerLimit) {
+      for (const [key, entry] of this.records) {
+        if (TERMINAL_STATUSES.has(entry.status) && key !== id) this.records.delete(key);
+        if (this.records.size <= this.ledgerLimit) break;
+      }
     }
     return record;
   }

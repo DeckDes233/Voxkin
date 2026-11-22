@@ -10,7 +10,10 @@ export function validateActionState(message, current) {
     };
   }
   const requestedRevision = message.state_revision ?? message.revision;
-  if (requestedRevision !== undefined && requestedRevision !== null && Number(requestedRevision) !== Number(current.revision)) {
+  const readLatest = current.readLatest && message.session_id && message.session_id === current.sessionId
+    && Number.isSafeInteger(Number(requestedRevision)) && Number(requestedRevision) >= 0
+    && Number(requestedRevision) <= Number(current.revision);
+  if (requestedRevision !== undefined && requestedRevision !== null && Number(requestedRevision) !== Number(current.revision) && !readLatest) {
     return {
       status: 'blocked',
       detail: '动作基于过期的 Bridge state revision，动作未启动；请基于新观察重新准入',

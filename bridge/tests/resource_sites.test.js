@@ -3,6 +3,29 @@ import test from 'node:test';
 import { Vec3 } from 'vec3';
 import { inspectResourceSites } from '../resource_sites.js';
 
+test('burst observations reuse only positions and refresh on movement, new sessions and direct skill reads', () => {
+  const position = new Vec3(1, 64, 0);
+  const block = { name: 'hay_block', position };
+  let scans = 0;
+  const bot = { game: { dimension: 'overworld' }, entity: { position: new Vec3(0, 64, 0) }, entities: {},
+    registry: { blocksByName: { hay_block: { name: 'hay_block', id: 1 } } },
+    findBlocks: () => { scans++; return [position]; }, blockAt: () => block };
+  assert.equal(inspectResourceSites(bot, null, 'a').hay.length, 1);
+  block.name = 'air';
+  bot.entities = { 1: { name: 'iron_golem', position } };
+  for (let i = 0; i < 100; i++) {
+    const observed = inspectResourceSites(bot, null, 'a');
+    assert.equal(observed.hay.length, 0);
+    assert.equal(observed.golems.length, 1);
+  }
+  assert.equal(scans, 1);
+  bot.entity.position.x += 4;
+  inspectResourceSites(bot, null, 'a');
+  inspectResourceSites(bot, null, 'b');
+  inspectResourceSites(bot);
+  assert.equal(scans, 4);
+});
+
 test('resource sites require village evidence for chests and beds, protect shelter, and accept hay elsewhere', () => {
   const blocks = [
     { name: 'chest', id: 1, position: new Vec3(20, 64, 0) },

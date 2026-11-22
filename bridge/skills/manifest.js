@@ -2044,6 +2044,7 @@ module.exports = {
           default: null,
           description: "可选最低背包总量。达到后只采触手可及的方块以补足 count，按实际库存回报。",
         },
+        { name: 'within_reach', type: 'boolean', required: false, default: false, description: '只采挖掘距离内的方块，候选耗尽即回报。' },
         {
           name: 'avoid_positions',
           type: 'array',

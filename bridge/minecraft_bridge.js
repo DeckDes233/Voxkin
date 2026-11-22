@@ -472,9 +472,11 @@ function enqueueAction(message) {
     return;
   }
   if (rejectBlockedAction(actionBlockStatus, message, reply)) return;
+  const read = worldReaderFor(message);
   const validation = validateActionState(message, {
     sessionId,
     revision: stateRevision,
+    readLatest: Boolean(read),
     ready: ordinaryActionReady(allowedDuringWaterEscape(message.tool)),
     reason: !botReady || !bot?.entity
       ? 'Minecraft 世界尚未完成生命周期确认'
@@ -486,8 +488,32 @@ function enqueueAction(message) {
     reply(message, false, validation.detail, validation.status, validation.data);
     return;
   }
+  if (read) {
+    message.action_id ||= `action-${randomUUID()}`;
+    const result = executor.read(message.action_id, message.tool, () => read(message.arguments || {}), statusForError);
+    reply(message, result.status === 'succeeded', result.detail, result.status);
+    return;
+  }
   stopResidentMovement();
   enqueueActionTask(message);
+}
+
+function worldReaderFor(message) {
+  switch (message.tool) {
+    case 'inventory': return readInventory;
+    case 'locate_block': return locateBlock;
+    case 'locate_entity': return locateEntity;
+    // 带庇护所参数的观察会写入记忆，交给独占执行器处理。
+    case 'observe': return message.arguments?.shelter || message.arguments?.shelter_position ? null : observeSurroundings;
+    default: return null;
+  }
+}
+
+function readInventory() {
+  const items = bot.inventory.items();
+  return items.length
+    ? items.map((item) => `${blockLabel(item.name)} x${item.count}`).join('、').slice(0, 400)
+    : '背包是空的';
 }
 
 function enqueueActionTask(message) {
@@ -701,13 +727,6 @@ async function runAction(message, token) {
             : `已到 ${player.username} 附近，距离 ${result.distance.toFixed(1)} 格`;
         break;
       }
-      case 'inventory': {
-        const items = bot.inventory.items();
-        detail = items.length
-          ? items.map((item) => `${blockLabel(item.name)} x${item.count}`).join('、').slice(0, 400)
-          : '背包是空的';
-        break;
-      }
       case 'observe':
         if (args.shelter) rememberRequestedShelter(args.shelter);
         if (args.shelter_position) {
@@ -743,12 +762,6 @@ async function runAction(message, token) {
         break;
       case 'goto_block':
         detail = await gotoBlock(args);
-        break;
-      case 'locate_block':
-        detail = locateBlock(args);
-        break;
-      case 'locate_entity':
-        detail = locateEntity(args);
         break;
       case 'pickup_items':
         detail = await pickupItems(args);
@@ -1908,7 +1921,7 @@ function findFuelItem(count = 1, preferred = '') {
   return selectFuel(bot.inventory.items(), [count], preferred);
 }
 
-async function smeltItem(args) {
+async function smeltItem(args, token = executor.active?.token) {
   const name = String(args.item || '');
   const count = Math.max(1, Math.min(Number(args.count) || 1, 64));
   const item = bot.registry.itemsByName[name];
@@ -1941,7 +1954,7 @@ async function smeltItem(args) {
     let waited = 0;
     while (waited < 90 && (furnace.outputItem()?.count || 0) < count) {
       if (interrupted) throw new Error('被新的指令打断');
-      await sleep(1000);
+      await (token?.wait ?? sleep)(1000);
       waited += 1;
     }
     const output = furnace.outputItem();
@@ -3423,7 +3436,8 @@ function createBot() {
     }
     bot.pathfinder.setMovements(movements);
     if (!armorTimer) armorTimer = setInterval(queueArmorMaintenance, 15000);
-    setInterval(sendState, 5000);
+    const stateTimer = setInterval(sendState, 5000);
+    bot.once('end', () => clearInterval(stateTimer));
     startTerrainReadinessCheck('spawn');
     sendState();
   });

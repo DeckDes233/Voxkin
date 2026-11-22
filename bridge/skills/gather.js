@@ -1093,8 +1093,9 @@ async function mineCollect(args, ctx) {
   const ids = matching.length === 1 ? matching[0] : matching;
   // 满足硬需求后只取手边的储备，把远程寻路的时间留给下一步。
   const reserveOnly = () => minimum < want && countOwned() >= minimum;
+  const withinReach = () => args.within_reach === true || reserveOnly();
   const scan = (excludedCount) => {
-    const nearby = reserveOnly();
+    const nearby = withinReach();
     const positions = bot.findBlocks({ matching: ids, maxDistance: nearby ? Math.ceil(MINE_REACH) : range, count: avoided.length ? 512 : Math.max(need * 4, 8) + excludedCount })
       .filter(p => !nearby || distanceBetween(bot.entity.position, p) <= MINE_REACH)
       .filter(p => !avoided.some(danger => Math.hypot(p.x - danger.x, p.z - danger.z) < 8));
@@ -1113,7 +1114,7 @@ async function mineCollect(args, ctx) {
       return distanceBetween(origin, a) - distanceBetween(origin, b);
     })[0];
   };
-  for await (const position of resourceCandidates(ctx, ids, range, Math.max(need * 4, 8), scan, chooseCandidate, reserveOnly)) {
+  for await (const position of resourceCandidates(ctx, ids, range, Math.max(need * 4, 8), scan, chooseCandidate, withinReach)) {
     if (countOwned() - owned >= need) break;
     requireConnected(ctx);
     checkHealth(ctx);
@@ -1126,6 +1127,7 @@ async function mineCollect(args, ctx) {
     }
     const distance = distanceBetween(bot.entity.position, position);
     if (distance > MINE_REACH) {
+      if (withinReach()) continue;
       const outcome = await ctx.travelToBlock(position, 30000);
       checkInterrupted(ctx);
       if (outcome === 'cancelled' || outcome === 'stopped') throw new Error('采集被取消：收到新的指令或连接断开');
@@ -1156,7 +1158,7 @@ async function mineCollect(args, ctx) {
     const state = dropFailureState(ctx, position);
     failures.push(`${formatPosition(position)} ${classifyDropOutcome(state)}`);
   }
-  if (tried === 0 && !reserveOnly()) throw new Error(`附近 ${range} 格内没有${blockLabel}，一个都没有找到`);
+  if (tried === 0 && !reserveOnly()) throw new Error(`附近 ${withinReach() ? MINE_REACH : range} 格内没有${blockLabel}，一个都没有找到`);
   const gained = countOwned() - owned;
   if (gained <= 0 && !reserveOnly()) {
     throw new Error(
@@ -1631,6 +1633,7 @@ export const skills = {
       { name: 'block', type: 'string', required: true, default: null, description: '目标方块 ID；wood_log 搜索任意主世界原木，铁矿、煤矿、钻石矿同时搜索深层变体。' },
       { name: 'count', type: 'number', required: true, default: 1, description: '背包掉落物总目标，范围 1-2304，可跨多堆；已有数量算在内。' },
       { name: 'minimum_count', type: 'number', required: false, default: null, description: '可选最低背包总量。达到后只采触手可及的方块以补足 count，按实际库存回报。' },
+      { name: 'within_reach', type: 'boolean', required: false, default: false, description: '只采挖掘距离内的方块，候选耗尽即回报。' },
       { name: 'avoid_positions', type: 'array', required: false, default: [], description: '已确认的危险坐标；跳过其水平八格范围内的矿点，换区后也不返回危险点。',
         items: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } }, required: ['x', 'y', 'z'], additionalProperties: false } },
       { name: 'range', type: 'number', required: false, default: 32, description: '搜索目标的半径，8-64 格。' },

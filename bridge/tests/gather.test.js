@@ -1051,3 +1051,14 @@ test('mine_collect 拒绝越界最低门槛且未达门槛不报成功', async (
   ctx.collectDrops = async () => {ctx.inventory.raw_iron = 1;};
   await assert.rejects(skills.mine_collect.handler({block:'iron_ore',count:4,minimum_count:2},ctx), /还差/);
 });
+
+test('within_reach cannot explore to satisfy a missing minimum', async () => {
+  const ctx = makeContext();
+  ctx.bot.findBlocks = () => [new Vec3(12, 10, 0)];
+  ctx.exploreResource = () => assert.fail('left the local search');
+  ctx.travelToBlock = () => assert.fail('walked to distant ore');
+  await assert.rejects(skills.mine_collect.handler({
+    block: 'iron_ore', count: 16, minimum_count: 1, within_reach: true,
+  }, ctx), /没有/);
+  assert.equal(ctx.digs.length, 0);
+});

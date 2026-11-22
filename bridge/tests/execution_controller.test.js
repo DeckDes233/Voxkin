@@ -5,6 +5,35 @@ import { ExecutionController } from '../execution_controller.js';
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+test('reads share a busy world and keep a bounded receipt history until a safety takeover', async () => {
+  const controller = new ExecutionController({ ledgerLimit: 8 });
+  const events = [];
+  controller.enqueue({ id: 'mine', run: async token => {
+    try {
+      await token.wait(30000);
+    } finally {
+      events.push('released');
+    }
+  } });
+  const original = controller.snapshot();
+  let reads = 0;
+  for (let index = 0; index < 100; index++) {
+    const read = () => String(++reads);
+    const id = `query-${index}`;
+    const result = controller.read(id, 'inventory', read, () => 'failed');
+    assert.equal(result.detail, String(index + 1));
+    controller.read(id, 'inventory', read, () => 'failed');
+  }
+  assert.equal(reads, 100);
+  assert.deepEqual(controller.snapshot(), original);
+  assert.equal(controller.status('mine').status, 'running');
+  assert.equal(controller.records.size, 8);
+  await new Promise(resolve => controller.enqueue({ id: 'oxygen', kind: 'safety',
+    run: () => { events.push('escape'); return { status: 'succeeded' }; }, onResult: resolve }));
+  assert.deepEqual(events, ['released', 'escape']);
+  assert.equal(controller.status('mine').data.preempt_cause, 'safety_priority');
+});
+
 test('concurrent requests execute serially and priority only orders queued work', async () => {
   const events = [];
   const controller = new ExecutionController();
