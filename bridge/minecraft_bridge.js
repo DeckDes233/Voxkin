@@ -5,6 +5,7 @@ import { FUEL_BURN, selectFuel } from './fuel.js';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import mineflayer from 'mineflayer';
+import { applyProtocol767ItemFormat } from './protocol_767.js';
 import pathfinderPkg from 'mineflayer-pathfinder';
 import WebSocket from 'ws';
 import { Vec3 } from 'vec3';
@@ -3341,6 +3342,7 @@ function isStopIntent(text) {
 }
 
 function createBot() {
+  applyProtocol767ItemFormat();
   retreatTrail.clear();
   if (INDEPENDENT) {
     log('独立模式已启用：不向玩家索要坐标，不跟随玩家');
