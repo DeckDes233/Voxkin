@@ -137,6 +137,9 @@ export function frameHasEye(block) {
 // 末影龙停在中央祭坛附近时才会落下，允许一点垂直误差。
 export function isDragonPerched(entity, bot) {
   if (!entity || !entity.position || !bot || !bot.entity || !bot.entity.position) return false;
+  const phaseIndex = bot.registry?.entitiesByName?.ender_dragon?.metadataKeys?.indexOf('phase');
+  const phase = entity.metadata?.[phaseIndex];
+  if (Number.isInteger(phase)) return phase >= 5 && phase <= 7;
   const dragon = entity.position;
   const me = bot.entity.position;
   return (
@@ -1390,6 +1393,36 @@ function centralPortalState(bot) {
   return fullyLoaded ? false : null;
 }
 
+async function strikePerchedDragon(ctx, dragon) {
+  const bot = botOf(ctx);
+  if (!bot.attack || !ctx.equipWeapon || !ctx.walkOnce) {
+    if (ctx.approach) await ctx.approach(dragon);
+    return ctx.attackEntity(dragon);
+  }
+  const p = dragon.position.floored(), feet = bot.entity.position;
+  const eye = feet.offset(0, bot.entity.eyeHeight ?? 1.62, 0);
+  const body = dragon.position.offset(0, 0.6, 0);
+  if (eye.distanceTo(body) <= 3) {
+    await ctx.equipWeapon();
+    throwIfInterrupted(ctx, '末地战斗');
+    await bot.lookAt(body, true);
+    bot.attack(dragon);
+  } else {
+    // 龙停在基岩柱上方。走到柱边实际可站立的台阶，不追逐空中的实体坐标。
+    const steps = [];
+    for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,1],[1,-1],[-1,-1]]) {
+      for (let dy = 0; dy >= -4; dy--) {
+        const stand = p.offset(dx, dy, dz);
+        if (!dryMiningFooting(bot, stand)) continue;
+        if (stand.offset(0.5, 1.62, 0.5).distanceTo(body) <= 3) steps.push(stand);
+        break;
+      }
+    }
+    steps.sort((a, b) => a.distanceTo(feet) - b.distanceTo(feet));
+    if (steps.length) await ctx.walkOnce(steps[0].x, steps[0].y, steps[0].z, 0, 3000);
+  }
+}
+
 async function fightDragon(args, ctx) {
   throwIfInterrupted(ctx, '末地战斗');
   const bot = botOf(ctx);
@@ -1404,7 +1437,7 @@ async function fightDragon(args, ctx) {
   const pumpkin = findItem(ctx, 'carved_pumpkin');
   if (pumpkin && bot.inventory.slots?.[5]?.name !== 'carved_pumpkin') await bot.equip(pumpkin, 'head');
   const onIsland = bot.entity.position.floored && bot.blockAt?.(bot.entity.position.floored().offset(0, -1, 0))?.name === 'end_stone';
-  const canEngage = onIsland && findEntity(ctx, DRAGON_ENTITY, radius) && findEntity(ctx, CRYSTAL_ENTITY, radius);
+  const canEngage = onIsland && findEntity(ctx, DRAGON_ENTITY, radius);
   if (!canEngage) await reachEndIsland(ctx, deadline);
   const returnPortalPresentAtStart = centralPortalState(bot);
 
@@ -1518,8 +1551,12 @@ async function fightDragon(args, ctx) {
     const distance = distanceToBot(ctx, dragon);
     try {
       if (perched) {
-        if (typeof ctx.approach === 'function') await ctx.approach(dragon);
-        const detail = await ctx.attackEntity(dragon);
+        if (bot.health < 18 && ctx.findRangedWeapon?.() && ctx.evadePerchedDragon) {
+          await ctx.evadePerchedDragon(dragon);
+          await sleepMs(ctx, 500);
+          continue;
+        }
+        const detail = await strikePerchedDragon(ctx, dragon);
         if (detail) lastDetail = detail;
       } else {
         const ranged =
@@ -1538,7 +1575,8 @@ async function fightDragon(args, ctx) {
     await sleepMs(ctx, 500);
   }
 
-  const remaining = Number.isFinite(lastHealth) ? Math.max(1, Math.ceil(lastHealth)) : 1;
+  if (!Number.isFinite(lastHealth)) throw new Error('战斗结束时没有观察到龙的生命值或新出现的返回门');
+  const remaining = Math.max(1, Math.ceil(lastHealth));
   throw new Error(
     `还差 ${remaining} 点血才能击杀末影龙` +
       (lastDetail ? `（${lastDetail}）` : '') +

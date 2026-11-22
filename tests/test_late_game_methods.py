@@ -83,6 +83,19 @@ def test_s6_partial_crystal_receipt_requires_measured_progress_and_a_live_boss(t
     assert not supervisor._late_action_recovery(receipt, {**state, "dimension": "overworld"})
 
 
+def test_s6_preemption_budget_only_credits_new_damage_in_the_same_end_session(tmp_path):
+    before = {**world("the_end"), "end_dragon": {"health": 200}}
+    after = {**before, "end_dragon": {"health": 192}}
+    action = {"tool": "fight_dragon", "status": "preempted", "receipt_confirmed": True,
+              "result_data": {"observation": after}}
+    supervisor = GoalSupervisor(GOALS["S6"], TaskStore(tmp_path / "tasks.db"), None, lambda: after)
+    supervisor.state = {"action_history": [action]}
+    assert supervisor._record_dragon_damage(before)
+    assert not supervisor._record_dragon_damage(before)
+    after.update(session_id="another", end_dragon={"health": 160})
+    assert not supervisor._record_dragon_damage(before)
+
+
 def test_s5_uses_the_shaft_lip_and_reconsiders_routes_from_the_surface(tmp_path):
     state = world(water_bucket=1)
     state["position"] = {"x": 0.5, "y": 71, "z": 0.5}

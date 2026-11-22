@@ -597,6 +597,8 @@ class GoalSupervisor:
                 outcome = await self._execute_step(step, method_key, step_index)
                 if outcome == "preempted":
                     preemptions += 1
+                    if step.tool == "fight_dragon" and self._record_dragon_damage(state):
+                        preemptions = 0
                     if preemptions > MAX_PREEMPTIONS:
                         return self._block("preemption_budget", "安全抢占次数超出目标重评预算")
                     safe_state = await self._wait_after_safety()
@@ -1115,6 +1117,25 @@ class GoalSupervisor:
             "sleep_confirmed": bool(self.state.get("sleep_confirmed")),
             "guarded_night_confirmed": bool(self.state.get("guarded_night_confirmed")),
         }
+
+    def _record_dragon_damage(self, before: dict) -> bool:
+        history = self.state.get("action_history") or []
+        if self.goal.stage != "S6" or not history:
+            return False
+        action = history[-1]
+        after = (action.get("result_data") or {}).get("observation") or {}
+        if (action.get("tool") != "fight_dragon" or action.get("status") != "preempted"
+                or action.get("receipt_confirmed") is not True or not before.get("session_id")
+                or before.get("session_id") != after.get("session_id") or not after.get("alive")
+                or any(str(s.get("dimension")).removeprefix("minecraft:") != "the_end" for s in (before, after))):
+            return False
+        initial = (before.get("end_dragon") or {}).get("health")
+        final = (after.get("end_dragon") or {}).get("health")
+        if not self._finite_number(initial) or not self._finite_number(final):
+            return False
+        lowest = min(float(initial), self.state.get("s6_lowest_dragon_health", float(initial)))
+        self.state["s6_lowest_dragon_health"] = min(lowest, float(final)) if final > 0 else lowest
+        return 0 < final <= lowest - 1
 
     def _late_action_recovery(self, action: dict, current: dict) -> str:
         if self._portal_preflight_stopped(action) or self._portal_insertion_reconciled(action, current):

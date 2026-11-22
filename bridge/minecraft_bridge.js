@@ -1,5 +1,6 @@
 import { escapeWater, reachShore, waterLike, breathable, avoidWaterScaffolding, allowedDuringWaterEscape } from './water_escape.js';
 import { dryMiningFooting, leaveMagmaBlock, netherRouteExclusion } from './dry_footing.js';
+import { crystalAimPoint } from './skills/combat.js';
 import { FUEL_BURN, selectFuel } from './fuel.js';
 // 沃心 Minecraft 桥接进程：mineflayer 负责游戏内身份，WebSocket 负责与 Voxkin Core 通信。
 // 部分动作与自主行为参考 MindCraft（MIT，https://github.com/mindcraft-bots/mindcraft）。
@@ -623,6 +624,8 @@ function buildSkillContext(runSkill, token = null, actionMessage = null) {
     findRangedWeapon,
     aimPoint,
     shootAt,
+    evadePerchedDragon: dragon => evadeDragonHazard(dragon, token, () => dragon.isValid !== false
+      && bot.entity.position.distanceTo(dragon.position) < 16),
     nearbyPlayers,
     nearbyHostiles,
     entityMatches,
@@ -2559,6 +2562,26 @@ async function shootAt(target) {
   if (!ranged) return false;
   try {
     await bot.equip(ranged.bow, 'hand');
+    if (target.name === 'ender_dragon' && ranged.bow.name === 'bow') {
+      const token = executor.active?.token;
+      bot.activateItem();
+      try {
+        await sleep(850);
+        if (token?.cancelled || target.isValid === false) return false;
+        const start = target.position.clone(), sampledAt = performance.now();
+        await sleep(250);
+        if (token?.cancelled || target.isValid === false) return false;
+        const motion = target.position.minus(start).scaled(50 / Math.max(1, performance.now() - sampledAt));
+        const ticks = Math.min(35, bot.entity.position.distanceTo(target.position) / 2.7);
+        const body = target.position.plus(motion.scaled(ticks)).offset(0, 2, 0);
+        const aim = crystalAimPoint(bot, target, body);
+        if (!aim) return false;
+        await bot.lookAt(aim, true);
+        return !token?.cancelled;
+      } finally {
+        bot.deactivateItem();
+      }
+    }
     await bot.lookAt(aimPoint(target), true);
     await bot.activateItem();
     await sleep(ranged.bow.name === 'crossbow' ? 1250 : 900);
@@ -2889,7 +2912,7 @@ function nearbyDragonCloud() {
     Math.abs(e.position.y - pos.y) < 4 && Math.hypot(e.position.x - pos.x, e.position.z - pos.z) < 7);
 }
 
-async function leaveDragonCloud(cloud, token) {
+async function evadeDragonHazard(threat, token, stillThreatened) {
   const origin = bot.entity.position.floored();
   const destinations = [];
   for (const [dx, dz] of [[8,0],[-8,0],[0,8],[0,-8],[6,6],[-6,6],[6,-6],[-6,-6]]) {
@@ -2901,11 +2924,11 @@ async function leaveDragonCloud(cloud, token) {
       }
     }
   }
-  destinations.sort((a, b) => b.distanceTo(cloud.position) - a.distanceTo(cloud.position));
+  destinations.sort((a, b) => b.distanceTo(threat.position) - a.distanceTo(threat.position));
   for (const p of destinations.slice(0, 3)) {
-    if (token.cancelled || !nearbyDragonCloud()) return;
+    if (token.cancelled || !stillThreatened()) return;
     try {
-      await gotoWithTimeout(bot.pathfinder, new goals.GoalNear(p.x, p.y, p.z, 1), 2500, '躲开龙息超时');
+      await gotoWithTimeout(bot.pathfinder, new goals.GoalNear(p.x, p.y, p.z, 1), 2500, '末地避险换位超时', () => bot.entity.position);
     } catch (error) {
       if (token.cancelled) throw error;
     }
@@ -2921,7 +2944,7 @@ async function runLocalSafety(event, data, token) {
   if (await leaveMagmaBlock(bot, token, sleep)) return;
   const cloud = nearbyDragonCloud();
   if (cloud) {
-    await leaveDragonCloud(cloud, token);
+    await evadeDragonHazard(cloud, token, nearbyDragonCloud);
     return;
   }
   if (event === 'critical_hunger') {
@@ -2929,6 +2952,11 @@ async function runLocalSafety(event, data, token) {
     return;
   }
   const source = Number.isInteger(data.source_id) ? bot.entities[String(data.source_id)] : null;
+  if (source?.name === 'ender_dragon' && ['the_end', 'minecraft:the_end'].includes(bot.game.dimension)) {
+    // 专项战斗负责瞄准飞龙；局部避险只在贴身时拉开距离。
+    await evadeDragonHazard(source, token, () => source.isValid !== false && bot.entity.position.distanceTo(source.position) < 10);
+    return;
+  }
   const hostile = source && ((source.type === 'mob' || source.type === 'hostile') || HOSTILE_MOBS.has(source.name))
     ? source
     : findHostile(event === 'hostile_nearby' ? 12 : 8);
@@ -3023,6 +3051,8 @@ function survivalTick() {
   }
   const hostile = findHostile(16);
   if (hostile) {
+    // 末地的末影人也会追打撞到它的龙。靠近已激怒的末影人时，由实际受击事件确认是否需要反击。
+    if (hostile.name === 'enderman' && ['the_end', 'minecraft:the_end'].includes(bot.game.dimension)) return;
     const distance = bot.entity.position.distanceTo(hostile.position);
     if (distance <= 8 && Date.now() - lastCreeperWarnAt > 10000) {
       lastCreeperWarnAt = Date.now();

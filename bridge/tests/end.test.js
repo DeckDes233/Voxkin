@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { createSkillInvoker } from '../skill_invoker.js';
 import { skills as combatSkills } from '../skills/combat.js';
-import { isEndDimension, skills } from '../skills/end.js';
+import { isDragonPerched, isEndDimension, skills } from '../skills/end.js';
 
 function makePosition(x = 0, y = 64, z = 0) {
   return {
@@ -39,6 +39,13 @@ function makeBlockPosition(x, y, z) {
     },
   };
 }
+
+test('a dragon flying across the podium is distinguished from one actually sitting on it', () => {
+  const position = makePosition(0, 66, 0);
+  const bot = { entity: { position }, registry: { entitiesByName: { ender_dragon: { metadataKeys: ['phase'] } } } };
+  assert.equal(isDragonPerched({ position, metadata: [0] }, bot), false);
+  assert.equal(isDragonPerched({ position, metadata: [6] }, bot), true);
+});
 
 function makeStrongholdSearch({
   searchId = 's6-search-test',
