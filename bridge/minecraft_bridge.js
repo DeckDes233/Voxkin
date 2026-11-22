@@ -22,7 +22,7 @@ import { inspectResourceSites } from './resource_sites.js';
 import { syncWindowWithLease, writeWindowClickWithLease } from './window_sync.js';
 import { placeBedAt } from './bed_placement.js';
 import { installArmorManagerApi } from './armor_manager.js';
-import { cleanupCraftWindowForSafety, isUrgentSafetyPreemption } from './craft_window_cleanup.js';
+import { cleanupCraftWindowForSafety, craftReturnSlot, isUrgentSafetyPreemption } from './craft_window_cleanup.js';
 import { createRetreatTrail, retreatAlongTrail } from './retreat_route.js';
 import { retainTemporaryTable, shouldRecoverTemporaryTable, ownedTableNearby } from './workstation_lifecycle.js';
 import { pickCraftingRecipe } from './recipe_selection.js';
@@ -1495,6 +1495,16 @@ async function refreshWindowState(window, token = executor.active?.token) {
   await syncWindow(window, 2000, token);
 }
 
+async function storeCraftCursor(window, token, cleanup = false) {
+  while (window.selectedItem) {
+    const count = window.selectedItem.count;
+    const slot = craftReturnSlot(window);
+    if (slot === null) throw new Error('背包满了，无法归还合成物品');
+    await clickWindowSlot(window, slot, 0, 0, token, cleanup);
+    if (window.selectedItem && window.selectedItem.count >= count) throw new Error('合成物品归还后鼠标堆叠未减少');
+  }
+}
+
 // 把合成格清空：先拿起格里的东西，再放进背包空位，材料不会被弄丢。
 async function clearCraftGrid(window, width, height, token) {
   assertActionToken(token);
@@ -1502,9 +1512,7 @@ async function clearCraftGrid(window, width, height, token) {
     assertActionToken(token);
     if (!window.slots[gridSlot]) continue;
     await clickWindowSlot(window, gridSlot, 0, 0, token);
-    const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
-    if (empty === null) throw new Error('背包满了，无法清空合成格');
-    await clickWindowSlot(window, empty, 0, 0, token);
+    await storeCraftCursor(window, token);
   }
 }
 
@@ -1530,9 +1538,7 @@ async function placeIngredient(window, ingredient, destSlot, token) {
     }
     placed += take;
     if (window.selectedItem) {
-      const back = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
-      if (back === null) throw new Error('背包满了，无法放回剩余材料');
-      await clickWindowSlot(window, back, 0, 0, token);
+      await storeCraftCursor(window, token);
     }
   }
 }
@@ -1556,9 +1562,7 @@ async function takeCraftResult(window, token) {
   const output = window.slots[0];
   if (!output) return null;
   await clickWindowSlot(window, window.craftingResultSlot, 0, 0, token);
-  const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
-  if (empty === null) throw new Error('背包满了，无法取走产物');
-  await clickWindowSlot(window, empty, 0, 0, token);
+  await storeCraftCursor(window, token);
   return output;
 }
 
@@ -1566,18 +1570,14 @@ async function takeCraftResult(window, token) {
 async function restoreCraftWindow(window, width, height, token, { cursorOnly = false } = {}) {
   assertActionToken(token, true);
   if (window.selectedItem) {
-    const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
-    if (empty === null) throw new Error('合成取消后背包没有空位归还手持物品');
-    await clickWindowSlot(window, empty, 0, 0, token, true);
+    await storeCraftCursor(window, token, true);
   }
   if (cursorOnly) return;
   for (let gridSlot = 1; gridSlot <= width * height; gridSlot += 1) {
     assertActionToken(token, true);
     if (!window.slots[gridSlot]) continue;
     await clickWindowSlot(window, gridSlot, 0, 0, token, true);
-    const empty = window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
-    if (empty === null) throw new Error('合成取消后背包没有空位归还合成材料');
-    await clickWindowSlot(window, empty, 0, 0, token, true);
+    await storeCraftCursor(window, token, true);
   }
 }
 

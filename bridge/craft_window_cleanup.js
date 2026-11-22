@@ -1,3 +1,18 @@
+import { isDeepStrictEqual } from 'node:util';
+
+export function craftReturnSlot(window) {
+  const held = window.selectedItem;
+  if (!held) return null;
+  for (let slot = window.inventoryStart; slot < window.inventoryEnd; slot++) {
+    const item = window.slots[slot];
+    if (item && item.count < item.stackSize && held.constructor.equal(item, held, false) &&
+        isDeepStrictEqual(item.components, held.components) && isDeepStrictEqual(item.removedComponents, held.removedComponents)) {
+      return slot;
+    }
+  }
+  return window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
+}
+
 export function isUrgentSafetyPreemption(token) {
   return Boolean(token?.cancelled && token.cancelStatus === 'preempted' && token.cancelCause === 'safety_priority');
 }

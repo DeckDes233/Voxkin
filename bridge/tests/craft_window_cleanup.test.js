@@ -2,7 +2,20 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
-import { cleanupCraftWindowForSafety } from '../craft_window_cleanup.js';
+import { cleanupCraftWindowForSafety, craftReturnSlot } from '../craft_window_cleanup.js';
+import itemFactory from 'prismarine-item';
+
+test('craft output fills matching partial stacks in a full inventory and respects components', () => {
+  const Item = itemFactory('1.21.1');
+  const held = new Item(123, 2);
+  const other = new Item(123, 1);
+  other.components.push({ type: 'custom_name', data: 'named' });
+  const partial = new Item(123, 1);
+  const window = { selectedItem: held, slots: [null, other, partial], inventoryStart: 1, inventoryEnd: 3, firstEmptySlotRange: () => null };
+  assert.equal(craftReturnSlot(window), 2);
+  partial.count = partial.stackSize;
+  assert.equal(craftReturnSlot(window), null);
+});
 import { ExecutionController } from '../execution_controller.js';
 import { writeWindowClickWithLease } from '../window_sync.js';
 
