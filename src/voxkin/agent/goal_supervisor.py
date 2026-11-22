@@ -2328,6 +2328,12 @@ class GoalSupervisor:
 
     def _retry_or_block_method(self, method_key: str, detail: str) -> str:
         failures = self._method_failure_count(method_key)
+        if self.goal.stage == "S5" and method_key.startswith("s5:raid_fortress:default:chunk:"):
+            # 侦察可能在最后一次尝试中走进相邻区块。下一轮按实到区块在派发前检查预算。
+            self.state["status"] = "active"
+            self.state["block_reason"] = detail
+            self._save()
+            return "retry"
         if self.goal.stage == "S3" and method_key == "s3:mine_collect:coal_ore":
             self.state["s3_coal_search_attempted"] = True
             self.state["status"] = "active"

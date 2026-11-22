@@ -58,6 +58,33 @@ def test_s5_in_nether_does_not_repeat_overworld_preparation():
     assert (step.tool, step.arguments["mode"]) == ("nether_travel", "exit")
 
 
+@pytest.mark.asyncio
+async def test_fortress_scout_replans_from_the_chunk_reached_on_its_last_attempt(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+    store.initialize()
+    task = store.create_task("S5", "S5")
+    state = world("the_nether", cooked_beef=4)
+    state["position"].update(x=37, z=2)
+    departures = []
+
+    async def dispatch(tool, args, timeout_s=0, **kwargs):
+        assert tool == "raid_fortress" and args["scout_only"]
+        departures.append(state["position"]["z"])
+        state["position"]["z"] = -4
+        state["revision"] += 1
+        return ActionResult(kwargs["action_id"], False, status="blocked", detail="当前视野无堡垒",
+                            data={"observation": deepcopy(state)})
+
+    supervisor = GoalSupervisor(GOALS["S5"], store, dispatch, lambda: state)
+    saved = supervisor._new_state()
+    saved["counters"]["method_failures"]["s5:raid_fortress:default:chunk:2:0"] = 2
+    store.save_goal_state(task.id, saved)
+    result = await supervisor.run(task.id, resume=True)
+    assert result["block_reason"] == "budget_method_attempts"
+    assert departures == [2, -4, -4, -4]
+    store.close()
+
+
 def test_s6_requires_live_dragon_evidence_to_resume_interrupted_combat(tmp_path):
     state = world("the_end", bow=1, arrow=63)
     supervisor = GoalSupervisor(GOALS["S6"], TaskStore(tmp_path / "tasks.db"), None, lambda: state)
