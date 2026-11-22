@@ -11,6 +11,8 @@ A real-time voice companion and autonomous-action prototype for Minecraft Java 1
 
 A persistent `GoalSupervisor` selects actions using inventory, environment and dimension observations and reconciles action receipts. Current stage policies are rule based, with resource reserves, village supplies, iron-golem harvesting and group-threat assessment implemented.
 
+Players can ask what Voxkin is carrying while it mines. The bridge reads the inventory while mining retains control of movement. The microphone keeps listening during replies and supports spoken interruptions when barge-in is enabled. Automated tests cover both paths. [Scheduling and interruptions](docs/ARCHITECTURE.md#任务语音与动作控制)
+
 See the [November 22 headless Paper test](docs/evidence/HEADLESS_S3_20261122.md) for the latest live results.
 
 | Area | Evidence boundary |
