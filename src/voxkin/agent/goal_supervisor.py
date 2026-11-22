@@ -484,7 +484,8 @@ class GoalSupervisor:
                     method_key = late_method_key("S5", step)
                     if step.tool == "raid_fortress" and step.arguments.get("scout_only") and self._finite_position(state.get("position")):
                         position = state["position"]
-                        method_key += f":{math.floor(position['x'] / 48)}:{math.floor(position['z'] / 48)}"
+                        # 只在实到同一 Minecraft 区块时共用局部失败次数；任务总预算覆盖跨区侦察。
+                        method_key += f":chunk:{math.floor(position['x'] / 16)}:{math.floor(position['z'] / 16)}"
                     if step.tool == "collect_obsidian":
                         step, method_key = self._s5_obsidian_site(step, state, method_key)
                         if step.tool != "collect_obsidian":
