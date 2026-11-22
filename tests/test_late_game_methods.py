@@ -96,6 +96,16 @@ def test_s6_preemption_budget_only_credits_new_damage_in_the_same_end_session(tm
     assert not supervisor._record_dragon_damage(before)
 
 
+def test_s6_timed_fight_replans_when_the_observed_dragon_is_still_damaged(tmp_path):
+    state = {**world("the_end"), "end_dragon": {"position": {"x": 1, "y": 66, "z": 0}, "health": 91}}
+    action = {"tool": "fight_dragon", "status": "partial", "receipt_confirmed": True,
+              "result_data": {"dragon_progress": {"started_health": 120, "remaining_health": 91}}}
+    supervisor = GoalSupervisor(GOALS["S6"], TaskStore(tmp_path / "tasks.db"), None, lambda: state)
+    assert supervisor._late_action_recovery(action, state) == "dragon_damage_observed"
+    state["end_dragon"]["health"] = 120
+    assert not supervisor._late_action_recovery(action, state)
+
+
 def test_s5_uses_the_shaft_lip_and_reconsiders_routes_from_the_surface(tmp_path):
     state = world(water_bucket=1)
     state["position"] = {"x": 0.5, "y": 71, "z": 0.5}

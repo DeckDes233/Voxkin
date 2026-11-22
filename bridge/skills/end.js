@@ -1480,6 +1480,7 @@ async function fightDragon(args, ctx) {
 
   let lastDetail = '';
   let lastHealth = dragonHealth(bot, dragon);
+  const startingHealth = lastHealth;
   while (Date.now() < deadline) {
     throwIfInterrupted(ctx, '末地战斗');
     if (!isEndDimension(currentDimension(ctx))) throw new Error('战斗期间离开末地，需要重新观察战场');
@@ -1553,6 +1554,10 @@ async function fightDragon(args, ctx) {
       if (perched) {
         if (bot.health < 18 && ctx.findRangedWeapon?.() && ctx.evadePerchedDragon) {
           await ctx.evadePerchedDragon(dragon);
+          if (bot.food < 20 && distanceToBot(ctx, dragon) >= 15 && !findEntity(ctx, 'area_effect_cloud', 10)) {
+            const food = ctx.findFoodForEating?.();
+            if (food && ctx.eatFood) await ctx.eatFood({ item: food.name, count: 1 });
+          }
           await sleepMs(ctx, 500);
           continue;
         }
@@ -1577,11 +1582,15 @@ async function fightDragon(args, ctx) {
 
   if (!Number.isFinite(lastHealth)) throw new Error('战斗结束时没有观察到龙的生命值或新出现的返回门');
   const remaining = Math.max(1, Math.ceil(lastHealth));
-  throw new Error(
+  const error = new Error(
     `还差 ${remaining} 点血才能击杀末影龙` +
       (lastDetail ? `（${lastDetail}）` : '') +
       (notes.length ? `；${notes.slice(-3).join('，')}` : ''),
   );
+  if (Number.isFinite(startingHealth) && lastHealth > 0 && startingHealth - lastHealth >= 1) {
+    error.data = { dragon_progress: { started_health: startingHealth, remaining_health: lastHealth } };
+  }
+  throw error;
 }
 
 // ------------------------------------------------------------------ 技能：返回主世界

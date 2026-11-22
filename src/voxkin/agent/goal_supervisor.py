@@ -1153,6 +1153,11 @@ class GoalSupervisor:
             return ""
         if action.get("status") == "preempted":
             return "dragon_alive_after_safety"
+        damage = (action.get("result_data") or {}).get("dragon_progress") or {}
+        if (action.get("status") == "partial" and self._finite_number(damage.get("started_health"))
+                and self._finite_number(damage.get("remaining_health")) and self._finite_number(dragon.get("health"))
+                and 0 < dragon["health"] <= damage["remaining_health"] <= damage["started_health"] - 1):
+            return "dragon_damage_observed"
         progress = (action.get("result_data") or {}).get("crystal_progress") or {}
         if (action.get("status") == "partial" and type(progress.get("broken")) is int and 1 <= progress["broken"] <= 10
                 and type(progress.get("remaining_visible")) is int and 1 <= progress["remaining_visible"] <= 10 - progress["broken"]):
