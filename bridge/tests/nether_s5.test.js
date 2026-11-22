@@ -1,7 +1,23 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { skills } from '../skills/nether.js';
+import { skills, surveyPassage } from '../skills/nether.js';
+import { Vec3 } from 'vec3';
+
+test('a bounded fortress tunnel needs solid support and a dry wall along the entire passage', () => {
+  const origin = new Vec3(0, 90, 0);
+  const bot = { game: { dimension: 'the_nether' }, entity: { position: origin }, blockAt(p) {
+    if (p.y < 90 || p.x > 0 && p.x <= 6 && p.z === 0 && p.y <= 92) return { name: 'netherrack', boundingBox: 'block' };
+    return { name: 'air', boundingBox: 'empty' };
+  } };
+  const route = { surveyed: [origin] };
+  assert.equal(surveyPassage(bot, route).direction, 'east');
+  const baseline = bot.blockAt;
+  bot.blockAt = p => p.x === 4 && p.z === 1 && p.y === 92 ? { name: 'lava', boundingBox: 'empty' } : baseline(p);
+  assert.equal(surveyPassage(bot, route), undefined);
+  bot.blockAt = p => p.x === 5 && p.z === 0 && p.y < 90 ? null : baseline(p);
+  assert.equal(surveyPassage(bot, route), undefined);
+});
 
 class Position {
   constructor(x = 0, y = 64, z = 0) {

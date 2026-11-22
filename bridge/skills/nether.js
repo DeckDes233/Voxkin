@@ -1107,6 +1107,28 @@ async function fallbackStep(ctx, route) {
     return false;
   }
   const target = route.surveyed ? nextSurveyPoint(ctx, route) : route.waypoints[route.nextWaypoint];
+  if (route.surveyed && (!target || route.walkFailures >= 2) && ctx.runSkill && route.passages < 2) {
+    const passage = surveyPassage(botOf(ctx), route);
+    if (passage) {
+      route.passages++;
+      route.attemptedWaypoints++;
+      route.surveyed.push(passage.end);
+      try {
+        await ctx.runSkill('strip_mine', { direction: passage.direction, length: 6, branches: 0, torchInterval: 0 });
+      } catch (error) {
+        throwIfInterrupted(ctx, '探索下界堡垒');
+        log(ctx, '短通道停止', error.message);
+        return false;
+      }
+      throwIfInterrupted(ctx, '探索下界堡垒');
+      const p = botOf(ctx).entity.position;
+      if (Math.hypot(p.x - passage.end.x - 0.5, p.z - passage.end.z - 0.5) <= 1.5) {
+        route.confirmed.push({x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z)});
+        route.walkFailures = 0;
+        return true;
+      }
+    }
+  }
   if (!target) {
     route.exhausted = true;
     return false;
@@ -1116,7 +1138,11 @@ async function fallbackStep(ctx, route) {
   try {
     if (route.surveyed) {
       route.surveyed.push({x: target.x, z: target.z});
-      if (await ctx.walkOnce(target.x, target.y, target.z, 2, 12000) !== 'reached') return false;
+      if (await ctx.walkOnce(target.x, target.y, target.z, 0, 12000) !== 'reached') {
+        route.walkFailures++;
+        return false;
+      }
+      route.walkFailures = 0;
       const p = botOf(ctx).entity.position;
       route.confirmed.push({x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z)});
       ctx.reportProgress?.('fortress_survey', '已到新落脚点，继续扫描堡垒', null, {position: route.confirmed.at(-1)});
@@ -1133,6 +1159,33 @@ async function fallbackStep(ctx, route) {
     log(ctx, '外扩搜索走不动', error.message);
     return false;
   }
+}
+
+// 普通寻路被围住时，只开掘已加载、下方有支撑且侧面没有岩浆的短通道。
+const PASSAGE_ROCK = new Set(['netherrack', 'blackstone', 'basalt', 'smooth_basalt', 'nether_quartz_ore', 'nether_gold_ore']);
+export function surveyPassage(bot, route) {
+  const start = bot.entity.position.floored(), choices = [];
+  for (const [direction, dx, dz] of [['east', 1, 0], ['west', -1, 0], ['south', 0, 1], ['north', 0, -1]]) {
+    let hasRock = false, safe = true;
+    for (let step = 1; step <= 6 && safe; step++) {
+      const p = start.offset(dx * step, 0, dz * step);
+      const floor = bot.blockAt(p.offset(0, -1, 0), false);
+      if (floor?.boundingBox !== 'block' || netherRouteExclusion(bot, {position: p}) || besideDrop(bot, p)) { safe = false; break; }
+      for (let y = 0; y <= 2; y++) {
+        const cell = bot.blockAt(p.offset(0, y, 0), false);
+        if (PASSAGE_ROCK.has(cell?.name)) hasRock = true;
+        else if (cell?.name !== 'air' && cell?.name !== 'cave_air') safe = false;
+        for (const [x, h, z] of [[dz, y, dx], [-dz, y, -dx], [0, y + 1, 0], [dx, y, dz]]) {
+          const adjacent = bot.blockAt(p.offset(x, h, z), false);
+          if (!adjacent || ['lava', 'gravel', 'sand'].includes(adjacent.name)) safe = false;
+        }
+      }
+    }
+    const end = start.offset(dx * 6, 0, dz * 6);
+    const clearance = Math.min(...route.surveyed.map(v => Math.hypot(v.x - end.x, v.z - end.z)));
+    if (safe && hasRock && clearance >= 4) choices.push({direction, end, clearance});
+  }
+  return choices.sort((a, b) => b.clearance - a.clearance)[0];
 }
 
 // 堡垒探索：找堡垒结构、找烈焰人、打烈焰人。
@@ -1177,6 +1230,8 @@ async function searchFortress(args, ctx) {
     route.surveyed = (Array.isArray(args.surveyed) ? args.surveyed : []).filter(p => p && Number.isFinite(p.x) && Number.isFinite(p.z)).slice(-24);
     route.surveyed.push(route.origin);
     route.confirmed = [];
+    route.walkFailures = 0;
+    route.passages = 0;
   }
   const deadline = Date.now() + timeoutMs;
 
