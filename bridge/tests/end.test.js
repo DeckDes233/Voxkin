@@ -269,7 +269,11 @@ test('throw_eye reports an estimate as partial until stronghold frames are found
     async look(yaw) {
       bot.entity.yaw = yaw;
     },
-    async activateItem() {},
+    async activateItem() {
+      const p = bot.entity.position;
+      const id = Object.keys(bot.entities).length + 1;
+      bot.entities[id] = { id, name: 'eye_of_ender', position: makePosition(p.x - (id === 1 ? 0 : 12), p.y + 8, p.z + (id === 1 ? 12 : 0)) };
+    },
     async deactivateItem() {},
     findBlocks: () => [],
     blockAt: () => null,
@@ -295,7 +299,7 @@ test('throw_eye reports an estimate as partial until stronghold frames are found
     assert.equal(result.status, 'partial');
     assert.match(result.detail, /两次投掷推算要塞大约在/);
     assert.match(result.detail, /已到达要塞估算点/);
-    assert.deepEqual(destinations.at(-1), { x: 0, y: 64, z: 200 });
+    assert.deepEqual(destinations.at(-1), { x: 0, y: 64, z: 96 });
   });
 });
 
@@ -309,7 +313,11 @@ test('throw_eye does not claim it reached the estimate when travel made no progr
     async look(yaw) {
       bot.entity.yaw = yaw;
     },
-    async activateItem() {},
+    async activateItem() {
+      const p = bot.entity.position;
+      const id = Object.keys(bot.entities).length + 1;
+      bot.entities[id] = { id, name: 'eye_of_ender', position: makePosition(p.x - (id === 1 ? 0 : 12), p.y + 8, p.z + (id === 1 ? 12 : 0)) };
+    },
     async deactivateItem() {},
     findBlocks: () => [],
     blockAt: () => null,
@@ -338,6 +346,19 @@ test('throw_eye does not claim it reached the estimate when travel made no progr
     assert.match(result.detail, /无法到达要塞估算点/);
     assert.doesNotMatch(result.detail, /已到达要塞估算点/);
   });
+});
+
+test('a resumed bearing scans for real frames before spending another eye', async () => {
+  const frame = { name: 'end_portal_frame', position: makePosition(10, 64, 20) };
+  const bot = { entity: { position: makePosition(10, 64, 20) }, game: { dimension: 'overworld' },
+    findBlocks: () => [frame.position], blockAt: () => frame };
+  const resume_search = { search_id: 'first', phase: 'bearing', scan: { dimension: 'overworld' },
+    eye_accounting: { throws_completed: 2, inventory_before: 24 },
+    evidence: { kind: 'eye_bearing', throw_origin: makePosition(), eye_position: makePosition(10, 72, 2) } };
+  const receipt = await skills.throw_eye.handler({ count: 12, resume_search }, { bot, countItem: () => 22 });
+  assert.equal(receipt.status, 'succeeded');
+  assert.equal(receipt.data.stronghold_search.search_id, 'first');
+  assert.equal(receipt.data.stronghold_search.eye_accounting.throws_completed, 2);
 });
 
 test('throw_eye does not reuse direction records from an earlier search', async () => {

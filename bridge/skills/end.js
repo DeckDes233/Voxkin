@@ -7,12 +7,12 @@
 // - 射线求交、框架状态、龙是否停在中央都是纯函数，单独导出，方便脱离游戏单测。
 // - 结果只写真实读到的背包数量、实体与坐标，不凭空说「龙已死」「门已开」。
 //
-// 待接入（ctx 目前没有，集成阶段补；缺了都能降级不崩）：
-// - ctx.runSkill(skillId, args)：跨模块调 combat.js 的 break_crystal。
-//   没有它就自己用 ctx.shootAt 打水晶。
-// - ctx.skills：技能注册表。缺了同样退回本地实现。
+// 跨模块战斗通过 ctx.runSkill 共享当前动作的取消与进度回执。
 
 // ------------------------------------------------------------------ 常量
+
+import { dryMiningFooting, miningRouteExclusion } from '../dry_footing.js';
+import { dragonHealth } from '../world_observation.js';
 
 const END_DIMENSION = 'minecraft:the_end';
 const OVERWORLD_DIMENSION = 'minecraft:overworld';
@@ -413,6 +413,7 @@ function safeSearchContext(raw) {
   const evidence = raw.evidence;
   if (!evidence || typeof evidence !== 'object' || evidence.kind !== 'eye_overhead') return null;
   if (!finitePosition(evidence.throw_origin) || !finitePosition(evidence.eye_position)) return null;
+  if (Number(evidence.eye_position.y) > Number(evidence.throw_origin.y) + 0.25) return null;
   const horizontalDistance = Number(evidence.horizontal_distance);
   if (!Number.isFinite(horizontalDistance) || horizontalDistance < 0 || horizontalDistance >= 20) return null;
   const accounting = raw.eye_accounting;
@@ -690,6 +691,11 @@ async function moveToward(ctx, x, z, radius = 3) {
   const bot = botOf(ctx);
   const y = Math.floor(bot.entity.position.y);
   try {
+    if (typeof ctx.walkOnce === 'function') {
+      const outcome = await ctx.walkOnce(Math.floor(x), y, Math.floor(z), radius, 45000, true);
+      throwIfInterrupted(ctx, '靠近要塞');
+      return outcome === 'reached' && Math.hypot(bot.entity.position.x - x, bot.entity.position.z - z) <= radius + 1;
+    }
     const result = await ctx.travelTo(Math.floor(x), y, Math.floor(z), radius);
     const position = bot.entity.position;
     if (![position.x, position.z].every(Number.isFinite)) return false;
@@ -709,7 +715,8 @@ async function moveToward(ctx, x, z, radius = 3) {
 
 async function throwEye(args, ctx) {
   throwIfInterrupted(ctx, '寻找要塞');
-  if (args && args.resume_search !== undefined) {
+  const bearing = args?.resume_search?.phase === 'bearing' ? args.resume_search : null;
+  if (!bearing && args && args.resume_search !== undefined) {
     return continueStrongholdSearch(args.resume_search, ctx);
   }
   const bot = botOf(ctx);
@@ -722,21 +729,22 @@ async function throwEye(args, ctx) {
   }
 
   const maxThrows = clampNumber(args.count, DEFAULT_EYE_THROWS, 1, 12);
-  const advance = clampNumber(args.advance, 0, 0, 256);
+  const advance = Math.min(96, clampNumber(args.advance, 0, 0, 256));
   const frameRadius = clampNumber(args.frame_radius, 24, 8, 64);
   const timeoutMs = clampNumber(args.timeout_s, 180, 20, 300) * 1000;
   const deadline = Date.now() + timeoutMs;
 
-  let throws = 0;
+  let throws = bearing?.eye_accounting?.throws_completed ?? 0;
   let lastDirection = null;
   const throwRecords = [];
   const notes = [];
-  const inventoryBefore = countItemIfKnown(ctx, EYE_ITEM);
+  const inventoryBefore = bearing?.eye_accounting?.inventory_before ?? countItemIfKnown(ctx, EYE_ITEM);
   let overheadEvidence = null;
   let lastFrameScan = null;
   const estimatedPosition = () => estimateStronghold(throwRecords);
   const makeSearch = (phase, scan = lastFrameScan, stopReason = '') => makeStrongholdSearch(ctx, {
     phase,
+    searchId: bearing?.search_id ?? null,
     estimate: estimatedPosition(),
     throwsCompleted: throws,
     inventoryBefore,
@@ -748,7 +756,25 @@ async function throwEye(args, ctx) {
     stopReason,
   });
 
-  for (let index = 0; index < maxThrows && Date.now() < deadline; index += 1) {
+  if (bearing) {
+    const old = bearing.evidence;
+    if (!bearing.search_id || !isOverworldDimension(bearing.scan?.dimension) || old?.kind !== 'eye_bearing' ||
+        !finitePosition(old.throw_origin) || !finitePosition(old.eye_position) || !Number.isInteger(throws) || throws < 1 || throws >= maxThrows) {
+      throw new Error('投眼方向或剩余次数无法确认');
+    }
+    const origin = old.throw_origin;
+    const direction = normalizeVector(old.eye_position.x - origin.x, old.eye_position.z - origin.z);
+    if (!direction) throw new Error('投眼轨迹没有可用水平方向');
+    const scan = scanFramesFresh(ctx, S6_FRAME_RADIUS);
+    if (!scan.fresh || !scan.stable) throw new Error('续跑前无法确认当前主世界区块');
+    if (scan.frames.length) return searchReceipt('succeeded', '恢复时在附近观察到末地门框', makeSearch('frames_found', scan));
+    if (Math.hypot(bot.entity.position.x - origin.x, bot.entity.position.z - origin.z) < 8 &&
+        !await moveToward(ctx, origin.x + direction.dx * 32, origin.z + direction.dz * 32)) {
+      return searchReceipt('partial', '恢复时未走到新投眼地点', { ...bearing, phase: 'blocked', resume_allowed: false });
+    }
+    throwRecords.push({ x: origin.x, z: origin.z, ...direction });
+  }
+  while (throws < maxThrows && Date.now() < deadline) {
     throwIfInterrupted(ctx, '寻找要塞');
     const eye = findItem(ctx, EYE_ITEM);
     if (!eye) {
@@ -767,10 +793,12 @@ async function throwEye(args, ctx) {
     await bot.equip(eye, 'hand');
     throwIfInterrupted(ctx, '寻找要塞');
     await bot.look(yaw, 0, true);
+    // 发出下一次使用前撤销上一投的检查点，避免中断时按旧库存对账。
+    ctx.reportProgress?.('throwing_eye', '正在投掷末影之眼', 0);
     await activateOnce(ctx);
     throws += 1;
 
-    const observed = await trackEye(ctx, knownIds, 2400);
+    const observed = await trackEye(ctx, knownIds, 4800);
     throwIfInterrupted(ctx, '寻找要塞');
     let direction = fallback;
     let eyeDistance = null;
@@ -779,11 +807,11 @@ async function throwEye(args, ctx) {
       const fromFlight = normalizeVector(observed.position.x - origin.x, observed.position.z - origin.z);
       if (fromFlight) direction = fromFlight;
     } else {
-      notes.push('没看到末影之眼的飞行实体，按投掷朝向推算');
+      notes.push('未观察到飞行实体，停止按方向移动');
     }
 
-    lastDirection = direction;
-    throwRecords.push({
+    lastDirection = observed ? direction : null;
+    if (observed) throwRecords.push({
       x: origin.x,
       z: origin.z,
       dx: direction.dx,
@@ -793,7 +821,7 @@ async function throwEye(args, ctx) {
       throwRecords.splice(0, throwRecords.length - MAX_THROW_RECORDS);
     }
 
-    if (observed && observed.settled && eyeDistance !== null && eyeDistance < 20) {
+    if (observed?.settled && observed.position.y <= origin.y + 0.25 && eyeDistance !== null && eyeDistance < 20) {
       overheadEvidence = {
         kind: 'eye_overhead',
         throw_origin: origin,
@@ -803,8 +831,17 @@ async function throwEye(args, ctx) {
     }
 
     lastFrameScan = scanFramesFresh(ctx, frameRadius);
-      if (!lastFrameScan.fresh || !lastFrameScan.stable) {
-        return searchReceipt('partial', '投眼后 fresh frame scan 无法重查门框区块或未确认稳定主世界；已保留搜索账本',
+    if (observed && lastFrameScan.fresh && lastFrameScan.stable) {
+      const checkpoint = makeSearch(overheadEvidence ? 'descend' : throws < maxThrows ? 'bearing' : 'blocked', lastFrameScan);
+      checkpoint.throw_limit = maxThrows;
+      if (!overheadEvidence) {
+        checkpoint.evidence = { kind: 'eye_bearing', throw_origin: origin, eye_position: observed.position };
+        checkpoint.stop_reason = '沿已观察的投眼方向移动时中断';
+      }
+      ctx.reportProgress?.('eye_observed', '已记录末影之眼轨迹与实际库存', 0, { stronghold_search: checkpoint });
+    }
+    if (!lastFrameScan.fresh || !lastFrameScan.stable) {
+      return searchReceipt('partial', '投眼后 fresh frame scan 无法重查门框区块或未确认稳定主世界；已保留搜索账本',
         makeSearch('blocked', lastFrameScan, 'frame_scan_dimension_unverified'));
     }
     if (lastFrameScan.frames.length > 0) {
@@ -839,6 +876,7 @@ async function throwEye(args, ctx) {
     }
 
     const estimate = estimatedPosition();
+    if (!observed) break;
     if (advance > 0 && estimate && estimate.distance <= advance + frameRadius) {
       const moved = await moveToward(ctx, estimate.x, estimate.z, 4);
       throwIfInterrupted(ctx, '寻找要塞');
@@ -894,14 +932,55 @@ async function throwEye(args, ctx) {
 
 // ------------------------------------------------------------------ 技能：激活末地门
 
-async function insertEye(ctx, frame) {
+function visibleFrame(bot, feet, frame) {
+  const eye = feet.offset(0, bot.entity.eyeHeight ?? 1.62, 0);
+  const ray = frame.position.offset(0.5, 0.45, 0.5).minus(eye);
+  const reach = ray.norm();
+  return reach > 0 && reach <= 4.5 && bot.world.raycast(eye, ray.scaled(1 / reach), reach + 0.1)?.position.equals(frame.position);
+}
+
+async function reachFrameFromOutside(ctx, frame, frames) {
+  const bot = botOf(ctx), feet = bot.entity.position;
+  if (dryMiningFooting(bot, feet) && visibleFrame(bot, feet, frame)) return true;
+  const floor = frame.position.y;
+  const minX = Math.min(...frames.map(f => f.position.x)), minZ = Math.min(...frames.map(f => f.position.z));
+  const inside = p => p.x >= minX && p.x <= minX + 4 && p.z >= minZ && p.z <= minZ + 4;
+  const stands = [];
+  for (let x = -4; x <= 4; x++) for (let z = -4; z <= 4; z++) for (let y = -3; y <= 2; y++) {
+    const stand = frame.position.offset(x, y, z);
+    if (!inside(stand) && dryMiningFooting(bot, stand) && visibleFrame(bot, stand.offset(0.5, 0, 0.5), frame)) stands.push(stand);
+  }
+  const movements = bot.pathfinder.movements;
+  const previous = { exclusionAreasStep: movements.exclusionAreasStep, exclusionAreasBreak: movements.exclusionAreasBreak,
+    allowParkour: movements.allowParkour, maxDropDown: movements.maxDropDown };
+  Object.assign(movements, { allowParkour: false, maxDropDown: 1,
+    exclusionAreasStep: [...(previous.exclusionAreasStep || []), b => !b?.position || (inside(b.position) && b.position.y <= floor + 1) ? 100 : miningRouteExclusion(bot, b)],
+    exclusionAreasBreak: [...(previous.exclusionAreasBreak || []), b => !b?.position || (inside(b.position) && b.position.y <= floor) ? 100 : 0] });
+  try {
+    stands.sort((a, b) => a.distanceTo(feet) - b.distanceTo(feet));
+    for (const stand of stands.slice(0, 4)) {
+      throwIfInterrupted(ctx, '在门框外侧移动');
+      await ctx.walkOnce(stand.x, stand.y, stand.z, 0, 6000);
+      if (dryMiningFooting(bot, bot.entity.position) && visibleFrame(bot, bot.entity.position, frame)) return true;
+    }
+    return false;
+  } finally {
+    Object.assign(movements, previous);
+  }
+}
+
+async function insertEye(ctx, frame, frames) {
   throwIfInterrupted(ctx, '激活末地门');
   const bot = botOf(ctx);
-  try {
-    await ctx.travelTo(frame.position.x, frame.position.y, frame.position.z, 2);
-  } catch (error) {
-    throwIfInterrupted(ctx, '激活末地门');
-    log(ctx, '没走到末地门框架', error.message);
+  if (bot.pathfinder?.movements && bot.world?.raycast && ctx.walkOnce) {
+    if (!await reachFrameFromOutside(ctx, frame, frames)) return false;
+  } else {
+    try {
+      await ctx.travelTo(frame.position.x, frame.position.y, frame.position.z, 2);
+    } catch (error) {
+      throwIfInterrupted(ctx, '激活末地门');
+      log(ctx, '没走到末地门框架', error.message);
+    }
   }
   const eye = findItem(ctx, EYE_ITEM);
   if (!eye) return false;
@@ -942,12 +1021,69 @@ async function insertEye(ctx, frame) {
   return frameHasEye(after);
 }
 
+async function crossPortalSurface(ctx, center, y, expected) {
+  const bot = botOf(ctx), here = bot.entity.position;
+  const horizontal = Math.hypot(here.x - center.x, here.z - center.z);
+  if (here.y < y + 0.7 || here.y > y + 2 || horizontal > 5) return false;
+  const steps = Math.max(1, Math.ceil(horizontal * 3));
+  for (let i = 1; i <= steps; i++) {
+    const tile = here.offset((center.x - here.x) * i / steps, y - here.y, (center.z - here.z) * i / steps).floored();
+    const floor = bot.blockAt(tile);
+    if (!floor || !(floor.name === PORTAL_BLOCK || floor.name === FRAME_BLOCK || floor.boundingBox === 'block')) return false;
+    if (bot.blockAt(tile.offset(0, 1, 0))?.boundingBox !== 'empty' || bot.blockAt(tile.offset(0, 2, 0))?.boundingBox !== 'empty') return false;
+  }
+  await bot.lookAt(center.offset(0, here.y - center.y + 1.4, 0), true);
+  bot.setControlState('forward', true);
+  try {
+    for (let tick = 0; tick < 35; tick++) {
+      if (isExpectedDimension(ctx, expected)) return true;
+      throwIfInterrupted(ctx, '跨过已激活的门面');
+      if (bot.entity.position.y < y - 0.3) break;
+      await sleepMs(ctx, 50);
+    }
+    return isExpectedDimension(ctx, expected);
+  } finally {
+    bot.setControlState('forward', false);
+  }
+}
+
 async function enterEndPortal(ctx, portal, expectedDimension, timeoutMs) {
   throwIfInterrupted(ctx, '进入末地');
   const bot = botOf(ctx);
   const x = Math.floor(portal.x);
   const y = Math.floor(portal.y);
   const z = Math.floor(portal.z);
+  if (expectedDimension === END_DIMENSION && bot.world?.raycast && bot.pathfinder?.movements && ctx.walkOnce) {
+    const frames = findFramesNearby(ctx, 16);
+    const tiles = findBlockPositions(ctx, PORTAL_BLOCK, 16, 9);
+    if (frames.length !== PORTAL_FRAME_COUNT || tiles.length !== 9) return false;
+    const center = tiles.reduce((p, tile) => p.plus(tile), tiles[0].scaled(0)).scaled(1 / tiles.length).offset(0.5, 0, 0.5);
+    if (await crossPortalSurface(ctx, center, y, expectedDimension)) return true;
+    const movements = bot.pathfinder.movements;
+    const previous = { canDig: movements.canDig, allowParkour: movements.allowParkour, maxDropDown: movements.maxDropDown,
+      exclusionAreasStep: movements.exclusionAreasStep };
+    const belowPortal = p => Math.abs(p.x + 0.5 - center.x) <= 2 && Math.abs(p.z + 0.5 - center.z) <= 2 && p.y < y;
+    Object.assign(movements, { canDig: false, allowParkour: false, maxDropDown: 1,
+      exclusionAreasStep: [...(previous.exclusionAreasStep || []), b => !b?.position || belowPortal(b.position) ? 100 : miningRouteExclusion(bot, b)] });
+    const deadline = Date.now() + timeoutMs;
+    try {
+      frames.sort((a, b) => a.position.distanceTo(bot.entity.position) - b.position.distanceTo(bot.entity.position));
+      for (const frame of frames) {
+        if (Date.now() >= deadline) break;
+        if (isExpectedDimension(ctx, expectedDimension)) return true;
+        throwIfInterrupted(ctx, '从门框上沿进入末地');
+        const p = frame.position;
+        await ctx.walkOnce(p.x, y + 1, p.z, 0, Math.min(5000, deadline - Date.now()));
+        if (isExpectedDimension(ctx, expectedDimension)) return true;
+        const here = bot.entity.position;
+        if (here.y < y + 0.7 || here.y > y + 2 || Math.hypot(here.x - p.x - 0.5, here.z - p.z - 0.5) > 1.2) continue;
+        if (await crossPortalSurface(ctx, center, y, expectedDimension)) return true;
+      }
+      return isExpectedDimension(ctx, expectedDimension);
+    } finally {
+      Object.assign(movements, previous);
+    }
+  }
   try {
     await ctx.travelTo(x, y, z, 1);
   } catch (error) {
@@ -998,10 +1134,8 @@ async function activateEndPortal(args, ctx) {
     throw new Error(`附近 ${radius} 格内没有末地门框架，先用 throw_eye 找到要塞`);
   }
   if (frames.length < PORTAL_FRAME_COUNT) {
-    throw new Error(
-      `只找到 ${frames.length} 个末地门框架，还差 ${PORTAL_FRAME_COUNT - frames.length} 个，` +
-        '可能还没走到要塞的传送门房间',
-    );
+    return { status: 'partial', detail: `观察到 ${frames.length} 个末地门框架，需走近房间后再插眼`,
+      data: { portal_phase: 'before_insertion', frames: frames.map(frame => copyPosition(frame.position)) } };
   }
 
   const filledBefore = frames.filter(frameHasEye).length;
@@ -1026,9 +1160,13 @@ async function activateEndPortal(args, ctx) {
     for (const frame of unfilled) {
       throwIfInterrupted(ctx, '激活末地门');
       if (Date.now() > deadline) break;
-      const ok = await insertEye(ctx, frame);
+      const ok = await insertEye(ctx, frame, frames);
       throwIfInterrupted(ctx, '激活末地门');
-      if (ok) inserted += 1;
+      if (ok) {
+        inserted += 1;
+        ctx.reportProgress?.('inserting_eyes', `已确认 ${filledBefore + inserted}/12 个门框有眼`, (filledBefore + inserted) / 12,
+          { portal_phase: 'inserting', filled: filledBefore + inserted });
+      }
       else failures.push(`${frame.position.x}, ${frame.position.y}, ${frame.position.z}`);
       await sleepMs(ctx, 250);
     }
@@ -1159,6 +1297,80 @@ async function moveToArenaCenter(ctx) {
   }
 }
 
+async function reachEndIsland(ctx, deadline) {
+  const bot = botOf(ctx);
+  const origin = bot.entity.position;
+  const arenaRadius = 24;
+  if (Math.hypot(origin.x, origin.z) <= arenaRadius) return;
+  const movements = bot.pathfinder?.movements;
+  if (!movements || !ctx.walkOnce) return;
+  const previous = { canDig: movements.canDig, allowParkour: movements.allowParkour, maxDropDown: movements.maxDropDown };
+  Object.assign(movements, { canDig: false, allowParkour: false, maxDropDown: 1 });
+  try {
+    for (let step = 0; step < 96 && Date.now() < deadline; step++) {
+      throwIfInterrupted(ctx, '从出生平台走上末地主岛');
+      const here = bot.entity.position.floored();
+      if (Math.hypot(here.x, here.z) <= arenaRadius) return;
+      const dx = Math.abs(here.x) >= Math.abs(here.z) ? -Math.sign(here.x) : 0;
+      const dz = dx ? 0 : -Math.sign(here.z);
+      // 岛面上按短程路点移动，错开黑曜石柱。虚空上的每一块桥面仍逐格确认。
+      if (bot.blockAt(here.offset(0, -1, 0))?.name === 'end_stone') {
+        let advanced = false;
+        for (const lateral of [0, 6, -6]) {
+          const ahead = here.offset(dx * 18 + dz * lateral, 0, dz * 18 - dx * lateral);
+          let surface = null;
+          for (let h = 9; h >= -5; h--) {
+            const p = ahead.offset(0, h, 0);
+            if (bot.blockAt(p.offset(0, -1, 0))?.name === 'end_stone' && dryMiningFooting(bot, p)) {
+              surface = p;
+              break;
+            }
+          }
+          if (!surface) continue;
+          await ctx.walkOnce(surface.x, surface.y, surface.z, 1, Math.min(12000, Math.max(1, deadline - Date.now())));
+          if (Math.hypot(bot.entity.position.x, bot.entity.position.z) < Math.hypot(here.x, here.z) - 2) {
+            advanced = true;
+            break;
+          }
+        }
+        if (advanced) continue;
+      }
+      const next = here.offset(dx, 0, dz);
+      const foot = bot.blockAt(next), floor = bot.blockAt(next.offset(0, -1, 0));
+      if (!foot || !floor) break;
+      let targetY = here.y;
+      if (foot.boundingBox === 'block') {
+        targetY++;
+      } else if (floor.boundingBox === 'empty') {
+        if (!dryMiningFooting(bot, here)) break;
+        const material = ['cobblestone', 'cobbled_deepslate', 'granite', 'andesite', 'end_stone'].find(name => ctx.countItem(name) > 0);
+        if (!material) break;
+        await ctx.placeBlock({ block: material, x: next.x, y: here.y - 1, z: next.z });
+      }
+      let stand = next.offset(0, targetY - here.y, 0);
+      if (!dryMiningFooting(bot, stand)) {
+        // 岸壁超过一级时，仅向前方已观察到的岛面寻路。
+        stand = null;
+        for (let up = 2; up <= 16; up++) {
+          const p = next.offset(0, up, 0);
+          if (bot.blockAt(p.offset(0, -1, 0))?.name === 'end_stone' && dryMiningFooting(bot, p)) {
+            stand = p;
+            break;
+          }
+        }
+        if (!stand) break;
+      }
+      const outcome = await ctx.walkOnce(stand.x, stand.y, stand.z, 0, Math.min(14000, Math.max(1, deadline - Date.now())));
+      if (outcome !== 'reached' && here.distanceTo(bot.entity.position.floored()) < 2) break;
+    }
+  } finally {
+    Object.assign(movements, previous);
+  }
+  if (Math.hypot(bot.entity.position.x, bot.entity.position.z) > arenaRadius) {
+    throw new Error('从末地出生点向主岛前进时未能确认下一处落脚点');
+  }
+}
+
 async function fightDragon(args, ctx) {
   throwIfInterrupted(ctx, '末地战斗');
   const bot = botOf(ctx);
@@ -1170,6 +1382,11 @@ async function fightDragon(args, ctx) {
   const timeoutMs = clampNumber(args.timeout_s, 240, 30, 300) * 1000;
   const deadline = Date.now() + timeoutMs;
   const notes = [];
+  const pumpkin = findItem(ctx, 'carved_pumpkin');
+  if (pumpkin && bot.inventory.slots?.[5]?.name !== 'carved_pumpkin') await bot.equip(pumpkin, 'head');
+  const onIsland = bot.entity.position.floored && bot.blockAt?.(bot.entity.position.floored().offset(0, -1, 0))?.name === 'end_stone';
+  const canEngage = onIsland && findEntity(ctx, DRAGON_ENTITY, radius) && findEntity(ctx, CRYSTAL_ENTITY, radius);
+  if (!canEngage) await reachEndIsland(ctx, deadline);
   const returnPortalPresentAtStart = findBlockPositions(ctx, PORTAL_BLOCK, 128, 8).length > 0;
 
   let dragon = findEntity(ctx, DRAGON_ENTITY, radius);
@@ -1199,7 +1416,8 @@ async function fightDragon(args, ctx) {
     throw new Error('附近没有末影龙，可能还没生成');
   }
 
-  const crystalResult = await clearCrystals(ctx, radius, deadline);
+  const crystalResult = await clearCrystals(ctx, Math.max(radius, 96), deadline);
+  if (!isEndDimension(currentDimension(ctx))) throw new Error('清除水晶期间离开末地，需要重新观察战场');
   notes.push(...crystalResult.notes);
   if (crystalResult.left > 0) {
     throw new Error(
@@ -1209,9 +1427,10 @@ async function fightDragon(args, ctx) {
   }
 
   let lastDetail = '';
-  let lastHealth = Number(dragon.health);
+  let lastHealth = dragonHealth(bot, dragon);
   while (Date.now() < deadline) {
     throwIfInterrupted(ctx, '末地战斗');
+    if (!isEndDimension(currentDimension(ctx))) throw new Error('战斗期间离开末地，需要重新观察战场');
     dragon = findEntity(ctx, DRAGON_ENTITY, radius);
     if (!dragon) {
       const returnPortalPresentNow = findBlockPositions(ctx, PORTAL_BLOCK, 128, 8).length > 0;
@@ -1230,7 +1449,7 @@ async function fightDragon(args, ctx) {
       await sleepMs(ctx, 500);
       continue;
     }
-    lastHealth = Number(dragon.health);
+    lastHealth = dragonHealth(bot, dragon);
     if (Number.isFinite(lastHealth) && lastHealth <= 0) {
       return {
         detail: `末影龙血量归零，打碎 ${crystalResult.broken} 个末地水晶`,
@@ -1369,7 +1588,7 @@ export const skills = {
       { name: 'advance', type: 'number', required: false, default: 0, description: '每次投掷后朝眼飞的方向走多少格，0 表示原地投。' },
       { name: 'frame_radius', type: 'number', required: false, default: 24, description: '发现末地门框架的搜索半径，范围 8-64 格。' },
       { name: 'timeout_s', type: 'number', required: false, default: 180, description: '整个寻找过程的最长用时，范围 20-300 秒。' },
-      { name: 'resume_search', type: 'object', required: false, default: null, description: 'Core 内部续跑字段；仅使用先前 Bridge 回执中的 stronghold_search，续跑不会再次投掷末影之眼。' },
+      { name: 'resume_search', type: 'object', required: false, default: null, description: 'Core 按先前回执恢复定位。沿已测方向实际前进后可在剩余预算内再次投眼，下探时沿用已有轨迹。' },
     ],
     handler: throwEye,
   },

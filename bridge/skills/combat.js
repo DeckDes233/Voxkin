@@ -1,5 +1,6 @@
 // 战斗技能模块：狩猎被动生物、与烈焰人交战、猎取末影人、破坏末地水晶、举盾格挡。
 import { assessCombatEncounter, combatEquipment } from '../combat_encounter.js';
+import { dryMiningFooting } from '../dry_footing.js';
 //
 // 约束（见 docs/plans/SKILL_MODULE_CONTRACT.md）：
 // - 只用 ctx 提供的能力，不 import 任何运行时依赖；bot 从 ctx.bot 取。
@@ -1731,16 +1732,25 @@ async function breakCrystal(args, ctx) {
   }
 
   const list = limit > 0 ? crystals.slice(0, limit) : crystals;
+  const dimension = ctx.bot.game?.dimension;
+  if (ctx.bot.world?.raycast) {
+    const visible = new Set();
+    for (const crystal of list) {
+      await ctx.sleep(0);
+      throwIfInterrupted(ctx, '选择可见水晶');
+      if (visibleCrystalAim(ctx.bot, crystal)) visible.add(crystal);
+    }
+    list.sort((a,b) => Number(visible.has(b)) - Number(visible.has(a)));
+  }
   let broken = 0;
-  let failed = 0;
   let hurt = 0;
   const notes = [];
 
   for (const crystal of list) {
     throwIfInterrupted(ctx, '清除末地水晶');
+    if (ctx.bot.game?.dimension !== dimension) throw new Error('清除水晶期间已切换维度');
     if (Date.now() > deadline) {
       notes.push('时间不够');
-      failed += 1;
       break;
     }
     if (crystal.isValid === false) continue;
@@ -1752,27 +1762,31 @@ async function breakCrystal(args, ctx) {
       await moveAwayFrom(ctx, crystal.position, safeDistance + 4);
     }
     throwIfInterrupted(ctx, '清除末地水晶');
-    const shot = await shootCrystal(ctx, crystal);
+    let shot = await shootCrystal(ctx, crystal);
+    if (!shot && ctx.walkOnce && ctx.bot.world?.raycast && Date.now() < deadline) {
+      if (await reachCrystalVantage(ctx, crystal, deadline)) shot = await shootCrystal(ctx, crystal);
+    }
     throwIfInterrupted(ctx, '清除末地水晶');
     if (!shot) {
-      failed += 1;
       notes.push('弓射失败');
       continue;
     }
     const gone = await waitCrystalGone(ctx, crystal, 6000);
     throwIfInterrupted(ctx, '清除末地水晶');
+    if (ctx.bot.game?.dimension !== dimension) throw new Error('清除水晶期间已切换维度');
     if (gone) {
       broken += 1;
     } else {
-      failed += 1;
-      notes.push('水晶没碎，可能被玻璃挡住');
+      notes.push('射击后仍能观察到水晶');
     }
 
     const endHealth = Number(ctx.bot.health ?? 20);
     if (endHealth < startHealth) hurt += startHealth - endHealth;
 
     // 躲开爆炸，再等一段安全间隔再打下一个。
-    await moveAwayFrom(ctx, crystal.position, safeDistance + 4);
+    if (distance3(crystal.position, ctx.bot.entity.position) < safeDistance) {
+      await moveAwayFrom(ctx, crystal.position, safeDistance + 4);
+    }
     throwIfInterrupted(ctx, '清除末地水晶');
     if (Number(ctx.bot.health ?? 20) <= 8) {
       await recoverHealth(ctx, 12, 20000);
@@ -1788,11 +1802,11 @@ async function breakCrystal(args, ctx) {
       `附近 ${radius} 格内有 ${list.length} 个末地水晶，一个都没打碎${notes.length ? `（${notes.join('、')}）` : ''}`
     );
   }
-  const left = list.length - broken - failed;
+  const left = list.filter(crystal => crystal.isValid !== false).length;
   if (left > 0) {
-    throw new Error(
-      `还差 ${left} 个末地水晶，只打碎了 ${broken} 个${notes.length ? `（${notes.join('、')}）` : ''}`
-    );
+    const error = new Error(`还差 ${left} 个末地水晶，只打碎了 ${broken} 个${notes.length ? `（${notes.join('、')}）` : ''}`);
+    error.data = { crystal_progress: { broken, remaining_visible: left } };
+    throw error;
   }
   return {
     detail: `用弓打碎了 ${broken} 个末地水晶${hurt > 0 ? `，被爆炸炸掉 ${hurt} 点血` : '，没被炸到'}`,
@@ -1800,7 +1814,108 @@ async function breakCrystal(args, ctx) {
   };
 }
 
-// 射水晶：瞄准点自己算，避免服务端没给 height 时算出 NaN 坐标。
+// 根据 Java 版箭矢逐 tick 的空气阻力和下落量，求满弓时能到达静止水晶的低角度。
+export function crystalAimPoint(bot, crystal, target = crystal.position.offset(0, entityHeight(crystal) * 0.5, 0), eye = bot.entity.position) {
+  const eyeY = eye.y + (bot.entity.eyeHeight ?? 1.62) - 0.1;
+  const horizontal = Math.hypot(target.x - eye.x, target.z - eye.z);
+  const rangeAt = ticks => (1 - 0.99 ** ticks) / 0.01;
+  const dropAt = ticks => 5 * (ticks - rangeAt(ticks));
+  const speedAt = ticks => Math.hypot(horizontal, target.y - eyeY + dropAt(ticks)) / rangeAt(ticks);
+  for (let tick = 1; tick <= 100; tick++) {
+    if (speedAt(tick) > 3) continue;
+    let low = tick - 1, high = tick;
+    for (let i = 0; i < 8; i++) {
+      const mid = (low + high) / 2;
+      if (speedAt(mid) > 3) low = mid;
+      else high = mid;
+    }
+    return crystal.position.offset(target.x - crystal.position.x, target.y - crystal.position.y + dropAt(high) + 0.1, target.z - crystal.position.z);
+  }
+  return null;
+}
+
+// 一次运动与水晶碰撞箱的首次交点，用同一段内的距离比较先碰方块还是实体。
+function crystalEntry(position, velocity, center) {
+  let enter = 0, leave = 1;
+  for (const axis of ['x', 'y', 'z']) {
+    const min = center[axis] - (axis === 'y' ? 0 : 0.95);
+    const max = center[axis] + (axis === 'y' ? 2 : 0.95);
+    if (Math.abs(velocity[axis]) < 1e-9) {
+      if (position[axis] < min || position[axis] > max) return null;
+      continue;
+    }
+    const a = (min - position[axis]) / velocity[axis], b = (max - position[axis]) / velocity[axis];
+    enter = Math.max(enter, Math.min(a, b));
+    leave = Math.min(leave, Math.max(a, b));
+    if (enter > leave) return null;
+  }
+  return enter;
+}
+
+export function visibleCrystalAim(bot, crystal, feet = bot.entity.position) {
+  if (!bot.world?.raycast) return crystalAimPoint(bot, crystal);
+  const eye = feet.offset(0, bot.entity.eyeHeight ?? 1.62, 0);
+  // 水晶碰撞箱宽 2 格，高 2 格。从中心和上缘选一个能先碰到水晶的角度。
+  const edgeX = Math.sign(eye.x - crystal.position.x) * 0.85, edgeZ = Math.sign(eye.z - crystal.position.z) * 0.85;
+  for (const [dx, dy, dz] of [[0,1,0], [edgeX,0.25,edgeZ], [edgeX,1.8,edgeZ], [0,1.8,0], [0.7,1.7,0], [-0.7,1.7,0], [0,1.7,0.7], [0,1.7,-0.7]]) {
+    const target = crystal.position.offset(dx, dy, dz);
+    const aim = crystalAimPoint(bot, crystal, target, feet);
+    if (!aim) continue;
+    let p = eye.offset(0,-0.1,0), velocity = aim.minus(eye).normalize().scaled(3);
+    for (let tick = 0; tick < 100; tick++) {
+      const length = velocity.norm(), direction = velocity.scaled(1 / length);
+      const entry = crystalEntry(p, velocity, crystal.position);
+      const range = (entry ?? 1) * length;
+      const blocked = bot.world.raycast(p, direction, range, (block, iterator) => {
+        const hit = iterator.intersect(block.shapes, block.position);
+        if (!hit) return false;
+        const along = hit.pos.minus(p).dot(direction);
+        return along >= 0 && along <= range;
+      });
+      if (blocked) break;
+      if (entry !== null) return aim;
+      p = p.plus(velocity);
+      if (velocity.y < 0 && p.y < target.y - 2) break;
+      velocity = velocity.scaled(0.99).offset(0,-0.05,0);
+    }
+  }
+  return null;
+}
+
+async function reachCrystalVantage(ctx, crystal, deadline) {
+  const bot = ctx.bot, origin = bot.entity.position.floored();
+  const columns = [];
+  const base = crystal.position.floored();
+  const caged = [[2,0],[-2,0],[0,2],[0,-2]].some(([dx,dz]) => bot.blockAt(base.offset(dx,0,dz))?.name === 'iron_bars');
+  if (caged) {
+    for (const gap of [3,4,5,6,8,10,12]) {
+      for (const [dx,dz] of [[1,1],[-1,1],[1,-1],[-1,-1]]) columns.push(base.offset(dx * gap, origin.y - base.y, dz * gap));
+    }
+  }
+  for (const radius of [12,24,36]) {
+    for (const [dx,dz] of [[-1,0],[0,-1],[0,1],[1,0],[-0.7,-0.7],[-0.7,0.7],[0.7,-0.7],[0.7,0.7]]) {
+      columns.push(origin.offset(Math.round(radius * dx), 0, Math.round(radius * dz)));
+    }
+  }
+  columns.sort((a,b) => a.distanceTo(origin) - b.distanceTo(origin));
+  for (const column of columns) {
+    await ctx.sleep(0);
+    throwIfInterrupted(ctx, '寻找能射到水晶的落脚点');
+    if (Date.now() >= deadline) return false;
+    if (Math.hypot(column.x, column.z) > 70) continue;
+    for (let y = 6; y >= -6; y--) {
+      const stand = column.offset(0, y, 0);
+      if (bot.blockAt(stand.offset(0, -1, 0))?.name !== 'end_stone' || !dryMiningFooting(bot, stand)) continue;
+      const feet = stand.offset(0.5, 0, 0.5);
+      if (feet.distanceTo(crystal.position) < 15 || !visibleCrystalAim(bot, crystal, feet)) break;
+      await ctx.walkOnce(stand.x, stand.y, stand.z, 0, Math.min(8000, Math.max(1, deadline - Date.now())));
+      if (visibleCrystalAim(bot, crystal)) return true;
+      break;
+    }
+  }
+  return false;
+}
+
 async function shootCrystal(ctx, crystal) {
   throwIfInterrupted(ctx, '射击末地水晶');
   const bot = ctx.bot;
@@ -1809,12 +1924,13 @@ async function shootCrystal(ctx, crystal) {
   try {
     await bot.equip(ranged.bow, 'hand');
     throwIfInterrupted(ctx, '射击末地水晶');
-    const aim = crystal.position.offset(0, entityHeight(crystal) * 0.5, 0);
+    const aim = ranged.bow.name === 'bow' ? visibleCrystalAim(bot, crystal) : crystal.position.offset(0, entityHeight(crystal) * 0.5, 0);
+    if (!aim) return false;
     await bot.lookAt(aim, true);
     throwIfInterrupted(ctx, '射击末地水晶');
     bot.activateItem();
     try {
-      await ctx.sleep(ranged.bow.name === 'crossbow' ? 1250 : 900);
+      await ctx.sleep(ranged.bow.name === 'crossbow' ? 1250 : 1100);
     } finally {
       bot.deactivateItem();
     }

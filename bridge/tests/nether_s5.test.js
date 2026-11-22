@@ -67,7 +67,8 @@ test('nether_travel records observed source portal and actual destination arriva
   const entryPortal = { x: 2, y: 64, z: 3 };
   entry.setBlock('nether_portal', entryPortal);
   entry.ctx.nearbyBlock = () => ({ position: entryPortal });
-  entry.ctx.walkOnce = async () => {
+  entry.ctx.sleep = async () => {
+    assert.equal(entry.bot.blockAt(entry.bot.entity.position).name, 'nether_portal');
     entry.bot.game.dimension = 'minecraft:the_nether';
     entry.bot.entity.position = new Position(121, 71, -249);
   };
@@ -100,7 +101,8 @@ test('nether_travel records observed source portal and actual destination arriva
     travelTargets.push({ x, y, z });
     exit.bot.entity.position = new Position(x, y, z);
   };
-  exit.ctx.walkOnce = async () => {
+  exit.ctx.sleep = async () => {
+    assert.equal(exit.bot.blockAt(exit.bot.entity.position).name, 'nether_portal');
     exit.bot.game.dimension = 'minecraft:overworld';
     exit.bot.entity.position = new Position(22, 65, 33);
   };
@@ -179,7 +181,7 @@ test('a restored portal hint is only a search anchor and exact vanilla dimension
     travelTargets.push({ x, y, z });
     bot.entity.position = new Position(x, y, z);
   };
-  ctx.walkOnce = async () => {
+  ctx.sleep = async () => {
     bot.game.dimension = 'minecraft:overworld';
     bot.entity.position = new Position(10, 64, 10);
   };
@@ -227,12 +229,14 @@ test('dimension helpers reject custom, partial, and unknown dimension names', as
 
 test('nether_travel stops after one unexpected or unknown dimension transition', async () => {
   for (const nextDimension of ['minecraft:the_end', '']) {
-    const { bot, ctx } = makeContext('minecraft:the_nether');
+    const { bot, ctx, setBlock } = makeContext('minecraft:the_nether');
     let walks = 0;
     const portal = { x: 1, y: 64, z: 0 };
-    bot.blockAt = () => ({ name: 'nether_portal', position: portal });
+    setBlock('nether_portal', portal);
+    ctx.travelTo = async () => {};
     ctx.nearbyBlock = () => ({ position: portal });
-    ctx.walkOnce = async () => {
+    ctx.walkOnce = async (x, y, z, radius) => {
+      assert.deepEqual([x, y, z, radius], [1, 64, 0, 0]);
       walks += 1;
       bot.game.dimension = nextDimension;
     };
@@ -317,6 +321,15 @@ test('raid_fortress returns only actually scanned fortress block coordinates', a
   });
 
   assert.deepEqual(travelTargets[0], fortress);
+});
+
+test('scouting records a live blaze without initiating combat', async () => {
+  const { bot, ctx } = makeContext();
+  bot.entities = { blaze: { name: 'blaze', position: new Position(2, 64, 0) } };
+  ctx.runSkill = () => assert.fail('scouting initiated combat');
+  const result = await skills.raid_fortress.handler({ scout_only: true }, ctx);
+  assert.deepEqual(result.data.events, ['fortress_route_found']);
+  assert.deepEqual(result.data.blaze_evidence.position, { x: 2, y: 64, z: 0 });
 });
 
 test('collect_blaze_rods asks combat for the inventory net shortage', async () => {

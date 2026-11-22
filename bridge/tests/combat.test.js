@@ -1,7 +1,40 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { skills } from '../skills/combat.js';
+import { crystalAimPoint, skills, visibleCrystalAim } from '../skills/combat.js';
+import { Vec3 } from 'vec3';
+
+test('a fully charged Java arrow reaches an elevated crystal at the computed angle', () => {
+  const feet = new Vec3(40.5, 61, 8.5);
+  const bot = { entity: { position: feet, eyeHeight: 1.62 } };
+  const crystal = { position: new Vec3(33.5, 83, 24.5), height: 2 };
+  const aim = crystalAimPoint(bot, crystal);
+  let velocity = aim.minus(feet.offset(0, 1.62, 0)).normalize().scaled(3);
+  let p = feet.offset(0, 1.52, 0);
+  let distance = Infinity;
+  for (let tick = 0; tick < 30; tick++) {
+    for (let i = 0; i < 10; i++) distance = Math.min(distance, p.plus(velocity.scaled(i / 10)).distanceTo(crystal.position.offset(0, 1, 0)));
+    p = p.plus(velocity);
+    velocity = velocity.scaled(0.99).offset(0, -0.05, 0);
+  }
+  assert.ok(distance < 0.35);
+});
+
+test('crystal shots ignore a block intersection beyond the checked segment and stop at a nearer one', () => {
+  const feet = new Vec3(0.5, 64, 0.5);
+  const crystal = { position: new Vec3(25.5, 75, 1.5), height: 2 };
+  let beyond = true;
+  const block = { position: new Vec3(0, 0, 0), shapes: [[0, 0, 0, 1, 1, 1]] };
+  const world = { raycast(origin, direction, range, matches) {
+    const distance = beyond ? range + 0.1 : range / 2;
+    const iterator = { intersect: () => ({ pos: origin.plus(direction.scaled(distance)) }) };
+    return matches(block, iterator) ? block : null;
+  } };
+  const bot = { entity: { position: feet, eyeHeight: 1.62 }, world };
+  assert.ok(visibleCrystalAim(bot, crystal));
+  beyond = false;
+  assert.equal(visibleCrystalAim(bot, crystal), null);
+});
 
 function makeSheep(id, colorIndex = 0, sheared = false, baby = false) {
   const metadata = {};

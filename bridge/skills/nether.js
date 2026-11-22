@@ -1,4 +1,5 @@
 // 下界模块：黑曜石下界门、维度坐标换算、堡垒探索、烈焰棒收集。
+import { dryMiningFooting, netherRouteExclusion } from '../dry_footing.js';
 // 契约见 docs/plans/SKILL_MODULE_CONTRACT.md；对应路线图 M7.1-M7.4。
 //
 // 约束：
@@ -7,11 +8,7 @@
 // - 坐标换算、门框布局、堡垒方块判定都是纯函数，单独导出，方便脱离游戏单测。
 // - 结果只写真实读到的背包数量、方块与坐标，不凭空说「已建好门」。
 //
-// 待接入（ctx 目前没有，集成阶段补；缺了都能降级不崩）：
-// - ctx.runSkill(skillId, args)：跨模块调别的技能。raid_fortress / collect_blaze_rods
-//   优先用它请 combat.js 的 fight_blaze；没有它就退回自己报坐标和建议。
-// - ctx.skills：技能注册表。缺了同样退回。
-// - ctx.withTimeout / ctx.classifyPathFailure：超时包装与路径失败分类，缺省用本地实现。
+// 跨模块战斗通过 ctx.runSkill 共享当前动作的取消与进度回执。
 
 // ------------------------------------------------------------------ 常量
 
@@ -205,7 +202,7 @@ export function checkpointInfo(position, dimension) {
 // facing='x' 表示门宽沿 x 轴（门内两格在 x 上并排，门是 1 深的）；
 // facing='z' 则门宽沿 z 轴。
 // 返回 interior 门内 6 格、bottom 底排 4 格、sides 两侧 6 格、
-// frame 最省门框 10 格、top 顶部四角 4 格、full 完整门框 14 格。
+// frame 为两条横梁与两侧共 10 格，full 包含四角共 14 格。
 export function portalFrame(origin, facing) {
   const axis = facing === 'z' ? 'z' : 'x';
   const ox = Math.floor(Number(origin && origin.x));
@@ -237,7 +234,7 @@ export function portalFrame(origin, facing) {
     top.push(axis === 'x' ? at(d, PORTAL_INTERIOR_HEIGHT, 0) : at(0, PORTAL_INTERIOR_HEIGHT, d));
   }
 
-  const frame = [...bottom, ...sides];
+  const frame = [...bottom.slice(1, -1), ...sides, ...top.slice(1, -1)];
   return {
     axis,
     origin: { x: ox, y: oy, z: oz },
@@ -246,7 +243,7 @@ export function portalFrame(origin, facing) {
     sides,
     frame,
     top,
-    full: [...frame, ...top],
+    full: [...bottom, ...sides, ...top],
   };
 }
 
@@ -458,12 +455,22 @@ async function clearPortalSpace(ctx, frame) {
 // 摆黑曜石门框：先底排，再两侧，每块都有可以依附的邻居。
 async function placeObsidianFrame(ctx, frame) {
   let placed = 0;
-  for (const target of [...frame.bottom, ...frame.sides]) {
+  for (const target of frame.frame) {
     throwIfInterrupted(ctx, 'Building nether portal');
     const block = blockAt(ctx, target.x, target.y, target.z);
     if (block && block.name === 'obsidian') {
       placed += 1;
       continue;
+    }
+    if (target === frame.top[1]) {
+      const corner = frame.top[0];
+      const support = blockAt(ctx, corner.x, corner.y, corner.z);
+      if (support?.boundingBox !== 'block') {
+        const material = ['cobblestone', 'cobbled_deepslate', 'dirt', 'netherrack', 'granite', 'andesite', 'diorite', 'stone']
+          .find(name => ctx.countItem(name) > 0);
+        if (!material) throw new Error('顶梁需要一个垫角方块');
+        await ctx.placeBlock({ block: material, ...corner });
+      }
     }
     try {
       await ctx.placeBlock({ block: 'obsidian', x: target.x, y: target.y, z: target.z });
@@ -492,26 +499,15 @@ async function lightPortal(ctx, frame) {
   if (!steel) throw new Error('没有打火石，黑曜石摆好了也点不燃下界门');
   await bot.equip(steel, 'hand');
 
-  // 瞄准点依次是：门内下边两格正下方的黑曜石中心，再退到门内净空中心。
-  const aims = [];
-  for (const target of frame.interior.slice(0, 2)) {
-    aims.push(makeVec(ctx, target.x + 0.5, target.y - 0.5, target.z + 0.5));
-  }
-  const center = frame.interior[0];
-  aims.push(makeVec(ctx, center.x + 0.5, center.y + 0.5, center.z + 0.5));
-
-  for (const aim of aims) {
+  for (const target of frame.bottom.slice(1, -1)) {
     throwIfInterrupted(ctx, 'Lighting nether portal');
     try {
-      await bot.lookAt(aim, true);
-      await sleepMs(ctx, 150);
+      const base = blockAt(ctx, target.x, target.y, target.z);
+      if (base?.name !== 'obsidian') continue;
+      if (bot.entity.position.distanceTo(base.position) > 4.5) await ctx.travelTo(target.x, target.y + 1, target.z, 2);
       throwIfInterrupted(ctx, '点燃下界门');
-      await bot.activateItem();
-      try {
-        await sleepMs(ctx, 400);
-      } finally {
-        if (typeof bot.deactivateItem === 'function') await bot.deactivateItem();
-      }
+      await bot.equip(steel, 'hand');
+      await bot.activateBlock(base, makeVec(ctx, 0, 1, 0));
     } catch (error) {
       throwIfInterrupted(ctx, '点燃下界门');
       log(ctx, '点火动作失败，换一个瞄准点', error.message);
@@ -751,8 +747,10 @@ async function waitDimension(ctx, expected, timeoutMs) {
 async function enterPortal(ctx, portal, expectedDimension, timeoutMs) {
   throwIfInterrupted(ctx, '穿过下界门');
   const sourceDimension = currentDimension(ctx);
+  let floorY = portal.y;
+  while (floorY > portal.y - 21 && blockAt(ctx, portal.x, floorY - 1, portal.z)?.name === 'nether_portal') floorY--;
   try {
-    await ctx.travelTo(portal.x, portal.y, portal.z, 1);
+    await ctx.travelTo(portal.x, floorY, portal.z, 1);
   } catch (error) {
     throwIfInterrupted(ctx, '穿过下界门');
     log(ctx, '没走到下界门', error.message);
@@ -770,7 +768,10 @@ async function enterPortal(ctx, portal, expectedDimension, timeoutMs) {
       );
     }
     try {
-      await ctx.walkOnce(portal.x, portal.y, portal.z, 1, 4000);
+      const at = botOf(ctx).entity.position;
+      if (blockAt(ctx, Math.floor(at.x), Math.floor(at.y), Math.floor(at.z))?.name !== 'nether_portal') {
+        await ctx.walkOnce(portal.x, floorY, portal.z, 0, 4000);
+      }
     } catch (error) {
       throwIfInterrupted(ctx, '穿过下界门');
       log(ctx, '进门动作失败', error.message);
@@ -936,25 +937,20 @@ function findBlaze(ctx, radius) {
 function findFortressStructure(ctx, radius) {
   const bot = botOf(ctx);
   const registry = bot.registry && bot.registry.blocksByName;
-  if (!registry) return null;
+  if (!registry || typeof bot.findBlocks !== 'function') return null;
   const origin = bot.entity.position;
+  const names = [...FORTRESS_STRUCTURE_BLOCKS].filter(name => registry[name]);
+  if (!names.length) return null;
+  const ids = names.map(name => registry[name].id);
+  const positions = bot.findBlocks({ matching: ids.length === 1 ? ids[0] : ids, maxDistance: radius, count: 8 });
   let best = null;
   let bestDistance = Infinity;
-  for (const name of FORTRESS_STRUCTURE_BLOCKS) {
-    const entry = registry[name];
-    if (!entry || typeof bot.findBlocks !== 'function') continue;
-    let positions = [];
-    try {
-      positions = bot.findBlocks({ matching: entry.id, maxDistance: radius, count: 4 });
-    } catch {
-      positions = [];
-    }
-    for (const spot of positions) {
-      const distance = Math.hypot(spot.x - origin.x, spot.z - origin.z);
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        best = { x: spot.x, y: spot.y, z: spot.z, name };
-      }
+  for (const spot of positions) {
+    const name = names.length === 1 ? names[0] : bot.blockAt(spot, false)?.name;
+    const distance = Math.hypot(spot.x - origin.x, spot.y - origin.y, spot.z - origin.z);
+    if (FORTRESS_STRUCTURE_BLOCKS.has(name) && distance < bestDistance) {
+      bestDistance = distance;
+      best = { x: spot.x, y: spot.y, z: spot.z, name };
     }
   }
   return best;
@@ -1015,6 +1011,7 @@ function fortressEvidenceData(dimension, evidence, route = null) {
       route_budget_waypoints: route.budgetWaypoints,
       attempted_waypoints: route.attemptedWaypoints,
       dimension: route.dimension,
+      ...(route.confirmed?.length ? { visited: route.confirmed.slice(-24) } : {}),
     };
   }
   return data;
@@ -1082,6 +1079,25 @@ function makeFortressRoute(position, dimension, scanRadius) {
   };
 }
 
+function nextSurveyPoint(ctx, route) {
+  const bot = botOf(ctx), here = bot.entity.position.floored();
+  const candidates = [];
+  for (const [dx, dz] of [[1,0],[0,1],[-1,0],[0,-1],[0.7,0.7],[-0.7,0.7],[0.7,-0.7],[-0.7,-0.7]]) {
+    for (const distance of [24, 14, 8, 5]) {
+      const p = here.offset(Math.round(dx * distance), 0, Math.round(dz * distance));
+      for (const dy of [0,1,-1,2,-2,3,-3,4,-4,5,-5,6,-6,8,-8,10,-10,12,-12]) {
+        const stand = p.offset(0, dy, 0);
+        if (!dryMiningFooting(bot, stand) || netherRouteExclusion(bot, {position: stand})) continue;
+        const clearance = Math.min(...route.surveyed.map(v => Math.hypot(v.x - stand.x, v.z - stand.z)));
+        if (clearance >= 4) candidates.push({stand, clearance});
+        break;
+      }
+    }
+  }
+  candidates.sort((a, b) => b.clearance - a.clearance);
+  return candidates[0]?.stand;
+}
+
 async function fallbackStep(ctx, route) {
   throwIfInterrupted(ctx, '探索下界堡垒');
   if (currentDimension(ctx) !== route.dimension) {
@@ -1090,11 +1106,23 @@ async function fallbackStep(ctx, route) {
   if (route.attemptedWaypoints >= route.budgetWaypoints || route.nextWaypoint >= route.waypoints.length) {
     return false;
   }
-  const target = route.waypoints[route.nextWaypoint];
+  const target = route.surveyed ? nextSurveyPoint(ctx, route) : route.waypoints[route.nextWaypoint];
+  if (!target) {
+    route.exhausted = true;
+    return false;
+  }
   route.nextWaypoint += 1;
   route.attemptedWaypoints += 1;
   try {
-    await ctx.travelTo(target.x, target.y, target.z, 3);
+    if (route.surveyed) {
+      route.surveyed.push({x: target.x, z: target.z});
+      if (await ctx.walkOnce(target.x, target.y, target.z, 2, 12000) !== 'reached') return false;
+      const p = botOf(ctx).entity.position;
+      route.confirmed.push({x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z)});
+      ctx.reportProgress?.('fortress_survey', '已到新落脚点，继续扫描堡垒', null, {position: route.confirmed.at(-1)});
+    } else {
+      await ctx.travelTo(target.x, target.y, target.z, 3);
+    }
     throwIfInterrupted(ctx, '探索下界堡垒');
     if (currentDimension(ctx) !== route.dimension) {
       throw new Error('探索路线移动后维度发生变化，停止继续移动');
@@ -1109,6 +1137,30 @@ async function fallbackStep(ctx, route) {
 
 // 堡垒探索：找堡垒结构、找烈焰人、打烈焰人。
 async function raidFortress(args, ctx) {
+  const bot = botOf(ctx);
+  const movements = bot.pathfinder?.movements;
+  if (!args.scout_only || !movements || !isNetherDimension(currentDimension(ctx))) return searchFortress(args, ctx);
+  const previous = { allowParkour: movements.allowParkour, canDig: movements.canDig, maxDropDown: movements.maxDropDown,
+    exclusionAreasStep: movements.exclusionAreasStep };
+  let hazards = [], nextScan = 0;
+  const avoidCubes = block => {
+    if (!block?.position) return 1000;
+    if (Date.now() >= nextScan) {
+      hazards = Object.values(bot.entities).filter(e => e?.name === 'magma_cube' && e.isValid !== false && e.position);
+      nextScan = Date.now() + 400;
+    }
+    return hazards.some(e => Math.abs(e.position.y - block.position.y) < 5 &&
+      Math.hypot(e.position.x - block.position.x - 0.5, e.position.z - block.position.z - 0.5) < 6) ? 1000 : 0;
+  };
+  Object.assign(movements, { allowParkour: false, canDig: false, maxDropDown: 1, exclusionAreasStep: [...previous.exclusionAreasStep, avoidCubes] });
+  try {
+    return await searchFortress(args, ctx);
+  } finally {
+    Object.assign(movements, previous);
+  }
+}
+
+async function searchFortress(args, ctx) {
   const dimension = currentDimension(ctx);
   if (!isNetherDimension(dimension)) {
     throw new Error(`当前在${dimensionLabel(dimension)}，附近没有可以探索的下界堡垒`);
@@ -1118,6 +1170,11 @@ async function raidFortress(args, ctx) {
   const timeoutMs = clampNumber(args.timeout_s, 120, 10, 600) * 1000;
   const wantBlazes = clampNumber(args.blazes, 1, 8, 1);
   const route = makeFortressRoute(botOf(ctx).entity.position, dimension, radius);
+  if (args.scout_only === true && botOf(ctx).pathfinder?.movements && ctx.walkOnce) {
+    route.surveyed = (Array.isArray(args.surveyed) ? args.surveyed : []).filter(p => p && Number.isFinite(p.x) && Number.isFinite(p.z)).slice(-24);
+    route.surveyed.push(route.origin);
+    route.confirmed = [];
+  }
   const deadline = Date.now() + timeoutMs;
 
   const notes = [];
@@ -1126,6 +1183,7 @@ async function raidFortress(args, ctx) {
   let structureFound = null;
   let blazeSeen = null;
   let lastSearch = 0;
+  let previousScan = null;
 
   while (Date.now() < deadline) {
     throwIfInterrupted(ctx, '探索下界堡垒');
@@ -1149,6 +1207,11 @@ async function raidFortress(args, ctx) {
           z: Math.floor(position.z),
         },
       };
+      if (args.scout_only === true) {
+        return { status: 'succeeded', detail: `已在下界观察到烈焰人，距离 ${distance} 格`,
+          data: { events: ['fortress_route_found'], blaze_evidence: blazeEvidence,
+            fortress_evidence: fortressEvidenceData(dimension, structureEvidence, route) } };
+      }
       log(
         ctx,
         '发现烈焰人',
@@ -1196,13 +1259,17 @@ async function raidFortress(args, ctx) {
     }
 
     // 4. 找当前维度里实扫到的下界砖结构。
-    const structure = findFortressStructure(ctx, radius);
+    const here = botOf(ctx).entity.position;
+    if (!previousScan || here.distanceTo(previousScan.position) >= 6 || Date.now() - previousScan.time >= 8000) {
+      previousScan = {position: {x: here.x, y: here.y, z: here.z}, time: Date.now(), structure: findFortressStructure(ctx, radius)};
+    }
+    const structure = previousScan.structure;
     if (structure) {
       if (!structureFound) structureFound = structure;
       const evidence = rememberFortressStructure(ctx, structure, structureEvidence);
       const key = fortressStructureKey(evidence);
       const origin = botOf(ctx).entity.position;
-      const distance = Math.hypot(structure.x - origin.x, structure.z - origin.z);
+      const distance = Math.hypot(structure.x - origin.x, structure.y - origin.y, structure.z - origin.z);
       if (distance > 6 && !visitedStructures.has(key) && route.attemptedWaypoints < route.budgetWaypoints) {
         visitedStructures.add(key);
         route.attemptedWaypoints += 1;
@@ -1225,6 +1292,10 @@ async function raidFortress(args, ctx) {
         continue;
       }
       if (distance <= 6) {
+        if (args.scout_only === true) {
+          return { status: 'succeeded', detail: `已接近实测的堡垒方块 ${structure.name}`,
+            data: { events: ['fortress_route_found'], fortress_evidence: fortressEvidenceData(dimension, structureEvidence, route) } };
+        }
         notes.push('在 (' + structure.x + ', ' + structure.y + ', ' + structure.z + ') 看到 ' + label(ctx, structure.name));
       }
     }
@@ -1233,7 +1304,7 @@ async function raidFortress(args, ctx) {
     if (Date.now() - lastSearch > 1500) {
       lastSearch = Date.now();
       const moved = await fallbackStep(ctx, route);
-      if (!moved && route.attemptedWaypoints >= route.budgetWaypoints) break;
+        if (!moved && (route.exhausted || route.attemptedWaypoints >= route.budgetWaypoints)) break;
       if (!moved) await sleepMs(ctx, 1000);
     } else {
       await sleepMs(ctx, 500);
@@ -1631,10 +1702,12 @@ export const skills = {
   },
   raid_fortress: {
     description:
-      '探索下界堡垒：扫描明确的下界砖结构方块，找到烈焰人后请战斗技能去打；无目标时围绕本次固定起点走有限路线，扫描半径与路线点预算分开。',
+      '搜索堡垒方块与烈焰人。S5 侦察模式根据已访问位置选择安全落脚点并回报发现，默认模式发现烈焰人后交给战斗技能。',
     parameters: [
       { name: 'radius', type: 'number', required: false, default: DEFAULT_FORTRESS_RADIUS, description: '搜索半径。' },
       { name: 'blazes', type: 'number', required: false, default: 1, description: '要打几只烈焰人。' },
+      { name: 'scout_only', type: 'boolean', required: false, default: false, description: '只寻找烈焰人或走近堡垒方块，保留战斗给采集动作。' },
+      { name: 'surveyed', type: 'array', required: false, default: [], description: '先前侦察实际到过的区域，用于选择新的安全落脚点。' },
       { name: 'timeout_s', type: 'number', required: false, default: 120, description: '整个探索的最长用时。' },
     ],
     handler: raidFortress,

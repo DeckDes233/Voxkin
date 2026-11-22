@@ -1,7 +1,18 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { skills } from '../skills/nether.js';
+import { portalFrame, skills } from '../skills/nether.js';
+
+test('the ten-block Nether frame encloses every side of a two-by-three opening on either axis', () => {
+  for (const axis of ['x', 'z']) {
+    const layout = portalFrame({ x: 0, y: 64, z: 0 }, axis);
+    const coords = new Set(layout.frame.map(p => `${p[axis]},${p.y}`));
+    assert.equal(coords.size, 10);
+    for (const y of [63, 67]) for (const d of [0, 1]) assert.ok(coords.has(`${d},${y}`));
+    for (const y of [64, 65, 66]) for (const d of [-1, 2]) assert.ok(coords.has(`${d},${y}`));
+    assert.equal(layout.full.length, 14);
+  }
+});
 
 function makePosition(x = 0, y = 64, z = 0) {
   return {

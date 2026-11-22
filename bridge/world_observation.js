@@ -1,5 +1,72 @@
 import { inspectResourceSites } from './resource_sites.js';
 
+const portalRooms = new WeakMap();
+
+export function dragonHealth(bot, dragon) {
+  if (!dragon || dragon.isValid === false) return null;
+  const key = bot?.registry?.entitiesByName?.ender_dragon?.metadataKeys?.indexOf('health');
+  const value = dragon.health ?? dragon.metadata?.[key];
+  return Number.isFinite(value) ? value : null;
+}
+
+function observeDragon(bot) {
+  if (!['the_end', 'minecraft:the_end'].includes(bot?.game?.dimension)) return null;
+  const entity = Object.values(bot.entities || {}).find(e => e?.name === 'ender_dragon' && e.isValid !== false);
+  const hp = dragonHealth(bot, entity);
+  if (hp !== null && entity.position) {
+    return { health: hp, position: { x: entity.position.x, y: entity.position.y, z: entity.position.z } };
+  }
+  const bar = bot.bossBars?.find(b => b.isDragonBar && (b.title?.translate ?? b.title?.json?.translate) === 'entity.minecraft.ender_dragon');
+  return bar && Number.isFinite(bar.health) ? { health_fraction: bar.health, source: 'dragon_boss_bar' } : null;
+}
+
+function observePortalRoom(bot) {
+  const p = bot?.entity?.position;
+  const id = bot?.registry?.blocksByName?.end_portal_frame?.id;
+  if (!p || id == null || !bot.findBlocks || !['overworld', 'minecraft:overworld'].includes(bot.game?.dimension)) return null;
+  const cache = portalRooms.get(bot);
+  if (cache && Date.now() - cache.time < 1000 && p.distanceTo(cache.position) < 3) return cache.room;
+  const frames = [];
+  for (const pos of bot.findBlocks({ matching: id, maxDistance: 12, count: 12 })) {
+    const block = bot.blockAt(pos, false);
+    if (block?.name !== 'end_portal_frame') continue;
+    const eye = block.getProperties().eye;
+    if (![true, false, 'true', 'false', 0, 1].includes(eye)) continue;
+    frames.push({ x: pos.x, y: pos.y, z: pos.z, filled: eye === true || eye === 'true' || eye === 1 });
+  }
+  const room = frames.length ? { frames } : null;
+  portalRooms.set(bot, { time: Date.now(), position: p.clone(), room });
+  return room;
+}
+
+function observeSurfaceAccess(bot, makeVec) {
+  const position = bot?.entity?.position;
+  if (!position || !['overworld', 'minecraft:overworld'].includes(bot.game?.dimension) || !bot.blockAt) return null;
+  const x = Math.floor(position.x), y = Math.floor(position.y), z = Math.floor(position.z);
+  const sky = bot.blockAt(makeVec(x, y + 1, z), false)?.skyLight;
+  if (!Number.isFinite(sky)) return null;
+  const access = { sky_light: sky, exit: null };
+  if (sky >= 12) {
+    const walls = [[1, 0], [-1, 0], [0, 1], [0, -1]]
+      .filter(([dx, dz]) => bot.blockAt(makeVec(x + dx, y + 2, z + dz), false)?.boundingBox === 'block');
+    if (walls.length < 3) return access;
+  }
+  // 检查头顶和相邻四列，只认实际读到的日照干地；相同海拔的封闭洞穴不能当作地表。
+  for (const [dx, dz] of [[0, 0], [4, 0], [-4, 0], [0, 4], [0, -4]]) {
+    for (let height = y + 1; height <= y + 24; height++) {
+      const feet = bot.blockAt(makeVec(x + dx, height, z + dz), false);
+      if (!(feet?.skyLight >= 14) || !['air', 'short_grass', 'tall_grass'].includes(feet.name)) continue;
+      const ground = bot.blockAt(makeVec(x + dx, height - 1, z + dz), false);
+      const head = bot.blockAt(makeVec(x + dx, height + 1, z + dz), false);
+      if (ground?.boundingBox !== 'block' || !['air', 'short_grass', 'tall_grass'].includes(head?.name)) continue;
+      if (ground.name.endsWith('_leaves') || ['magma_block', 'cactus', 'campfire', 'soul_campfire', 'powder_snow'].includes(ground.name)) continue;
+      access.exit = { x: x + dx, y: height, z: z + dz };
+      return access;
+    }
+  }
+  return access;
+}
+
 function inspectShelterDetails(bot, remembered, makeVec = (x, y, z) => ({ x, y, z })) {
   if (!remembered?.position || ![3, 4, 5].includes(Number(remembered.size))) {
     return {
@@ -146,6 +213,9 @@ export function createObservation(bot, options) {
     off_hand: offHand?.name || '',
     nearby_owned_crafting_table: Boolean(nearbyOwnedCraftingTable),
     nearby_crafting_table: Boolean(nearbyCraftingTable || nearbyOwnedCraftingTable),
+    surface_access: observeSurfaceAccess(bot, makeVec),
+    end_portal_room: observePortalRoom(bot),
+    end_dragon: observeDragon(bot),
     inventory_free_slots: typeof bot?.inventory?.emptySlotCount === 'function' ? bot.inventory.emptySlotCount() : null,
     resource_sites: inspectResourceSites(bot, shelter, sessionId),
     collection_within_reach: true,

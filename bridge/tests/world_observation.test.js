@@ -85,6 +85,16 @@ test('observation reports a verified owned table without inventing an inventory 
   assert.equal(nearby.inventory.crafting_table, undefined);
 });
 
+test('an enclosed cave at Y=62 reports the dry sunlit turf above it', () => {
+  const { bot } = makeWorld();
+  bot.entity.position.y = 62;
+  bot.blockAt = p => p.y >= 79 ? { name: 'air', skyLight: 15, boundingBox: 'empty' }
+    : p.y === 78 ? { name: 'grass_block', skyLight: 0, boundingBox: 'block' }
+    : { name: 'cave_air', skyLight: 0, boundingBox: 'empty' };
+  const { surface_access } = createObservation(bot, { executor: {} });
+  assert.deepEqual(surface_access, { sky_light: 0, exit: { x: 0, y: 79, z: 0 } });
+});
+
 test('副手盾计入装备持有数且不会重复统计，副手材料仍与合成库存分开', () => {
   const { bot } = makeWorld();
   const shield = { name: 'shield', count: 1, slot: 45 };

@@ -1,4 +1,5 @@
 import { escapeWater, reachShore, waterLike, breathable, avoidWaterScaffolding, allowedDuringWaterEscape } from './water_escape.js';
+import { dryMiningFooting, leaveMagmaBlock, netherRouteExclusion } from './dry_footing.js';
 import { FUEL_BURN, selectFuel } from './fuel.js';
 // 沃心 Minecraft 桥接进程：mineflayer 负责游戏内身份，WebSocket 负责与 Voxkin Core 通信。
 // 部分动作与自主行为参考 MindCraft（MIT，https://github.com/mindcraft-bots/mindcraft）。
@@ -2066,7 +2067,6 @@ async function eatFood(args) {
     }
     const beforeCount = countItem(targetName);
     const beforeFood = Number(bot.food ?? 20);
-    const beforeHealth = Number(bot.health ?? 20);
     try {
       await bot.equip(item, 'hand');
       await bot.consume();
@@ -2078,11 +2078,11 @@ async function eatFood(args) {
       throw new Error(`吃${itemLabel(targetName)}失败：${error.message}`);
     }
     let verified = false;
-    for (let attempt = 0; attempt < 10; attempt += 1) {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      if (interrupted) throw new Error('被新的指令打断');
       if (
         countItem(targetName) < beforeCount ||
-        Number(bot.food ?? 20) > beforeFood ||
-        Number(bot.health ?? 20) > beforeHealth
+        Number(bot.food ?? 20) > beforeFood
       ) {
         verified = true;
         break;
@@ -2090,7 +2090,7 @@ async function eatFood(args) {
       await sleep(100);
     }
     if (!verified) {
-      throw new Error(`吃了${itemLabel(targetName)}，但没有检测到数量、饥饿或血量变化`);
+      throw new Error(`没有观察到${itemLabel(targetName)}数量减少或饥饿值恢复`);
     }
     eaten += 1;
   }
@@ -2774,16 +2774,22 @@ function isNearDanger(position) {
 async function escapeEnvironment() {
   if (escapeBusy || actionBusy) return;
   escapeBusy = true;
+  const movements = bot.pathfinder.movements;
+  const previous = { canDig: movements.canDig, allowParkour: movements.allowParkour, allow1by1towers: movements.allow1by1towers,
+    allowSprinting: movements.allowSprinting, maxDropDown: movements.maxDropDown };
   try {
     const target = pickWanderTarget();
     if (target) {
-      bot.pathfinder.movements.allowSprinting = true;
-      await gotoWithDeadline(new goals.GoalNear(target.x, target.y, target.z, 1));
-      log('离开了危险位置');
+      resetPathfinderGoal();
+      Object.assign(movements, { canDig: false, allowParkour: false, allow1by1towers: false, allowSprinting: false, maxDropDown: 1 });
+      await gotoWithTimeout(bot.pathfinder, new goals.GoalBlock(target.x, target.y, target.z), 4000, '避险换位超时',
+        () => bot.entity.position);
+      if (dryMiningFooting(bot, bot.entity.position)) log('离开了危险位置');
     }
   } catch (error) {
     log('离开危险位置失败', error.message);
   } finally {
+    Object.assign(movements, previous);
     escapeBusy = false;
     lastActivity = Date.now();
   }
@@ -2876,11 +2882,47 @@ function enqueueLocalSafety(event, data) {
   return reflexScheduler.dispatch(event, data);
 }
 
+function nearbyDragonCloud() {
+  if (!['the_end', 'minecraft:the_end'].includes(bot?.game?.dimension)) return null;
+  const pos = bot.entity.position;
+  return Object.values(bot.entities).find(e => e?.name === 'area_effect_cloud' && e.isValid !== false && e.position &&
+    Math.abs(e.position.y - pos.y) < 4 && Math.hypot(e.position.x - pos.x, e.position.z - pos.z) < 7);
+}
+
+async function leaveDragonCloud(cloud, token) {
+  const origin = bot.entity.position.floored();
+  const destinations = [];
+  for (const [dx, dz] of [[8,0],[-8,0],[0,8],[0,-8],[6,6],[-6,6],[6,-6],[-6,-6]]) {
+    for (let dy = 3; dy >= -3; dy--) {
+      const target = origin.offset(dx, dy, dz);
+      if (dryMiningFooting(bot, target)) {
+        destinations.push(target);
+        break;
+      }
+    }
+  }
+  destinations.sort((a, b) => b.distanceTo(cloud.position) - a.distanceTo(cloud.position));
+  for (const p of destinations.slice(0, 3)) {
+    if (token.cancelled || !nearbyDragonCloud()) return;
+    try {
+      await gotoWithTimeout(bot.pathfinder, new goals.GoalNear(p.x, p.y, p.z, 1), 2500, '躲开龙息超时');
+    } catch (error) {
+      if (token.cancelled) throw error;
+    }
+  }
+}
+
 async function runLocalSafety(event, data, token) {
   if (token.cancelled) throw new Error(token.cancelReason || '安全动作已取消');
   if (event === 'low_oxygen') {
     if (await swimToShore(`本地避险 oxygen=${data.oxygen}`, token, 30000)) return;
     throw new Error('水中自救超时，未确认抵达安全岸边');
+  }
+  if (await leaveMagmaBlock(bot, token, sleep)) return;
+  const cloud = nearbyDragonCloud();
+  if (cloud) {
+    await leaveDragonCloud(cloud, token);
+    return;
   }
   if (event === 'critical_hunger') {
     if (Number(bot.food ?? 20) <= 8 && findFood()) await eatIfPossible();
@@ -2901,6 +2943,10 @@ async function runLocalSafety(event, data, token) {
   }
   if (data.source_type === 'player' && source) {
     await retreatFrom(source);
+  } else if (bot.health <= 10 && bot.entity.onGround && dryMiningFooting(bot, bot.entity.position)
+      && !netherRouteExclusion(bot, { position: bot.entity.position.floored() })) {
+    // 已脱离接触且站稳时留在原地恢复，避免低血量触发随机跑动、再次跌落。
+    if (bot.food < 20 && findFood()) await eatIfPossible();
   } else {
     await escapeEnvironment();
     if (bot.health <= 10 && findFood()) await eatIfPossible();
@@ -2964,6 +3010,11 @@ function onDamaged(source) {
 
 function survivalTick() {
   if (!bot || !bot.entity || bot.isSleeping) return;
+  const cloud = nearbyDragonCloud();
+  if (cloud) {
+    reportReflexEvent('hostile_nearby', { entity_id: cloud.id, entity_name: cloud.name, health: bot.health, food: bot.food }, 1500);
+    return;
+  }
   if (bot.health <= 8) {
     reportReflexEvent('low_health', { health: bot.health, food: bot.food, position: { x: bot.entity.position.x, y: bot.entity.position.y, z: bot.entity.position.z } }, 5000);
   }
@@ -3083,13 +3134,9 @@ function pickWanderTarget(heading = null, visited = new Set()) {
     for (let dy = 2; dy >= -4; dy -= 1) {
       const ground = bot.blockAt(vec(x, Math.floor(base.y) + dy, z));
       if (!ground || ground.boundingBox !== 'block') continue;
-      if (/water|lava/.test(ground.name)) continue;
-      const above = bot.blockAt(ground.position.offset(0, 1, 0));
-      const above2 = bot.blockAt(ground.position.offset(0, 2, 0));
-      if (above?.boundingBox === 'empty' && above2?.boundingBox === 'empty') {
-        const target = ground.position.offset(0, 1, 0);
-        if (target.distanceTo(base) >= 3 && !isNearDanger(target)) return target;
-      }
+      const target = ground.position.offset(0, 1, 0);
+      if (target.distanceTo(base) >= 3 && dryMiningFooting(bot, target)
+          && !netherRouteExclusion(bot, { position: target }) && !isNearDanger(target)) return target;
     }
   }
   return null;
@@ -3390,6 +3437,8 @@ function createBot() {
     isDeathPending: () => deathPending,
     onRespawn: ({ deathRespawn }) => {
       log(deathRespawn ? '已重生' : '收到维度切换 respawn 包');
+      stopPathfinding();
+      bot.clearControlStates();
       if (deathRespawn) {
         lastHealth = 20;
         respawnReady = true;
@@ -3420,6 +3469,7 @@ function createBot() {
     movements.canOpenDoors = true;
     movements.maxDropDown = 4;
     movements.liquidCost = 12;
+    movements.exclusionAreasStep.push((block) => netherRouteExclusion(bot, block));
     movements.exclusionAreasPlace.push((block) => avoidWaterScaffolding(bot, block));
     movements.infiniteLiquidDropdownDistance = false;
     const avoidBlocks = [

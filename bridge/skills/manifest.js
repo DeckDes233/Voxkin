@@ -2212,7 +2212,7 @@ module.exports = {
       skill_id: 'raid_fortress',
       group: '专精类',
       type: 'act',
-      description: "探索下界堡垒：扫描明确的下界砖结构方块，找到烈焰人后请战斗技能去打；无目标时围绕本次固定起点走有限路线，扫描半径与路线点预算分开。",
+      description: "搜索堡垒方块与烈焰人。S5 侦察模式根据已访问位置选择安全落脚点并回报发现，默认模式发现烈焰人后交给战斗技能。",
       intent_examples: ["执行搜堡垒", "需要搜堡垒时调用", "用搜堡垒推进当前任务"],
       parameters: [
         {
@@ -2228,6 +2228,20 @@ module.exports = {
           required: false,
           default: 1,
           description: "要打几只烈焰人。",
+        },
+        {
+          name: 'scout_only',
+          type: 'boolean',
+          required: false,
+          default: false,
+          description: "只寻找烈焰人或走近堡垒方块，保留战斗给采集动作。",
+        },
+        {
+          name: 'surveyed',
+          type: 'array',
+          required: false,
+          default: [],
+          description: "先前侦察实际到过的区域，用于选择新的安全落脚点。",
         },
         {
           name: 'timeout_s',
@@ -2752,7 +2766,7 @@ module.exports = {
           type: 'object',
           required: false,
           default: null,
-          description: "Core 内部续跑字段；仅使用先前 Bridge 回执中的 stronghold_search，续跑不会再次投掷末影之眼。",
+          description: "Core 按先前回执恢复定位。沿已测方向实际前进后可在剩余预算内再次投眼，下探时沿用已有轨迹。",
         },
       ],
       preconditions: "桥接已连接且 bot 已进入世界。",
