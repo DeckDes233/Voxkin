@@ -4,7 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Sequence
 
 from voxkin.agent.actions import ActionDispatcher
 from voxkin.agent.arbiter import ActionArbiter, ActionTicket
@@ -43,7 +43,9 @@ class MissingKeyLLM:
             "api_key_configured": False,
         }
 
-    async def stream_chat(self, messages) -> AsyncIterator[LLMDelta]:
+    async def stream_chat(
+        self, messages: Sequence[dict[str, str]], tools: Sequence[dict[str, Any]] | None = None
+    ) -> AsyncIterator[LLMDelta]:
         raise LLMError(
             "LLM 未配置：设置环境变量 "
             f"{self.config.llm.api_key_env} 或写入 config/local.yaml 的 llm.api_key"

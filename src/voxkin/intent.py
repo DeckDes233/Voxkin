@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from voxkin.agent.skills import block_aliases
-from voxkin.voice.phrase_catalog import phrase_for_intent
+from voxkin.voice.phrase_catalog import phrase_for_intent, phrase_for_skill
 
 STOP = re.compile(r"(别跟|不要跟|不用跟|别再跟|停下|站住|停住|别动|取消当前|停止当前)")
 # 「别挖了」这类否定式采集也是停止；不加进来会被采集规则误判成动作。
@@ -17,6 +17,10 @@ THREAT = re.compile(r"(小心|注意|有苦力怕|有僵尸|有怪)")
 EAT = re.compile(r"(吃东西|吃点|吃个|吃了|饿了|进食|吃食物)")
 SLEEP = re.compile(r"(睡觉|睡吧|去睡|找张床|上床)")
 INVENTORY = re.compile(r"(背包|有什么|还有多少|多少个|够不够|有没有)")
+INVENTORY_LIST = re.compile(
+    r"^(?:请)?(?:(?:看看|查看|查一下|看一下)(?:你的)?背包|(?:你的)?背包里(?:都)?有什么(?:东西)?)"
+    r"[呢啊吗]?[？?。！!]*$"
+)
 OBSERVE = re.compile(r"(你在哪|在哪|坐标|现在几点|什么时间|天亮了吗|天黑了)")
 
 # 会改世界的采集说法：挖、采、收集、弄点、摘、砍。
@@ -46,15 +50,15 @@ CN_DIGITS = {
 }
 
 # 规则意图到技能与参数的映射。参数只放能确定的值，不确定就不走快路。
-INTENT_SKILLS: dict[str, tuple[str, float]] = {
-    "stop_movement": ("stop", 0.95),
-    "follow_player": ("follow_player", 0.9),
-    "come_to_player": ("come_to_player", 0.85),
-    "attack_nearest": ("attack_nearest", 0.8),
-    "eat_food": ("eat", 0.8),
-    "sleep": ("sleep", 0.8),
-    "inventory": ("inventory", 0.7),
-    "observe_self": ("observe", 0.75),
+INTENT_SKILLS: dict[str, str] = {
+    "stop_movement": "stop",
+    "follow_player": "follow_player",
+    "come_to_player": "come_to_player",
+    "attack_nearest": "attack_nearest",
+    "eat_food": "eat",
+    "sleep": "sleep",
+    "inventory": "inventory",
+    "observe_self": "observe",
 }
 
 
@@ -93,6 +97,7 @@ def classify(text: str) -> Intent | None:
         ("assess_threat", THREAT, 0.7),
         ("eat_food", EAT, 0.8),
         ("sleep", SLEEP, 0.8),
+        ("inventory", INVENTORY_LIST, 0.95),
         ("inventory", INVENTORY, 0.7),
         ("observe_self", OBSERVE, 0.75),
     ):
@@ -185,9 +190,8 @@ def plan(text: str) -> IntentPlan | None:
         return None
     intent = classify(value)
     if intent is not None:
-        mapping = INTENT_SKILLS.get(intent.name)
-        if mapping is None:
+        skill_id = INTENT_SKILLS.get(intent.name)
+        if skill_id is None:
             return None
-        skill_id, confidence = mapping
-        return _make_plan(intent.name, skill_id, {}, confidence)
+        return _make_plan(intent.name, skill_id, {}, intent.confidence)
     return _collect_plan(value)

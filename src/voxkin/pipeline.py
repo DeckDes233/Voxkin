@@ -4,7 +4,8 @@ import asyncio
 import time
 import uuid
 from collections import deque
-from typing import Any, Awaitable, Callable
+from contextlib import aclosing
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from voxkin.agent.actions import ActionError
 from voxkin.agent.arbiter import ActionController, ActionTicket
@@ -393,6 +394,15 @@ class ConversationPipeline:
         self._active_tasks = [tts_task]
         return turn, generation, queue, tts_task
 
+    async def _reply_deltas(self, turn: TurnTimeline, user_text: str) -> AsyncIterator[LLMDelta]:
+        if turn.meta.get("fast_path") and self.llm.describe().get("provider") == "unconfigured":
+            turn.meta["llm_skipped"] = "unconfigured"
+            return
+        messages = self._build_messages(user_text)
+        async with aclosing(self.llm.stream_chat(messages, tools=self._tool_schemas())) as stream:
+            async for delta in stream:
+                yield delta
+
     async def respond(self, user_text: str, request_id: str | None = None) -> dict[str, Any]:
         async with self._turn_handoff:
             turn, generation, queue, tts_task = await self._begin_turn(user_text, request_id)
@@ -407,7 +417,7 @@ class ConversationPipeline:
         splitter = SentenceSplitter(max_chars=self.config.tts.max_chars_per_request)
         collected: list[str] = []
         tool_calls = 0
-        stream = self.llm.stream_chat(self._build_messages(user_text), tools=self._tool_schemas())
+        stream = self._reply_deltas(turn, user_text)
         try:
             async for delta in stream:
                 if generation != self._generation:
@@ -476,9 +486,13 @@ class ConversationPipeline:
             )
             raise
         finally:
+            if not tts_task.done():
+                tts_task.cancel()
+                await asyncio.gather(tts_task, return_exceptions=True)
             if generation == self._generation:
                 self._active_turn = None
                 self._accept_audio = False
+                self._tts_active = False
             await stream.aclose()
         turn.meta["spoken"] = "".join(self._spoken_texts.get(turn.request_id, []))
         if generation != self._generation:
@@ -583,7 +597,8 @@ class ConversationPipeline:
                     )
                     return
         finally:
-            self._tts_active = False
+            if generation == self._generation:
+                self._tts_active = False
 
     def _action_acknowledgement(self, call: dict[str, Any]) -> str:
         name = str(call.get("name") or "")

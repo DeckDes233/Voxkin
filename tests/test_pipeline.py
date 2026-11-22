@@ -18,7 +18,9 @@ from voxkin.bridge.protocol import ActionResult
 from voxkin.config import VoxkinConfig
 from voxkin.events import MetricsStore
 from voxkin.llm.openai_compat import OpenAICompatLLM
+from voxkin.llm.base import LLMError
 from voxkin.pipeline import ConversationPipeline
+from voxkin.runtime import MissingKeyLLM
 from voxkin.voice.cache import SpeechCache
 
 
@@ -243,6 +245,35 @@ class FakeController:
                         action_id=action_id, ok=False, detail="已取消", status="cancelled"
                     )
                 )
+
+
+async def test_unconfigured_model_preserves_local_action_and_reports_ordinary_chat_error():
+    config = VoxkinConfig()
+    config.voice_cache.enabled = False
+    events = []
+
+    async def record(event):
+        events.append(event)
+
+    async def inventory(call, turn):
+        assert call["name"] == "inventory"
+        return "粗铁 x12"
+
+    pipeline = ConversationPipeline(config, MissingKeyLLM(config), ToneTTS(),
+                                    RecordingSink(), MetricsStore(), emit=record)
+    pipeline.set_action_handler(inventory)
+    try:
+        with pytest.raises(LLMError, match="LLM 未配置"):
+            await pipeline.respond("今天天气不错")
+        assert not pipeline.is_speaking
+        assert not pipeline._tts_active
+        assert any(event["type"] == "turn_failed" for event in events)
+        summary = await pipeline.respond("背包里有什么")
+        assert summary["meta"]["llm_skipped"] == "unconfigured"
+        assert await wait_until(lambda: any(e.get("detail") == "粗铁 x12" for e in events))
+        assert [e["tool"] for e in events if e["type"] == "action_finished"] == ["inventory"]
+    finally:
+        await pipeline.close()
 
 
 async def test_stop_cancels_the_running_action(llm_port, tmp_path):

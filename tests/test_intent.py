@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from voxkin.config import VoxkinConfig
 from voxkin.intent import classify, is_stop, plan
 
 
@@ -102,6 +103,19 @@ def test_plan_allows_question_mark_for_observation() -> None:
     result = plan("我在哪？")
     assert result is not None
     assert result.skill_id == "observe"
+
+
+@pytest.mark.parametrize("text", ["背包里有什么？", "看看你的背包", "你的背包里都有什么东西"])
+def test_direct_inventory_request_meets_read_threshold(text: str) -> None:
+    result = plan(text)
+    assert result is not None and result.skill_id == "inventory"
+    assert result.confidence >= VoxkinConfig().fast_path.min_confidence
+
+
+@pytest.mark.parametrize("text", ["附近有没有村庄", "把背包里的铁给我", "我的背包里有什么？", "背包里有什么就拿什么"])
+def test_ambiguous_inventory_reference_stays_below_read_threshold(text: str) -> None:
+    result = plan(text)
+    assert result is None or result.confidence < VoxkinConfig().fast_path.min_confidence
 
 
 def test_plan_returns_none_for_small_talk() -> None:

@@ -90,6 +90,16 @@ class StudioServer:
         self.started_at = time.time()
         self._turn_task: asyncio.Task | None = None
 
+    def _start_turn(self, text: str, request_id: str | None = None) -> asyncio.Task:
+        task = asyncio.create_task(self.runtime.pipeline.respond(text, request_id))
+        task.add_done_callback(self._log_turn_error)
+        return task
+
+    @staticmethod
+    def _log_turn_error(task: asyncio.Task) -> None:
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.warning("对话回合失败：%s", error)
+
     def build(self) -> web.Application:
         app = web.Application()
         app.router.add_get("/", self.index)
@@ -158,7 +168,7 @@ class StudioServer:
         wait = bool(body.get("wait"))
         if self._turn_task is not None and not self._turn_task.done():
             await self.runtime.pipeline.interrupt("new_request")
-        self._turn_task = asyncio.create_task(self.runtime.pipeline.respond(text, request_id))
+        self._turn_task = self._start_turn(text, request_id)
         if wait:
             summary = await self._turn_task
             return web.json_response({"request_id": request_id, "summary": summary})
@@ -455,7 +465,7 @@ class StudioServer:
                         and self.runtime.run_manager.running
                     ):
                         self.runtime.run_manager.request_stop()
-                    asyncio.create_task(self.runtime.pipeline.respond(chat["text"]))
+                    self._start_turn(chat["text"])
                 elif kind == "action_result":
                     self.runtime.dispatcher.resolve(ActionResult.from_message(data))
                     manager = getattr(self.runtime, "run_manager", None)
@@ -744,7 +754,7 @@ class StudioServer:
                     continue
                 command = json.loads(message.data)
                 if command.get("type") == "say":
-                    asyncio.create_task(self.runtime.pipeline.respond(command["text"]))
+                    self._start_turn(command["text"])
                 elif command.get("type") == "interrupt":
                     await self.runtime.pipeline.interrupt("ws_command")
 
