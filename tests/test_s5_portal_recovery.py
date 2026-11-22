@@ -194,6 +194,9 @@ async def test_s5_portal_transition_survives_store_and_bridge_restart_for_exit_h
                 "minecraft:the_nether",
                 {"x": 121, "y": 71, "z": -249},
             )
+        elif tool == "raid_fortress":
+            assert arguments["scout_only"]
+            data["events"] = ["fortress_route_found"]
         elif tool == "collect_blaze_rods":
             world["inventory"]["blaze_rod"] = 12
         elif tool == "hunt_enderman":

@@ -400,10 +400,11 @@ S5_STEPS: tuple[StepSpec, ...] = (
     StepSpec(
         "在堡垒附近找烈焰人",
         "raid_fortress",
-        {"radius": 64, "blazes": 1, "timeout_s": 240},
-        {"type": "always"},
+        {"radius": 64, "scout_only": True, "timeout_s": 240},
+        {"type": "result_event", "event": "fortress_route_found"},
         retries=1,
         timeout_s=250,
+        effect_class="replan",
     ),
     StepSpec(
         "击杀烈焰人并拾取 12 根烈焰棒，给 24 个末影之眼留足烈焰粉",

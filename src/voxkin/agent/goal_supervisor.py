@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
+import re
 import time
 import uuid
 from dataclasses import asdict, replace
 from typing import Any, Awaitable, Callable
 
 from voxkin.agent.action_effects import REPLAN_EFFECT_TOOLS, action_effect_class
-from voxkin.agent.late_game_methods import choose_s5_action, choose_s6_action, prepare_late_action
+from voxkin.agent.late_game_methods import choose_s5_action, choose_s6_action, late_method_key, prepare_late_action
+from voxkin.agent.plans import S6_STEPS
 from voxkin.agent.resource_policy import batch_resource_step, choose_supply_opportunity
 from voxkin.agent.goals import (
     GOAL_IMMUTABLE_STATES,
@@ -223,8 +225,27 @@ class GoalSupervisor:
             return self._result(True, "done", str(saved.get("detail") or "持久化目标已完成"))
         if saved and isinstance(saved.get("unresolved_action"), dict):
             self.state = saved
+            unresolved = saved["unresolved_action"]
+            current = dict(self.state_provider() or {})
+            if (unresolved.get("tool") == "fight_dragon" and unresolved.get("status") == "preempted"
+                    and unresolved.get("receipt_confirmed") is True and str(current.get("dimension")).removeprefix("minecraft:") == "the_end"):
+                # 重连时地形往往先于实体和 Boss 栏到达。等待同一末地内的服务器观察。
+                deadline = min(time.monotonic() + 10, time.monotonic() + max(0.0, float(saved.get("deadline_at", 0)) - time.time()))
+                while not current.get("end_dragon") and time.monotonic() < deadline and not self._stop_requested:
+                    if self._observation_event is not None:
+                        self._observation_event.clear()
+                    await self._wait_for_observation(timeout=deadline - time.monotonic())
+                    current = dict(self.state_provider() or {})
+                    if str(current.get("dimension")).removeprefix("minecraft:") != "the_end":
+                        break
             if self._migrate_known_s3_stripmine_terminal(saved["unresolved_action"]):
                 saved = self.state
+            elif self._late_action_recovery(unresolved, current):
+                self.state.pop("unresolved_action")
+                self.state["pending_action"] = None
+                self.state["status"] = "active"
+                self.state["block_reason"] = ""
+                self._save()
             else:
                 reason = str(saved.get("block_reason") or "非重放动作结果缺少可验证证据")
                 self.state["status"] = "blocked"
@@ -460,13 +481,19 @@ class GoalSupervisor:
                             await self._wait_for_observation()
                             continue
                         return self._block("s5_dependencies", str(self.state.get("late_game_block_reason") or "等待 S5 补给或可用路线"))
-                    resource = step.arguments.get("item") or step.arguments.get("block") or step.arguments.get("mode") or "default"
-                    method_key = f"s5:{step.tool}:{resource}"
+                    method_key = late_method_key("S5", step)
+                    if step.tool == "raid_fortress" and step.arguments.get("scout_only") and self._finite_position(state.get("position")):
+                        position = state["position"]
+                        method_key += f":{math.floor(position['x'] / 48)}:{math.floor(position['z'] / 48)}"
+                    if step.tool == "collect_obsidian":
+                        step, method_key = self._s5_obsidian_site(step, state, method_key)
+                        if step.tool != "collect_obsidian":
+                            step_index = None
                 elif (self.goal.stage == "S6" and isinstance(self.state.get("stronghold_search"), dict)
                       and self.state["stronghold_search"].get("phase") != "frames_found"
                       and str(state.get("dimension") or "").removeprefix("minecraft:") == "overworld"):
                     search = self.state["stronghold_search"]
-                    if search.get("phase") != "descend":
+                    if search.get("phase") not in {"descend", "bearing"}:
                         recovery = self.state.get("recovery")
                         explicitly_resuming = isinstance(recovery, dict) and (
                             recovery.get("reason") == "explicit_resume"
@@ -510,6 +537,12 @@ class GoalSupervisor:
                     )
                     step_index = None
                     method_key = f"s6:stronghold_search:{search_id}:layer:{layers}"
+                    if search.get("phase") == "bearing":
+                        used = search["eye_accounting"]["throws_completed"]
+                        step = replace(step, description="从已观察的投眼方向恢复定位",
+                                       arguments={**S6_STEPS[6].arguments, "count": search["throw_limit"], "resume_search": dict(search)},
+                                       timeout_s=310)
+                        method_key = f"s6:stronghold_search:{search_id}:bearing:{used}"
                 elif self.goal.stage == "S6":
                     step, step_index = choose_s6_action(state, self.state, completed_events)
                     step, step_index = prepare_late_action(step, step_index, state, self.state)
@@ -521,8 +554,7 @@ class GoalSupervisor:
                             await self._wait_for_observation()
                             continue
                         return self._block("s6_dependencies", str(self.state.get("late_game_block_reason") or "等待 S6 补给或可用路线"))
-                    resource = step.arguments.get("item") or step.arguments.get("block") or "default"
-                    method_key = f"s6:{step.tool}:{resource}"
+                    method_key = late_method_key("S6", step)
                 else:
                     steps = self._method_steps()
                     step_index = int(self.state.get("method_index", 0))
@@ -846,8 +878,18 @@ class GoalSupervisor:
         status: str,
         data: dict[str, Any],
     ) -> tuple[bool, str]:
+        if self.goal.stage == "S5" and condition.get("type") == "s5_shaft_displacement":
+            observation = _fresh_terminal_observation(pending, data)
+            origin = pending.get("baseline_position")
+            end = (observation or {}).get("position")
+            if (not self._finite_position(origin) or not self._finite_position(end)
+                    or pending.get("receipt_confirmed") is not True or not _fresh_terminal_state(pending, status, state)):
+                return False, "换竖井缺少新鲜位置回执"
+            distance = math.hypot(end["x"] - origin["x"], end["z"] - origin["z"])
+            return status == "succeeded" and distance >= 4, f"已观察到水平位移 {distance:.1f} 格"
         if (self.goal.stage, condition.get("type")) in {
-            ("S3", "s3_mining_relocation"), ("S3", "s3_wood_relocation"), ("S2", "s2_wool_relocation")
+            ("S3", "s3_mining_relocation"), ("S3", "s3_wood_relocation"), ("S2", "s2_wool_relocation"),
+            ("S5", "s5_obsidian_relocation"),
         }:
             observation = _fresh_terminal_observation(pending, data)
             if status != "succeeded" or pending.get("receipt_confirmed") is not True or observation is None or not _fresh_terminal_state(pending, status, state):
@@ -1073,6 +1115,68 @@ class GoalSupervisor:
             "sleep_confirmed": bool(self.state.get("sleep_confirmed")),
             "guarded_night_confirmed": bool(self.state.get("guarded_night_confirmed")),
         }
+
+    def _late_action_recovery(self, action: dict, current: dict) -> str:
+        if self._portal_preflight_stopped(action) or self._portal_insertion_reconciled(action, current):
+            return "portal_room_approach"
+        if self.goal.stage != "S6" or action.get("tool") != "fight_dragon" or action.get("receipt_confirmed") is not True:
+            return ""
+        dragon = current.get("end_dragon") or {}
+        living_dragon = (
+            self._finite_position(dragon.get("position")) and self._finite_number(dragon.get("health")) and float(dragon["health"]) > 0
+            or dragon.get("source") == "dragon_boss_bar" and self._finite_number(dragon.get("health_fraction"))
+            and 0 < float(dragon["health_fraction"]) <= 1
+        )
+        if not (current.get("ready") and current.get("alive") and str(current.get("dimension")).removeprefix("minecraft:") == "the_end" and living_dragon):
+            return ""
+        if action.get("status") == "preempted":
+            return "dragon_alive_after_safety"
+        progress = (action.get("result_data") or {}).get("crystal_progress") or {}
+        if (action.get("status") == "partial" and type(progress.get("broken")) is int and 1 <= progress["broken"] <= 10
+                and type(progress.get("remaining_visible")) is int and 1 <= progress["remaining_visible"] <= 10 - progress["broken"]):
+            return "crystal_progress_observed"
+        return ""
+
+    def _portal_insertion_reconciled(self, action: dict, current: dict) -> bool:
+        if (self.goal.stage != "S6" or action.get("tool") != "activate_end_portal"
+                or action.get("status") != "preempted" or action.get("receipt_confirmed") is not True
+                or not self._s6_is_overworld(current.get("dimension")) or not current.get("ready")
+                or not current.get("alive") or not current.get("session_id")):
+            return False
+        search = self.state.get("stronghold_search") or {}
+        frames = (current.get("end_portal_room") or {}).get("frames") or []
+        if search.get("phase") != "frames_found" or len(frames) != 12 or not all(
+            self._finite_position(f) and isinstance(f.get("filled"), bool) for f in frames
+        ):
+            return False
+        positions = {tuple(f[a] for a in "xyz") for f in frames}
+        x0, y0, z0 = min(f["x"] for f in frames), frames[0]["y"], min(f["z"] for f in frames)
+        ring = {(x0 + i, y0, z0 + j) for i in range(5) for j in range(5)
+                if (i in (0, 4)) != (j in (0, 4))}
+        previous = (search.get("scan") or {}).get("frames") or []
+        return (positions == ring and any(self._finite_position(f) and tuple(f[a] for a in "xyz") in ring for f in previous)
+                and inventory_count(current.get("inventory") or {}, "ender_eye") >= sum(not f["filled"] for f in frames))
+
+    def _portal_preflight_stopped(self, action: dict) -> bool:
+        if (self.goal.stage != "S6" or action.get("tool") != "activate_end_portal"
+                or action.get("status") != "partial" or action.get("receipt_confirmed") is not True
+                or (self.state.get("stronghold_search") or {}).get("phase") != "frames_found"):
+            return False
+        result = action.get("result_data") or {}
+        search = self.state["stronghold_search"]
+        frames = (search.get("scan") or {}).get("frames") or []
+        position = (result.get("observation") or {}).get("position") or search.get("position")
+        if not self._finite_position(position) or not frames or not all(self._finite_position(frame) for frame in frames):
+            return False
+        coords = tuple(float(position[a]) for a in "xyz")
+        if min(math.dist(coords, tuple(float(frame[a]) for a in "xyz")) for frame in frames) <= 8:
+            return False
+        if result.get("portal_phase") == "before_insertion":
+            return True
+        # 旧版本只在检查房间、尚未插眼时发出这一条完整终态。
+        match = re.fullmatch(r"只找到 (\d+) 个末地门框架，还差 (\d+) 个，可能还没走到要塞的传送门房间",
+                             str(action.get("result_detail") or ""))
+        return bool(match and 0 < int(match[1]) < 12 and int(match[1]) + int(match[2]) == 12)
 
     def _migrate_known_s3_stripmine_terminal(self, unresolved: dict[str, Any]) -> bool:
         """只迁移旧 S3 计划中有明确终态账本记录的铁矿挖掘失败。"""
@@ -1655,7 +1759,7 @@ class GoalSupervisor:
             pending["result_detail"] = result.detail
             pending["result_data"] = result.data
             self.store.log_event(self.task_id, "pending_action_reconciled", {"action_id": action_id, "status": result.status})
-            if result.status == "partial":
+            if result.status in {"partial", "preempted"}:
                 consumed = self._consume_s6_stronghold_partial(pending, result.status, result.data, result.detail)
                 if consumed is not None:
                     return consumed == "continue"
@@ -1882,6 +1986,8 @@ class GoalSupervisor:
 
     def _advance_after_success(self, pending: dict[str, Any], data: dict[str, Any]) -> None:
         self._record_s5_portal_transition(pending, data)
+        if (pending.get("expected_condition") or {}).get("type") == "s5_obsidian_relocation":
+            self.state["s5_obsidian_region"] = int(self.state.get("s5_obsidian_region", 0)) + 1
         if self.goal.stage == "S3" and pending.get("tool") == "mine_collect" and (pending.get("arguments") or {}).get("block") == "coal_ore":
             self.state["s3_coal_search_attempted"] = True
         if self.goal.stage == "S2" and str(pending.get("method_key") or "").startswith("s2:wool_relocate:region"):
@@ -2034,6 +2140,84 @@ class GoalSupervisor:
                               retries=1, timeout_s=180, effect_class="replan")
         return relocation, f"{local_key}:relocate"
 
+    def _s5_obsidian_site(self, step: StepSpec, state: dict, key: str) -> tuple[StepSpec, str]:
+        region = int(self.state.get("s5_obsidian_region", 0))
+        sites = self.state.setdefault("s5_obsidian_avoid_positions", [])
+        position = state.get("position") or {}
+        local_failures = ("没有装到水", "没有已加载的静止水源", "静止岩浆源耗尽")
+        exhausted_lava = None
+        for entry in reversed(self.state.get("action_history", [])):
+            if entry.get("tool") != "collect_obsidian" or not entry.get("receipt_confirmed") or entry.get("status") == "rejected_before_start":
+                continue
+            if entry.get("status") in {"blocked", "failed", "partial"} and any(reason in str(entry.get("result_detail")) for reason in local_failures):
+                site = (entry.get("terminal_observation") or (entry.get("result_data") or {}).get("observation") or {}).get("position")
+                if self._finite_position(site):
+                    if "静止岩浆源耗尽" in str(entry.get("result_detail")):
+                        exhausted_lava = site
+                    if not any(abs(float(site["y"]) - p["y"]) < 5 and math.hypot(float(site["x"]) - p["x"], float(site["z"]) - p["z"]) < 8 for p in sites):
+                        sites.append({a: float(site[a]) for a in "xyz"})
+                        del sites[:-128]
+            break
+        leaving_aquifer = self.state.get("s5_wet_region") == region
+        if self._finite_position(position) and (leaving_aquifer or any(abs(float(position["y"]) - p["y"]) < 5 and
+                math.hypot(float(position["x"]) - p["x"], float(position["z"]) - p["z"]) < 12 for p in sites)):
+            y = math.floor(float(position["y"]))
+            descent_key = f"s5:lava_descent:{region}:{y}"
+            if (not leaving_aquifer and exhausted_lava and abs(y - float(exhausted_lava["y"])) < 5 and y > -54
+                    and inventory_count(state.get("inventory") or {}, "water_bucket") and not self._method_failure_count(descent_key)):
+                target = max(-54, y - 8)
+                descend = StepSpec("带水桶分段下探，在新高度重新寻找岩浆", "safe_descend",
+                                   {"targetY": target, "maxLayers": y - target, "fill": True, "detour": False},
+                                   {"type": "position", "target": {**position, "y": target}, "radius": 1.5},
+                                   retries=1, timeout_s=110, effect_class="replan")
+                return descend, descent_key
+            if not leaving_aquifer and exhausted_lava and inventory_count(state.get("inventory") or {}, "water_bucket") and self._method_failure_count(descent_key):
+                for heading in ("east", "north", "west", "south"):
+                    bypass_key = f"s5:lava_bypass:{region}:{math.floor(y / 8)}:{heading}"
+                    if self._method_failure_count(bypass_key):
+                        continue
+                    bypass = StepSpec("沿干燥岩层横移，绕开进水的竖井", "strip_mine",
+                                      {"direction": heading, "length": 8, "branches": 0, "torchInterval": 0},
+                                      {"type": "s5_shaft_displacement"}, retries=1, timeout_s=120, effect_class="replan")
+                    return bypass, bypass_key
+                self.state["s5_wet_region"] = region
+                leaving_aquifer = True
+            surface_exit = (state.get("surface_access") or {}).get("exit")
+            exit_key = f"s5:obsidian_exit:{region}:{y}"
+            exit_above = self._finite_position(surface_exit) and float(surface_exit["y"]) > float(position["y"]) + 1
+            exit_beside = (leaving_aquifer and self._finite_position(surface_exit) and not exit_above
+                           and float(surface_exit["y"]) >= y
+                           and math.hypot(surface_exit["x"] - position["x"], surface_exit["z"] - position["z"]) > 2)
+            if exit_beside:
+                exit_key += ":ledge"
+            if ((not exhausted_lava or leaving_aquifer) and (exit_above or exit_beside)
+                    and self._method_failure_count(exit_key) < 2):
+                target = {**surface_exit, "y": min(surface_exit["y"], y + 6)} if leaving_aquifer else dict(surface_exit)
+                climb = StepSpec("向已观察到的出口上行，再换干地寻找资源", "goto", target,
+                                 {"type": "position", "target": target, "radius": 2},
+                                 retries=1, timeout_s=100, effect_class="replan")
+                return climb, exit_key
+            avoided = list(sites)
+            relocation_key = f"s5:obsidian_relocate:{region}"
+            for entry in reversed(self.state.get("action_history", [])):
+                prior_key = str(entry.get("method_key") or "")
+                if (prior_key != relocation_key and not prior_key.startswith(relocation_key + ":")) or entry.get("status") not in {"failed", "blocked"}:
+                    continue
+                route = (entry.get("result_data") or {}).get("relocation") or {}
+                # 井底出发时无法走到的岸上落点，上岸后应按新的连通地形重新寻路。
+                origin = route.get("origin")
+                if leaving_aquifer and self._finite_position(origin) and abs(float(origin["y"]) - y) >= 8:
+                    continue
+                avoided.extend(p for p in route.get("attempted_positions", []) if self._finite_position(p))
+            relocation = StepSpec("前往新的干燥区域寻找水源和岩浆", "explore_mining_site",
+                                  {"min_distance": 32, "avoid_positions": avoided[:128]},
+                                  {"type": "s5_obsidian_relocation", "min_distance": 32},
+                                  retries=1, timeout_s=160, effect_class="replan")
+            return relocation, f"{relocation_key}:{math.floor(y / 8)}" if leaving_aquifer else relocation_key
+        if region and self._finite_position(position) and inventory_count(state.get("inventory") or {}, "water_bucket"):
+            return step, f"{key}:region{region}:layer{math.floor(float(position['y']) / 8)}"
+        return step, f"{key}:region{region}" if region else key
+
     def _method_failure_count(self, method_key: str) -> int:
         counters = self.state.get("counters") or {}
         method_failures = counters.get("method_failures")
@@ -2149,7 +2333,7 @@ class GoalSupervisor:
             return False
 
     @classmethod
-    def _s6_finite_position(cls, value: Any) -> bool:
+    def _finite_position(cls, value: Any) -> bool:
         return isinstance(value, dict) and all(cls._finite_number(value.get(axis)) for axis in "xyz")
 
     @staticmethod
@@ -2177,12 +2361,12 @@ class GoalSupervisor:
             return False, "终态 observation 没有确认当前仍在主世界"
         if not self._s6_is_overworld(state.get("dimension")):
             return False, "Core 当前 observation 没有确认主世界维度"
-        if not self._s6_finite_position(search.get("position")):
+        if not self._finite_position(search.get("position")):
             return False, "搜索回执缺少实际当前位置"
         scan_position = observation.get("position")
-        if not self._s6_finite_position(scan_position):
+        if not self._finite_position(scan_position):
             return False, "终态 observation 缺少实际坐标"
-        if not self._s6_finite_position(state.get("position")):
+        if not self._finite_position(state.get("position")):
             return False, "Core 当前 observation 缺少实际坐标"
         radius = scan.get("radius")
         try:
@@ -2194,7 +2378,7 @@ class GoalSupervisor:
         frames = scan.get("frames")
         if not isinstance(frames, list) or not frames:
             return False, "没有实际门框坐标，不能认定找到要塞"
-        if any(not self._s6_finite_position(frame) for frame in frames):
+        if any(not self._finite_position(frame) for frame in frames):
             return False, "门框坐标无效"
         resume = (pending.get("arguments") or {}).get("resume_search")
         expected_search_id = resume.get("search_id") if isinstance(resume, dict) else None
@@ -2224,7 +2408,7 @@ class GoalSupervisor:
         data: dict[str, Any],
         detail: str,
     ) -> str | None:
-        if self.goal.stage != "S6" or str(pending.get("tool") or "") != "throw_eye" or status != "partial":
+        if self.goal.stage != "S6" or str(pending.get("tool") or "") != "throw_eye" or status not in {"partial", "preempted"}:
             return None
         raw = data.get("stronghold_search") if isinstance(data, dict) else None
         if not isinstance(raw, dict):
@@ -2253,18 +2437,27 @@ class GoalSupervisor:
         valid = (
             raw.get("schema_version") == 1
             and bool(search_id)
-            and phase in {"descend", "blocked"}
+            and phase in {"descend", "blocked", "bearing"}
             and isinstance(descent, dict)
             and throw_count >= 1
             and 0 <= layers <= S6_STRONGHOLD_MAX_DESCENT_LAYERS
             and 0 <= max_layers <= S6_STRONGHOLD_MAX_DESCENT_LAYERS
             and 1 <= segment_layers <= S6_STRONGHOLD_SEGMENT_LAYERS
             and layers <= max_layers
-            and self._s6_finite_position(raw.get("position"))
+            and self._finite_position(raw.get("position"))
             and isinstance(evidence, dict)
         )
         if previous_id and raw_id not in {None, previous_id}:
             valid = False
+        if phase == "bearing":
+            limit = raw.get("throw_limit")
+            scan = raw.get("scan") or {}
+            valid = (valid and isinstance(limit, int) and 1 <= throw_count < limit <= 12
+                     and evidence.get("kind") == "eye_bearing"
+                     and self._finite_position(evidence.get("throw_origin"))
+                     and self._finite_position(evidence.get("eye_position"))
+                     and isinstance(scan, dict) and scan.get("fresh") is True and scan.get("stable") is True
+                     and self._s6_is_overworld(scan.get("dimension")))
         if phase == "descend":
             valid = valid and max_layers > 0
             try:
@@ -2272,8 +2465,8 @@ class GoalSupervisor:
             except (TypeError, ValueError):
                 overhead_distance = math.inf
             valid = valid and evidence.get("kind") == "eye_overhead"
-            valid = valid and self._s6_finite_position(evidence.get("throw_origin"))
-            valid = valid and self._s6_finite_position(evidence.get("eye_position"))
+            valid = valid and self._finite_position(evidence.get("throw_origin"))
+            valid = valid and self._finite_position(evidence.get("eye_position"))
             valid = valid and math.isfinite(overhead_distance) and 0 <= overhead_distance < 20
             scan = raw.get("scan")
             valid = valid and isinstance(scan, dict)
@@ -2300,13 +2493,15 @@ class GoalSupervisor:
                 overhead_distance = float(evidence.get("horizontal_distance"))
             except (TypeError, ValueError):
                 overhead_distance = math.inf
-            valid = valid and self._s6_finite_position(evidence.get("throw_origin"))
-            valid = valid and self._s6_finite_position(evidence.get("eye_position"))
+            valid = valid and self._finite_position(evidence.get("throw_origin"))
+            valid = valid and self._finite_position(evidence.get("eye_position"))
             valid = valid and math.isfinite(overhead_distance) and 0 <= overhead_distance < 20
+        if valid and phase in {"descend", "blocked"} and evidence.get("kind") == "eye_overhead":
+            valid = float(evidence["eye_position"]["y"]) <= float(evidence["throw_origin"]["y"]) + 0.25
         if raw.get("resume_allowed") is True:
             valid = valid and phase == "blocked" and evidence.get("kind") == "eye_overhead"
             valid = valid and max_layers > 0 and layers < max_layers
-            valid = valid and self._s6_finite_position(raw.get("position"))
+            valid = valid and self._finite_position(raw.get("position"))
             scan = raw.get("scan")
             valid = valid and isinstance(scan, dict) and self._s6_is_overworld(scan.get("dimension"))
 
@@ -2330,14 +2525,14 @@ class GoalSupervisor:
                 "last_action_id": str(pending.get("action_id") or ""),
                 "stop_reason": "partial_receipt_invalid_or_mismatched; 不会重投末影之眼",
             })
-            if not self._s6_finite_position(context.get("position")):
+            if not self._finite_position(context.get("position")):
                 observed = dict(self.state_provider() or {})
-                if self._s6_finite_position(observed.get("position")):
+                if self._finite_position(observed.get("position")):
                     context["position"] = dict(observed["position"])
 
         item = {
             **pending,
-            "status": "partial",
+            "status": status,
             "receipt_confirmed": True,
             "result_detail": str(detail or ""),
             "result_data": data,
@@ -2358,7 +2553,7 @@ class GoalSupervisor:
             "reason": "s6_stronghold_partial_consumed",
             "s6_explicit_search_resume": False,
         })
-        if context.get("phase") == "descend":
+        if context.get("phase") in {"descend", "bearing"}:
             self.state["status"] = "active"
             self.state["block_reason"] = ""
             outcome = "continue"
@@ -2469,6 +2664,14 @@ class GoalSupervisor:
             action_history.append(history_item)
         self.state["pending_action"] = None
         recovery = self.state.setdefault("recovery", {})
+
+        observed_recovery = self._late_action_recovery(history_item, current)
+        if observed_recovery and not verified:
+            self.state["status"] = "active"
+            self.state["block_reason"] = ""
+            recovery.update(needs_reconcile=False, reason=observed_recovery)
+            self._save()
+            return True
 
         if verified:
             self._record_s4_action_outcomes(pending, status, current, data)
@@ -2606,7 +2809,8 @@ class GoalSupervisor:
             "status": "running",
             "method_key": method_key,
         }
-        if self.goal.stage in {"S2", "S3"} and step.tool == "explore_mining_site":
+        if ((self.goal.stage in {"S2", "S3", "S5"} and step.tool == "explore_mining_site")
+                or step.verify.get("type") == "s5_shaft_displacement"):
             pending["baseline_position"] = dict(state_before.get("position") or {})
         if self.goal.stage == "S3" and step.tool == "mine_collect" and (step.arguments.get("block") in {"iron_ore", "deepslate_iron_ore"}):
             pending["baseline_raw_iron"] = inventory_count(state_before.get("inventory") or {}, "raw_iron")
@@ -2647,7 +2851,7 @@ class GoalSupervisor:
             pending["receipt_confirmed"] = bool(getattr(error, "receipt_confirmed", False))
             pending["result_data"] = data
             pending["result_detail"] = str(error)
-            if status == "partial" and pending["receipt_confirmed"] is True:
+            if status in {"partial", "preempted"} and pending["receipt_confirmed"] is True:
                 consumed = self._consume_s6_stronghold_partial(pending, status, data, str(error))
                 if consumed is not None:
                     return "done" if consumed == "continue" else "blocked"
@@ -2733,6 +2937,9 @@ class GoalSupervisor:
             # ActionResult 是 Bridge 的真实回执；它打断 stale admission 连续计数。
             self._reset_admission_retry_streak(method_key)
         if status == "preempted":
+            consumed = self._consume_s6_stronghold_partial(pending, status, data, detail)
+            if consumed is not None:
+                return "done" if consumed == "continue" else "blocked"
             pending["status"] = "preempted"
             pending["result_data"] = data
             pending["result_detail"] = detail

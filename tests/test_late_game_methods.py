@@ -5,8 +5,21 @@ import pytest
 from voxkin.agent.late_game_methods import choose_s5_action, choose_s6_action, ingot_dependency, prepare_late_action
 from voxkin.agent.goal_supervisor import GoalSupervisor
 from voxkin.agent.goals import GOALS
+from voxkin.agent.runner import StepSpec
 from voxkin.agent.tasks import TaskStore
 from voxkin.bridge.protocol import ActionResult
+
+
+def test_s6_approaches_distant_frames_before_using_eyes():
+    state = world()
+    search = {"stronghold_search": {"phase": "frames_found", "scan": {"frames": [{"x": 15, "y": -6, "z": 2}]}}}
+    step, index = choose_s6_action(state, search, set())
+    assert index is None and step.tool == "goto"
+    state["position"] = {"x": 11, "y": 64, "z": 2}
+    step, index = choose_s6_action(state, search, set())
+    assert index is None and step.tool == "safe_descend" and step.arguments["targetY"] == 58
+    state["position"]["y"] = -3
+    assert choose_s6_action(state, search, set())[0].tool == "activate_end_portal"
 
 
 def world(dimension="overworld", **inventory):
@@ -16,13 +29,81 @@ def world(dimension="overworld", **inventory):
             "executor": {"safety_active": False, "active_action_id": None}}
 
 
+def test_s6_reconciles_interrupted_insertion_from_the_same_complete_ring(tmp_path):
+    state = world(ender_eye=3)
+    room = [{"x": x, "y": -6, "z": z, "filled": True} for x in range(5) for z in range(5)
+            if (x in (0, 4)) != (z in (0, 4))]
+    for frame in room[-3:]:
+        frame["filled"] = False
+    state["end_portal_room"] = {"frames": room}
+    supervisor = GoalSupervisor(GOALS["S6"], TaskStore(tmp_path / "tasks.db"), None, lambda: state)
+    supervisor.state = {"stronghold_search": {"phase": "frames_found", "scan": {"frames": room[:1]}}}
+    receipt = {"tool": "activate_end_portal", "status": "preempted", "receipt_confirmed": True}
+    assert supervisor._portal_insertion_reconciled(receipt, state)
+    state["inventory"]["ender_eye"] = 2
+    assert not supervisor._portal_insertion_reconciled(receipt, state)
+    state["inventory"]["ender_eye"] = 3
+    state["end_portal_room"]["frames"] = room[:11]
+    assert not supervisor._portal_insertion_reconciled(receipt, state)
+
+
 def test_s5_in_nether_does_not_repeat_overworld_preparation():
     step, index = choose_s5_action(world("the_nether", cooked_beef=4), {})
     assert (step.tool, index) == ("raid_fortress", 7)
+    assert step.effect_class == "replan" and step.arguments["scout_only"]
+    assert step.verify == {"type": "result_event", "event": "fortress_route_found"}
     step, index = choose_s5_action(world("the_nether", blaze_rod=12, cooked_beef=4), {})
     assert (step.tool, index) == ("hunt_enderman", 9)
     step, index = choose_s5_action(world("the_nether", blaze_rod=12, ender_pearl=24), {})
     assert (step.tool, step.arguments["mode"]) == ("nether_travel", "exit")
+
+
+def test_s6_requires_live_dragon_evidence_to_resume_interrupted_combat(tmp_path):
+    state = world("the_end", bow=1, arrow=63)
+    supervisor = GoalSupervisor(GOALS["S6"], TaskStore(tmp_path / "tasks.db"), None, lambda: state)
+    receipt = {"tool": "fight_dragon", "status": "preempted", "receipt_confirmed": True}
+    assert not supervisor._late_action_recovery(receipt, state)
+    state["end_dragon"] = {"source": "dragon_boss_bar", "health_fraction": 1.0}
+    assert supervisor._late_action_recovery(receipt, state) == "dragon_alive_after_safety"
+    assert not supervisor._late_action_recovery({**receipt, "receipt_confirmed": False}, state)
+    state["end_dragon"]["health_fraction"] = 0.0
+    assert not supervisor._late_action_recovery(receipt, state)
+
+
+def test_s6_partial_crystal_receipt_requires_measured_progress_and_a_live_boss(tmp_path):
+    state = world("the_end")
+    state["end_dragon"] = {"source": "dragon_boss_bar", "health_fraction": 1.0}
+    supervisor = GoalSupervisor(GOALS["S6"], TaskStore(tmp_path / "tasks.db"), None, lambda: state)
+    receipt = {"tool": "fight_dragon", "status": "partial", "receipt_confirmed": True,
+               "result_data": {"crystal_progress": {"broken": 3, "remaining_visible": 7}}}
+    assert supervisor._late_action_recovery(receipt, state) == "crystal_progress_observed"
+    for invalid in ({"broken": 0, "remaining_visible": 7}, {"broken": True, "remaining_visible": 7},
+                    {"broken": 3, "remaining_visible": 8}):
+        assert not supervisor._late_action_recovery({**receipt, "result_data": {"crystal_progress": invalid}}, state)
+    assert not supervisor._late_action_recovery(receipt, {**state, "dimension": "overworld"})
+
+
+def test_s5_uses_the_shaft_lip_and_reconsiders_routes_from_the_surface(tmp_path):
+    state = world(water_bucket=1)
+    state["position"] = {"x": 0.5, "y": 71, "z": 0.5}
+    lip = {"x": 4, "y": 72, "z": 0}
+    state["surface_access"] = {"sky_light": 15, "exit": lip}
+    supervisor = GoalSupervisor(GOALS["S5"], TaskStore(tmp_path / "tasks.db"), None, lambda: state)
+    old_target = {"x": 32, "y": 75, "z": 0}
+    supervisor.state = {"s5_obsidian_region": 1, "s5_wet_region": 1, "action_history": [
+        {"method_key": "s5:obsidian_relocate:1", "status": "blocked", "result_data": {
+            "relocation": {"origin": {"x": 0, "y": 54, "z": 0}, "attempted_positions": [old_target]}}}]}
+    request = StepSpec("采集黑曜石", "collect_obsidian", {}, {})
+    step, _ = supervisor._s5_obsidian_site(request, state, "s5:obsidian")
+    assert step.tool == "goto" and step.arguments == lip
+    state["position"] = lip
+    step, _ = supervisor._s5_obsidian_site(request, state, "s5:obsidian")
+    assert step.tool == "explore_mining_site" and old_target not in step.arguments["avoid_positions"]
+    supervisor.state = {"s5_obsidian_region": 2}
+    _, upper = supervisor._s5_obsidian_site(request, state, "s5:obsidian")
+    state["position"] = {**lip, "y": lip["y"] - 8}
+    _, lower = supervisor._s5_obsidian_site(request, state, "s5:obsidian")
+    assert upper != lower
 
 
 def test_s5_existing_igniter_skips_all_of_its_consumed_ingredients():
@@ -65,6 +146,23 @@ def test_late_supply_climbs_in_short_verified_segments_before_dawn():
     assert step is None and ledger["late_game_wait_reason"]
 
 
+def test_daytime_hunt_uses_observed_surface_above_a_cave_at_normal_surface_elevation():
+    state = world()
+    state.update(position={"x": -33, "y": 62, "z": 105},
+                 surface_access={"sky_light": 0, "exit": {"x": -33, "y": 79, "z": 105}})
+    step, _ = prepare_late_action(*choose_s5_action(state, {}), state, {})
+    assert step.tool == "goto" and step.arguments["y"] == 79
+    state["surface_access"] = {"sky_light": 15, "exit": None}
+    assert prepare_late_action(*choose_s5_action(state, {}), state, {})[0].tool == "hunt_animal"
+
+
+def test_hunt_progress_counts_raw_meat_in_the_bridge_and_total_food_in_the_goal():
+    state = world(beef=1, bread=2)
+    step, _ = choose_s5_action(state, {})
+    assert step.arguments["count"] == 2
+    assert step.verify["count"] == 4
+
+
 def test_s6_respects_existing_equipment_eyes_and_recipe_yields():
     state = world(cooked_beef=4, bow=1, arrow=60, feather=1, flint=1)
     step, index = choose_s6_action(state, {}, set())
@@ -89,6 +187,7 @@ def test_late_combat_eats_and_waits_for_health_before_reengaging():
     ledger = {}
     step, index = choose_s5_action(state, ledger)
     assert step.tool == "eat_if_hungry"
+    assert step.verify == {"type": "food", "min": 16}
     state["food"] = 20
     step, index = prepare_late_action(*choose_s5_action(state, ledger), state, ledger)
     assert step is None and ledger["late_game_wait_reason"]
