@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import mineflayer from 'mineflayer';
 import { applyProtocol767ItemFormat } from './protocol_767.js';
+import { correctMiningMaterials } from './mining_materials.js';
 import pathfinderPkg from 'mineflayer-pathfinder';
 import WebSocket from 'ws';
 import { Vec3 } from 'vec3';
@@ -3355,6 +3356,7 @@ function createBot() {
     auth: config.auth,
     version: config.version || undefined,
   });
+  bot.once('login', () => correctMiningMaterials(bot.registry));
   bot.loadPlugin(pathfinder);
   installArmorManagerApi(bot, armorManager);
   bot.loadPlugin(toolModule.plugin || toolModule);
