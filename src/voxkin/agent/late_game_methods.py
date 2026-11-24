@@ -38,21 +38,39 @@ def prepare_late_action(step: StepSpec | None, index: int | None, state: dict, l
     surface = state.get("surface_access") or {}
     overworld = str(state.get("dimension") or "").removeprefix("minecraft:") == "overworld"
     exit_position = surface.get("exit")
+    route = None
     if outdoor and overworld and state.get("is_day") is True and isinstance(exit_position, dict):
-        return StepSpec("先到已观察的露天地面再搜索", "goto", dict(exit_position),
-                        {"type": "position", "target": dict(exit_position), "radius": 2.0},
-                        retries=2, timeout_s=90, effect_class="replan"), None
-    if outdoor and overworld and surface.get("sky_light", 0) < 12 and _s3_needs_surface_route(state):
+        route = StepSpec("先到已观察的露天地面再搜索", "goto", dict(exit_position),
+                         {"type": "position", "target": dict(exit_position), "radius": 2.0, "site": "surface_exit"},
+                         retries=2, timeout_s=90, effect_class="replan")
+    elif outdoor and overworld and surface.get("sky_light", 0) < 12 and _s3_needs_surface_route(state):
         ledger.pop("s3_preflight_terminal_reason", None)
         ledger.pop("s3_preflight_wait_reason", None)
         route = _s3_return_to_known_surface(state, ledger, staged_supply_route=True)
         if route is None:
             ledger["late_game_block_reason"] = ledger.get("s3_preflight_terminal_reason")
             ledger["late_game_wait_reason"] = ledger.get("s3_preflight_wait_reason")
+            return None, None
+    if route is not None:
+        failures = (ledger.get("counters") or {}).get("method_failures") or {}
+        if route.tool == "goto" and failures.get(late_method_key(ledger.get("stage", ""), route)) and not _danger_now(state):
+            position = state["position"]
+            rise = min(6, math.floor(route.arguments["y"]) - math.floor(position["y"]))
+            if rise >= 2:
+                dx, dz = route.arguments["x"] - position["x"], route.arguments["z"] - position["z"]
+                direction = ("east" if dx > 0 else "west") if abs(dx) > abs(dz) else ("south" if dz > 0 else "north")
+                return StepSpec("上行寻路失败，改挖有支撑的短阶梯", "strip_mine",
+                                {"rise": rise, "direction": direction},
+                                {"type": "min_height", "y": math.floor(position["y"]) + rise},
+                                retries=1, timeout_s=160, effect_class="replan"), None
         return route, None
     if step.tool == "hunt_animal" and (state.get("is_day") is False or _hunt_closing(state)):
         ledger["late_game_wait_reason"] = "等天亮后再寻找食物，保留狩猎预算"
         return None, None
+    if step.tool == "hunt_animal" and step.arguments.get("walk_only"):
+        failures = (ledger.get("counters") or {}).get("method_failures") or {}
+        if failures.get(late_method_key(ledger.get("stage", ""), step)):
+            step = replace(step, arguments={**step.arguments, "radius": 64})
     return step, index
 
 
@@ -101,18 +119,32 @@ def sustenance(state: dict, *, reserve: int = 0) -> StepSpec | None:
                         {"type": "food", "min": min(18, math.floor(food) + 1)}, retries=2, timeout_s=60, effect_class="replan")
     if str(state.get("dimension") or "").removeprefix("minecraft:") == "overworld" and (stock < reserve or (food < 12 and not stock)):
         raw = sum(inventory_count(inventory, name) for name in ("beef", "porkchop", "mutton", "chicken", "rabbit"))
-        return StepSpec("先取得一份新口粮，再按实际库存继续备粮", "hunt_animal", {"count": raw + 1, "radius": 64, "min_health": 10},
+        arguments = {"count": raw + 1, "radius": 64, "min_health": 10}
+        if food < 8 and not stock:
+            arguments.update(radius=24, walk_only=True)
+        return StepSpec("先取得一份新口粮，再按实际库存继续备粮", "hunt_animal", arguments,
                         {"type": "inventory_any", "items": sorted(FOOD_ITEMS), "count": stock + 1},
                         retries=2, timeout_s=250, effect_class="replan")
     return None
 
 
-def late_method_key(stage: str, step: StepSpec) -> str:
+def late_method_key(stage: str, step: StepSpec, position: dict | None = None) -> str:
     prefix = stage.lower()
+    if step.tool == "goto" and step.verify.get("site") == "surface_exit":
+        target = step.arguments
+        return f"{prefix}:surface_exit:{math.floor(target['x'] / 8)}:{math.floor(target['y'] / 4)}:{math.floor(target['z'] / 8)}"
+    if step.tool == "strip_mine" and step.arguments.get("rise"):
+        return f"{prefix}:ascent:{step.verify['y'] - step.arguments['rise']}"
     if step.tool == "eat_if_hungry":
         return f"{prefix}:eat_to:{step.verify['min']}"
     if step.tool == "hunt_animal":
-        return f"{prefix}:hunt_animal:stock:{step.verify['count']}"
+        mode = "walking" if step.arguments.get("walk_only") else "stock"
+        if mode == "walking" and step.arguments.get("radius", 24) > 24:
+            mode = "walking_wide"
+        key = f"{prefix}:hunt_animal:{mode}:{step.verify['count']}"
+        if mode != "walking" and position and all(isinstance(position.get(axis), (float, int)) and math.isfinite(position[axis]) for axis in ("x", "z")):
+            return f"{key}:area:{math.floor(position['x'] / 64)}:{math.floor(position['z'] / 64)}"
+        return key
     if step.tool == "collect_obsidian":
         return f"{prefix}:collect_obsidian:stock:{step.arguments['count']}"
     resource = step.arguments.get("item") or step.arguments.get("block")
@@ -142,24 +174,32 @@ def choose_s5_action(state: dict[str, Any], ledger: dict[str, Any]) -> tuple[Ste
             index = 8 if routed else 7
             if not routed:
                 surveyed = []
+                walk_misses = []
                 for entry in ledger.get("action_history", []):
                     obs = entry.get("terminal_observation") or {}
                     if (entry.get("tool") != "raid_fortress" or not entry.get("receipt_confirmed")
                             or str(obs.get("dimension")).removeprefix("minecraft:") != "the_nether"):
                         continue
                     route = ((entry.get("result_data") or {}).get("fortress_evidence") or {}).get("route") or {}
+                    if isinstance(route.get("walk_misses"), list):
+                        walk_misses = route["walk_misses"][-16:]
                     for pos in (entry.get("baseline_position"), *(route.get("visited") or [])[-24:], obs.get("position")):
                         if isinstance(pos, dict) and all(isinstance(pos.get(a), (int, float)) and math.isfinite(pos[a]) for a in ("x", "z")):
                             surveyed.append({"x": pos["x"], "z": pos["z"]})
                 if surveyed:
-                    return replace(S5_STEPS[7], arguments={**S5_STEPS[7].arguments, "surveyed": surveyed[-24:]}), 7
+                    arguments = {**S5_STEPS[7].arguments, "surveyed": surveyed[-24:]}
+                    if walk_misses:
+                        arguments["walk_misses"] = walk_misses
+                    return replace(S5_STEPS[7], arguments=arguments), 7
             return S5_STEPS[index], index
         return S5_STEPS[9], 9
     if dimension != "overworld":
         ledger["late_game_block_reason"] = "S5 需要主世界或下界的新鲜维度观察"
         return None, None
-    local_preparation = cursor < 5 and inventory_count(inventory, "obsidian") < 10 and not rods
-    reserve = 1 if local_preparation and _hunt_closing(state) else 4
+    obsidian = inventory_count(inventory, "obsidian")
+    # 分批采到第一块后游标已指向建门；仍按实有数量判断是否还在矿点。
+    local_preparation = cursor < 6 and obsidian < 10 and not rods
+    reserve = 1 if local_preparation and (obsidian > 0 or _hunt_closing(state)) else 4
     supply = sustenance(state, reserve=reserve)
     if supply:
         # 地下等天亮补粮时，先用背包现成的材料准备点火器；仍在出发前检查口粮。
@@ -179,6 +219,19 @@ def choose_s5_action(state: dict[str, Any], ledger: dict[str, Any]) -> tuple[Ste
     # 已确认建门/过门的游标只作为门址提示，nether_travel 仍需实测门块及维度变化。
     if cursor >= 6:
         return S5_STEPS[6], 6
+    site = ledger.get("s5_portal_site")
+    if site:
+        origin = site["origin"]
+        position = state.get("position") or {}
+        if not all(isinstance(position.get(axis), (int, float)) and math.isfinite(position[axis]) for axis in "xyz"):
+            ledger["late_game_wait_reason"] = "等待当前位置后返回已记录的下界门址"
+            return None, None
+        if math.dist(tuple(position[a] for a in "xyz"), tuple(origin[a] for a in "xyz")) > 12:
+            beside = dict(origin)
+            beside["z" if site["axis"] == "x" else "x"] += 3
+            return StepSpec("返回中断前的下界门址旁", "goto", beside,
+                            {"type": "position", "target": beside, "radius": 3}, effect_class="replan"), None
+        return replace(S5_STEPS[5], arguments={"resume_site": site}), 5
     if inventory_count(inventory, "flint_and_steel") < 1:
         dependency = ingot_dependency(inventory, 1)
         if dependency:

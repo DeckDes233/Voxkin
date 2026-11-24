@@ -257,6 +257,15 @@ class GoalSupervisor:
             if recovery.get("reason") != "known_terminal_s3_stripmine_replanned_from_fresh_observation":
                 recovery["reason"] = "explicit_resume"
             search = saved.get("stronghold_search")
+            # 旧版门框扫描能穿墙。恢复时只继承实际投眼轨迹和已下探层数。
+            if (self.goal.stage == "S6" and isinstance(search, dict) and search.get("phase") == "frames_found"
+                    and (search.get("scan") or {}).get("frames") and not search["scan"].get("line_of_sight")):
+                search["scan"] = {**search["scan"], "frames": []}
+                if (search.get("evidence") or {}).get("kind") == "eye_overhead":
+                    search["phase"] = "descend"
+                else:
+                    saved.pop("stronghold_search")
+                    search = None
             recovery["s6_explicit_search_resume"] = bool(
                 self.goal.stage == "S6"
                 and isinstance(search, dict)
@@ -375,6 +384,10 @@ class GoalSupervisor:
                         await self._wait_for_observation()
                         continue
                     method_key = f"s2:{step.tool}:{step.arguments.get('block') or step.arguments.get('item') or 'default'}"
+                    if step.tool == "make_shelter":
+                        site = (state.get("shelter") or {}).get("position") or state.get("position")
+                        if self._finite_position(site):
+                            method_key += ":site:" + ",".join(str(math.floor(site[a] / 4)) for a in "xyz")
                     if method_key == "s2:hunt_material:wool":
                         region = int(self.state.get("s2_wool_search_region", 0))
                         if region:
@@ -437,10 +450,6 @@ class GoalSupervisor:
                     elif step.tool == "mine_collect" and resource in {*S3_OVERWORLD_WOOD_LOGS, "wood_log"}:
                         context = _s3_wood_search_context(state) or "unknown"
                         method_key = f"s3:wood_search:{context}:{resource}"
-                        if resource == "wood_log":
-                            step = replace(step, arguments={**step.arguments, "surface_wood": True})
-                            if self._method_failure_count(method_key):
-                                step, method_key = self._expand_wood_search(step, state, method_key)
                     else:
                         method_key = f"s3:{step.tool}:{resource}"
                     if step.tool == "strip_mine":
@@ -481,7 +490,7 @@ class GoalSupervisor:
                             await self._wait_for_observation()
                             continue
                         return self._block("s5_dependencies", str(self.state.get("late_game_block_reason") or "等待 S5 补给或可用路线"))
-                    method_key = late_method_key("S5", step)
+                    method_key = late_method_key("S5", step, state.get("position"))
                     if step.tool == "raid_fortress" and step.arguments.get("scout_only") and self._finite_position(state.get("position")):
                         position = state["position"]
                         # 只在实到同一 Minecraft 区块时共用局部失败次数；任务总预算覆盖跨区侦察。
@@ -555,7 +564,7 @@ class GoalSupervisor:
                             await self._wait_for_observation()
                             continue
                         return self._block("s6_dependencies", str(self.state.get("late_game_block_reason") or "等待 S6 补给或可用路线"))
-                    method_key = late_method_key("S6", step)
+                    method_key = late_method_key("S6", step, state.get("position"))
                 else:
                     steps = self._method_steps()
                     step_index = int(self.state.get("method_index", 0))
@@ -594,6 +603,24 @@ class GoalSupervisor:
                             arguments={**step.arguments, "portal_hint": portal_hint},
                         )
 
+                if self.goal.stage in {"S3", "S4"} and step.tool == "sleep_safe":
+                    method_key = f"wood_sleep:day{state.get('day')}"
+                if (self.goal.stage in {"S3", "S4"} and step.tool == "mine_collect"
+                        and step.arguments.get("block") == "wood_log" and not step.arguments.get("within_reach")):
+                    step = replace(step, arguments={**step.arguments, "surface_wood": True})
+                    access = state.get("surface_access") or {}
+                    exit_point = access.get("exit")
+                    position = state.get("position")
+                    if (self._finite_position(exit_point) and self._finite_position(position)
+                            and self._finite_number(access.get("sky_light")) and access["sky_light"] < 8
+                            and exit_point["y"] - position["y"] >= 2 and state.get("is_day") is True
+                            and self._method_failure_count(f"{method_key}:exit") < 2):
+                        method_key += ":exit"
+                        step = StepSpec("先到已观察的见天出口，再找地表原木", "goto", dict(exit_point),
+                                        {"type": "position", "target": dict(exit_point), "radius": 2},
+                                        retries=1, timeout_s=90, effect_class="replan")
+                    elif self._method_failure_count(method_key) and self._finite_position(position):
+                        step, method_key = self._expand_wood_search(step, state, method_key)
                 step = batch_resource_step(self.goal.stage, step, state)
                 outcome = await self._execute_step(step, method_key, step_index)
                 if outcome == "preempted":
@@ -892,6 +919,7 @@ class GoalSupervisor:
             return status == "succeeded" and distance >= 4, f"已观察到水平位移 {distance:.1f} 格"
         if (self.goal.stage, condition.get("type")) in {
             ("S3", "s3_mining_relocation"), ("S3", "s3_wood_relocation"), ("S2", "s2_wool_relocation"),
+            ("S4", "s3_wood_relocation"),
             ("S5", "s5_obsidian_relocation"),
         }:
             observation = _fresh_terminal_observation(pending, data)
@@ -1139,6 +1167,15 @@ class GoalSupervisor:
         return 0 < final <= lowest - 1
 
     def _late_action_recovery(self, action: dict, current: dict) -> str:
+        if (self.goal.stage == "S5" and action.get("tool") == "make_nether_portal"
+                and action.get("receipt_confirmed") is True and action.get("status") == "preempted"
+                and str(current.get("dimension")).removeprefix("minecraft:") == "overworld" and current.get("alive")):
+            site = (action.get("result_data") or {}).get("portal_site") or {}
+            origin = site.get("origin") if isinstance(site, dict) else None
+            if (isinstance(origin, dict) and all(type(origin.get(axis)) is int for axis in "xyz")
+                    and site.get("axis") in ("x", "z") and site.get("dimension") == "minecraft:overworld"):
+                self.state["s5_portal_site"] = {"origin": dict(origin), "axis": site["axis"], "dimension": site["dimension"]}
+                return "resume_observed_nether_portal_site"
         if self._portal_preflight_stopped(action) or self._portal_insertion_reconciled(action, current):
             return "portal_room_approach"
         if self.goal.stage != "S6" or action.get("tool") != "fight_dragon" or action.get("receipt_confirmed") is not True:
@@ -1350,8 +1387,8 @@ class GoalSupervisor:
         if (self.goal.stage == "S3" and str(pending.get("method_key") or "").startswith("s3:ore_return_surface:")
                 and pending.get("receipt_confirmed") is True):
             self.state["s3_relocation_surface_return_used"] = True
-        if self.goal.stage == "S3" and pending.get("tool") == "explore_mining_site":
-            wood = (pending.get("expected_condition") or {}).get("type") == "s3_wood_relocation"
+        wood = (pending.get("expected_condition") or {}).get("type") == "s3_wood_relocation"
+        if pending.get("tool") == "explore_mining_site" and (self.goal.stage == "S3" or (self.goal.stage == "S4" and wood)):
             if not wood:
                 self.state["s3_relocation_failed"] = True
             attempted = (data.get("relocation") or {}).get("attempted_positions") or data.get("attempted_positions") or []
@@ -2411,6 +2448,8 @@ class GoalSupervisor:
         frames = scan.get("frames")
         if not isinstance(frames, list) or not frames:
             return False, "没有实际门框坐标，不能认定找到要塞"
+        if scan.get("line_of_sight") is not True:
+            return False, "门框坐标缺少视线确认"
         if any(not self._finite_position(frame) for frame in frames):
             return False, "门框坐标无效"
         resume = (pending.get("arguments") or {}).get("resume_search")
@@ -2842,7 +2881,7 @@ class GoalSupervisor:
             "status": "running",
             "method_key": method_key,
         }
-        if ((self.goal.stage in {"S2", "S3", "S5"} and step.tool == "explore_mining_site")
+        if ((self.goal.stage in {"S2", "S3", "S4", "S5"} and step.tool == "explore_mining_site")
                 or step.verify.get("type") == "s5_shaft_displacement"):
             pending["baseline_position"] = dict(state_before.get("position") or {})
         if self.goal.stage == "S3" and step.tool == "mine_collect" and (step.arguments.get("block") in {"iron_ore", "deepslate_iron_ore"}):

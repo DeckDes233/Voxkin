@@ -39,6 +39,19 @@ def s4_state(*, y: float = 59.9, revision: int = 20, **updates) -> dict:
     return state
 
 
+def test_s4_uses_the_observed_exit_before_a_distant_shelter():
+    state = s4_state(position={"x": 118.5, "y": 42, "z": 12.5}, is_day=False,
+                     shelter={"inside": False, "size": 4, "position": {"x": 9, "y": 69, "z": 152}},
+                     inventory={"iron_pickaxe": 1, "stick": 1, "porkchop": 3},
+                     surface_access={"sky_light": 0, "exit": {"x": 118, "y": 63, "z": 12}})
+    ledger = {}
+    ready, step = choose_s4_preflight_action(state, ledger)
+    assert not ready and step.tool == "goto" and step.arguments == {"x": 118, "y": 48, "z": 12}
+    state["position"]["y"] = 55
+    ready, step = choose_s4_preflight_action(state, ledger)
+    assert not ready and step is None and ledger.get("s4_preflight_wait_reason")
+
+
 def observation(state: dict) -> dict:
     return {
         **state,
@@ -155,6 +168,19 @@ def test_s4_propagates_safe_wait_when_missing_stone_pickaxe_requires_nighttime_w
     assert step is None
     assert goal_state.get("s4_preflight_wait_reason")
     assert "s4_preflight_block_reason" not in goal_state
+
+
+def test_s4_can_retry_nighttime_bed_admission_until_a_physical_failure():
+    state = s4_state(y=74, is_day=False, day=0, resource_sites={"sleep_bed": {"x": 4, "y": 72, "z": 3}},
+                     inventory={"iron_pickaxe": 1, "crafting_table": 1, "porkchop": 4})
+    ledger = {"s4_food_reserve_ready": True}
+    for _ in range(2):
+        _, step = choose_s4_preflight_action(state, ledger)
+        assert step.tool == "sleep_safe"
+        assert step.arguments["range"] == 32
+    ledger["counters"] = {"method_failures": {"wood_sleep:day0": 1}}
+    _, step = choose_s4_preflight_action(state, ledger)
+    assert step is None and ledger["s4_preflight_wait_reason"]
 
 
 def test_s4_mines_deepslate_when_stone_pickaxe_repair_needs_more_stone():

@@ -87,6 +87,10 @@ class Verifier:
                 available >= required,
                 "背包满足" if available >= required else f"可用物品共 {available} 个，还差 {required - available} 个",
             )
+        if kind == "min_height":
+            y = (state.get("position") or {}).get("y")
+            target = rule["y"]
+            return isinstance(y, (int, float)) and y >= target, f"实际高度 {y}，目标至少 {target}"
         if kind == "position":
             position = state.get("position") or {}
             target = rule.get("target") or {}

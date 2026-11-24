@@ -2,7 +2,7 @@ from copy import deepcopy
 
 import pytest
 
-from voxkin.agent.late_game_methods import choose_s5_action, choose_s6_action, ingot_dependency, prepare_late_action
+from voxkin.agent.late_game_methods import choose_s5_action, choose_s6_action, ingot_dependency, late_method_key, prepare_late_action
 from voxkin.agent.goal_supervisor import GoalSupervisor
 from voxkin.agent.goals import GOALS
 from voxkin.agent.runner import StepSpec
@@ -83,6 +83,16 @@ async def test_fortress_scout_replans_from_the_chunk_reached_on_its_last_attempt
     assert result["block_reason"] == "budget_method_attempts"
     assert departures == [2, -4, -4, -4]
     store.close()
+
+
+def test_s5_scout_reuses_failed_approaches_without_marking_their_targets_visited():
+    state = world("the_nether", cooked_beef=4)
+    miss = {"from": state["position"], "to": {"x": 24, "y": 64, "z": 0}}
+    history = [{"tool": "raid_fortress", "receipt_confirmed": True, "terminal_observation": state,
+                "result_data": {"fortress_evidence": {"route": {"walk_misses": [miss]}}}}]
+    step, _ = choose_s5_action(state, {"action_history": history})
+    assert step.arguments["walk_misses"] == [miss]
+    assert step.arguments["surveyed"] == [{"x": 0, "z": 0}]
 
 
 def test_s6_requires_live_dragon_evidence_to_resume_interrupted_combat(tmp_path):
@@ -183,6 +193,30 @@ def test_s5_uses_the_night_underground_for_stationary_preparation_before_hunting
     assert choose_s5_action(state, {})[0].tool == "hunt_animal"
 
 
+def test_s5_finishes_batched_obsidian_with_food_on_hand_then_restocks_before_portal():
+    state = world(obsidian=2, diamond_pickaxe=1, flint_and_steel=1, water_bucket=1, mutton=3)
+    state.update(food=18, time=11000)
+    ledger = {"method_index": 5}
+    step, _ = choose_s5_action(state, ledger)
+    assert step.tool == "collect_obsidian" and step.arguments["count"] == 4
+    state["inventory"]["obsidian"] = 10
+    assert choose_s5_action(state, ledger)[0].tool == "hunt_animal"
+
+
+def test_s5_resumes_preempted_build_only_at_receipted_site(tmp_path):
+    state = world(obsidian=4, flint_and_steel=1, mutton=4)
+    state.update(position={"x": 1, "y": 64, "z": 1}, alive=True)
+    supervisor = GoalSupervisor(GOALS["S5"], TaskStore(tmp_path / "tasks.db"), None, lambda: state)
+    supervisor.state = {"method_index": 5}
+    entry = {"tool": "make_nether_portal", "status": "preempted", "receipt_confirmed": True}
+    assert not supervisor._late_action_recovery(entry, state)
+    site = {"dimension": "minecraft:overworld", "axis": "x", "origin": {"x": 2, "y": 64, "z": 1}}
+    entry["result_data"] = {"portal_site": site}
+    assert supervisor._late_action_recovery(entry, state)
+    step, index = choose_s5_action(state, supervisor.state)
+    assert index == 5 and step.arguments == {"resume_site": site}
+
+
 def test_late_supply_climbs_in_short_verified_segments_before_dawn():
     state = world()
     state.update(position={"x": 0, "y": -10, "z": 0}, is_day=False,
@@ -200,10 +234,32 @@ def test_daytime_hunt_uses_observed_surface_above_a_cave_at_normal_surface_eleva
     state = world()
     state.update(position={"x": -33, "y": 62, "z": 105},
                  surface_access={"sky_light": 0, "exit": {"x": -33, "y": 79, "z": 105}})
-    step, _ = prepare_late_action(*choose_s5_action(state, {}), state, {})
+    ledger = {"stage": "S5", "counters": {"method_failures": {"s5:goto:default": 3}}}
+    step, _ = prepare_late_action(*choose_s5_action(state, ledger), state, ledger)
     assert step.tool == "goto" and step.arguments["y"] == 79
+    key = late_method_key("S5", step)
+    assert key == "s5:surface_exit:-5:19:13"
+    ledger["counters"]["method_failures"][key] = 1
+    step, _ = prepare_late_action(*choose_s5_action(state, ledger), state, ledger)
+    assert step.tool == "strip_mine" and step.verify["y"] == 68
     state["surface_access"] = {"sky_light": 15, "exit": None}
     assert prepare_late_action(*choose_s5_action(state, {}), state, {})[0].tool == "hunt_animal"
+
+
+def test_s5_can_start_a_verified_ascent_when_the_shelter_is_far_from_the_mine():
+    state = world(iron_ingot=1)
+    state.update(position={"x": 119.5, "y": -12, "z": -16.5}, is_day=False, food=16,
+                 shelter={"position": {"x": 1, "y": 63, "z": 97}, "size": 4})
+    ledger = {}
+    step, _ = prepare_late_action(*choose_s5_action(state, ledger), state, ledger)
+    assert step.tool == "goto" and step.arguments == {"x": 115, "y": -4, "z": -12}
+    assert step.verify["target"] == step.arguments
+    assert not ledger.get("late_game_block_reason")
+    ledger.update(stage="S5", counters={"method_failures": {"s5:goto:default": 3}})
+    step, _ = prepare_late_action(*choose_s5_action(state, ledger), state, ledger)
+    assert step.tool == "strip_mine" and step.arguments["rise"] == 6
+    assert step.verify == {"type": "min_height", "y": -6}
+    assert late_method_key("S5", step) == "s5:ascent:-12"
 
 
 def test_hunt_progress_counts_raw_meat_in_the_bridge_and_total_food_in_the_goal():
@@ -211,6 +267,18 @@ def test_hunt_progress_counts_raw_meat_in_the_bridge_and_total_food_in_the_goal(
     step, _ = choose_s5_action(state, {})
     assert step.arguments["count"] == 2
     assert step.verify["count"] == 4
+    state.update(food=7, inventory={})
+    step, _ = choose_s5_action(state, {})
+    assert step.arguments["walk_only"] and step.arguments["radius"] == 24
+    assert late_method_key("S5", step) == "s5:hunt_animal:walking:1"
+    ledger = {"stage": "S5", "counters": {"method_failures": {"s5:hunt_animal:walking:1": 1}}}
+    step, _ = prepare_late_action(step, None, state, ledger)
+    assert step.arguments["walk_only"] and step.arguments["radius"] == 64
+    assert late_method_key("S5", step) == "s5:hunt_animal:walking_wide:1"
+    state.update(food=9)
+    step, _ = choose_s5_action(state, {})
+    assert late_method_key("S5", step, {"x": 148, "z": 162}) == "s5:hunt_animal:stock:1:area:2:2"
+    assert late_method_key("S5", step, {"x": 97, "z": 60}) == "s5:hunt_animal:stock:1:area:1:0"
 
 
 def test_s6_respects_existing_equipment_eyes_and_recipe_yields():

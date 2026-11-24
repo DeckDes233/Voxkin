@@ -825,6 +825,17 @@ def test_s2_empty_inventory_and_partial_iron_choose_wool_without_mining_prerequi
     assert step.tool == "craft" and step.arguments["item"] == "shears"
 
 
+def test_s2_climbs_out_of_the_dirt_pit_before_choosing_a_new_shelter_site():
+    state = modern_state(inventory={"white_bed": 1, "cobblestone": 18, "dirt": 22})
+    exit_pos = {"x": 7, "y": 69, "z": 136}
+    state.update(shelter={}, position={"x": 7, "y": 65, "z": 136}, is_day=True,
+                 surface_access={"sky_light": 0, "exit": exit_pos})
+    step = choose_s2_action(state, {})
+    assert step.tool == "goto" and step.verify["target"] == exit_pos
+    state.update(position=exit_pos, surface_access={"sky_light": 15, "exit": None})
+    assert choose_s2_action(state, {}).tool == "make_shelter"
+
+
 def test_s2_uses_bridge_missing_block_count_and_night_shelter_priority():
     state = modern_state(
         is_day=False,
@@ -2863,7 +2874,8 @@ async def test_s6_estimate_without_actual_frame_coordinates_cannot_verify_throw_
 
 
 @pytest.mark.asyncio
-async def test_s6_fresh_overworld_frame_coordinates_verify_search_step(tmp_path):
+@pytest.mark.parametrize("visible", [False, True])
+async def test_s6_fresh_overworld_frame_coordinates_verify_search_step(tmp_path, visible):
     store = TaskStore(tmp_path / "tasks.db")
     store.initialize()
     task = store.create_task("S6", "S6")
@@ -2877,6 +2889,7 @@ async def test_s6_fresh_overworld_frame_coordinates_verify_search_step(tmp_path)
             "dimension": "minecraft:overworld",
             "radius": 64,
             "frames": [{"x": 11, "y": 24, "z": 20}],
+            "line_of_sight": visible,
         }
         return ActionResult(
             action_id=kwargs["action_id"],
@@ -2896,12 +2909,16 @@ async def test_s6_fresh_overworld_frame_coordinates_verify_search_step(tmp_path)
 
     outcome = await supervisor._execute_step(step, "plan:s6:6", 6)
 
-    assert outcome == "done"
     persisted = store.load_goal_state(task.id)
-    assert persisted["status"] == "active"
-    assert persisted["method_index"] == 7
-    assert persisted["stronghold_search"]["phase"] == "frames_found"
-    assert persisted["stronghold_search"]["scan"]["frames"] == [{"x": 11, "y": 24, "z": 20}]
+    if visible:
+        assert outcome == "done"
+        assert persisted["status"] == "active"
+        assert persisted["method_index"] == 7
+        assert persisted["stronghold_search"]["phase"] == "frames_found"
+        assert persisted["stronghold_search"]["scan"]["frames"] == [{"x": 11, "y": 24, "z": 20}]
+    else:
+        assert outcome == "blocked"
+        assert "视线" in persisted["unresolved_action"]["reason"]
     store.close()
 
 
@@ -3508,10 +3525,11 @@ def test_s3_relocation_requires_fresh_observed_progress_and_preserves_budget(tmp
     store.close()
 
 @pytest.mark.asyncio
-async def test_s3_relocation_execute_persists_new_region_and_preserves_total_budget(tmp_path):
+@pytest.mark.parametrize("stage", ["S3", "S4"])
+async def test_relocation_execute_reconciles_displacement_and_preserves_total_budget(tmp_path, stage):
     store = TaskStore(tmp_path / "s3_relocation.db")
     store.initialize()
-    task = store.create_task("S3", "S3")
+    task = store.create_task(stage, stage)
     state = modern_state(position={"x": 0, "y": 60, "z": 0}, inventory={"raw_iron": 8, "stone_pickaxe": 1})
     async def dispatch(tool, arguments, timeout_s=0, action_id="", **kwargs):
         assert tool == "explore_mining_site"
@@ -3521,20 +3539,23 @@ async def test_s3_relocation_execute_persists_new_region_and_preserves_total_bud
             "relocation": {"origin": {"x": 0, "y": 60, "z": 0}, "destination": dict(state["position"]), "attempted_positions": []},
             "observation": dict(state),
         })
-    supervisor = GoalSupervisor(GOALS["S3"], store, dispatch, lambda: state)
+    supervisor = GoalSupervisor(GOALS[stage], store, dispatch, lambda: state)
     supervisor.task_id = task.id
     supervisor.state = supervisor._new_state()
     supervisor.state.update(s3_ore_expose_used=12, s3_ore_no_progress=1)
     supervisor.state["counters"]["actions"] = 23
     step = choose_s3_resource_action(state, supervisor.state)
-    result = await supervisor._execute_step(step, "s3:ore_relocate:0", None)
+    if stage == "S4":
+        step = StepSpec("换区采木", "explore_mining_site", {"min_distance": 16}, {"type": "s3_wood_relocation", "min_distance": 16}, effect_class="replan")
+    result = await supervisor._execute_step(step, f"{stage}:relocate", None)
     assert result == "done", (result, supervisor.state)
     persisted = store.load_goal_state(task.id)
-    assert persisted["s3_ore_regions"] == 1
-    assert persisted["s3_ore_expose_used"] == 0
     assert persisted["counters"]["actions"] == 24
-    assert persisted["s3_ore_avoid_positions"] == [{"x": 0.0, "y": 60.0, "z": 0.0}]
-    assert choose_s3_resource_action(state, persisted).tool == "mine_collect"
+    if stage == "S3":
+        assert persisted["s3_ore_regions"] == 1
+        assert persisted["s3_ore_expose_used"] == 0
+        assert persisted["s3_ore_avoid_positions"] == [{"x": 0.0, "y": 60.0, "z": 0.0}]
+        assert choose_s3_resource_action(state, persisted).tool == "mine_collect"
     store.close()
 
 def test_s3_confirmed_water_enclosed_stair_relocates_without_repeating_tunnel():

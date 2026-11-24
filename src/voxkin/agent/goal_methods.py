@@ -409,6 +409,14 @@ def choose_s2_action(state: dict[str, Any], goal_state: dict[str, Any]) -> StepS
         missing_blocks = _shelter_missing_blocks(state, inventory)
         if missing_blocks > 0:
             return collect_block("dirt", missing_blocks, "最终庇护所方块", 250.0)
+        surface = state.get("surface_access") or {}
+        exit_pos = surface.get("exit")
+        sky_light = surface.get("sky_light")
+        if (day is True and not shelter.get("position") and isinstance(sky_light, (int, float)) and sky_light < 8
+                and isinstance(exit_pos, dict) and all(isinstance(exit_pos.get(axis), (int, float))
+                                                        and math.isfinite(exit_pos[axis]) for axis in "xyz")):
+            return action("从取土坑回到已观察到的露天地面再选址", "goto", dict(exit_pos),
+                          {"type": "position", "target": dict(exit_pos), "radius": 2}, 90.0)
         return action("搭建最终全封闭庇护所", "make_shelter", {"size": 4}, {"type": "shelter"})
 
     if not inside:
@@ -520,6 +528,22 @@ def _s3_return_to_known_surface(
         goal_state["s3_preflight_terminal_reason"] = "当前不在主世界，不能使用主世界庇护所锚点规划返地表路线"
         return None
     position = state.get("position") or {}
+    surface = state.get("surface_access") or {}
+    nearby_exit = surface.get("exit")
+    if (isinstance(nearby_exit, dict) and all(isinstance(p.get(a), (int, float)) and math.isfinite(p[a])
+                                               for p in (position, nearby_exit) for a in "xyz")
+            and 0 < nearby_exit["y"] - position["y"] <= 24
+            and math.hypot(nearby_exit["x"] - position["x"], nearby_exit["z"] - position["z"]) <= 8):
+        target = dict(nearby_exit)
+        if _danger_now(state) or (_is_day(state) is not True and target["y"] - position["y"] <= 8):
+            goal_state["s3_preflight_wait_reason"] = "在出口下方等到白天且附近安全后再外出"
+            return None
+        if _is_day(state) is not True:
+            target["y"] = min(math.floor(position["y"]) + 6, target["y"] - 5)
+        elif target["y"] - position["y"] > 12:
+            target["y"] = math.floor(position["y"]) + 6
+        return _s3_action("分段返回附近已观察到的露天地面", "goto", target,
+                          {"type": "position", "target": target, "radius": 2.0}, 90.0)
     shelter = state.get("shelter") or {}
     anchor = shelter.get("position") or {}
     try:
@@ -534,14 +558,19 @@ def _s3_return_to_known_surface(
         return None
     horizontal = math.hypot(target["x"] - current["x"], target["z"] - current["z"])
     vertical = target["y"] - current["y"]
-    if horizontal > S3_SURFACE_ROUTE_MAX_HORIZONTAL or vertical < S3_SURFACE_ROUTE_MIN_VERTICAL or (vertical > 96 and not staged_supply_route):
+    far_anchor = horizontal > S3_SURFACE_ROUTE_MAX_HORIZONTAL
+    if vertical < S3_SURFACE_ROUTE_MIN_VERTICAL or (not staged_supply_route and (far_anchor or vertical > 96)):
         goal_state["s3_preflight_terminal_reason"] = "已知庇护所锚点不在有界返地表路线范围内"
         return None
-    if staged_supply_route and vertical > 16 and not _danger_now(state):
+    if staged_supply_route and (vertical > 16 or (far_anchor and _is_day(state) is True)):
+        if _danger_now(state):
+            goal_state["s3_preflight_wait_reason"] = "等待安全控制处理附近危险后继续返地表"
+            return None
         # 暗洞白天也可能刷怪。先分段靠近已知出口，临近地表时再按昼夜决定是否外出。
         scale = min(1.0, 6 / max(1.0, horizontal))
         waypoint = {axis: round(current[axis] + (target[axis] - current[axis]) * scale) for axis in ("x", "z")}
-        waypoint["y"] = math.floor(current["y"]) + min(8, math.floor(vertical) - 10)
+        climb = min(8, math.floor(vertical) - 10) if vertical > 16 else min(4, math.floor(vertical))
+        waypoint["y"] = math.floor(current["y"]) + climb
         return _s3_action("分段向已知庇护所上行补给", "goto", waypoint,
                           {"type": "position", "target": waypoint, "radius": 3.0}, 90.0)
     if _is_day(state) is not True:
@@ -572,6 +601,13 @@ def _s3_ensure_planks(
         if _s3_needs_surface_route(state):
             return _s3_return_to_known_surface(state, goal_state)
         if _is_day(state) is not True:
+            day = state.get("day")
+            sleep_failures = (goal_state.get("counters") or {}).get("method_failures") or {}
+            if (_is_day(state) is False and isinstance(day, int) and not sleep_failures.get(f"wood_sleep:day{day}")
+                    and str(state.get("dimension")).removeprefix("minecraft:") == "overworld"
+                    and (state.get("resource_sites") or {}).get("sleep_bed") and not _danger_now(state)):
+                return _s3_action("用已观察到的床睡到天亮后采木", "sleep_safe", {"range": 32},
+                                  {"type": "daylight", "min_health": 1}, 120)
             goal_state["s3_preflight_wait_reason"] = "夜间不外出采木，等待白天后再采集木材"
             return None
     return step
@@ -1623,7 +1659,11 @@ def s4_method_key(step: StepSpec, state: dict[str, Any], goal_state: dict[str, A
         target = int(step.arguments.get("count", have))
         return f"s4:mine_collect:{block}:have{have}:target{target}"
     if step.tool == "craft":
-        return f"s4:craft:{step.arguments.get('item', 'default')}"
+        item = step.arguments.get("item", "default")
+        if (item in {"wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond_pickaxe", "furnace"}
+                and inventory_count(inventory, "crafting_table") > 0 and not _nearby_crafting_table(state)):
+            return f"s4:craft:{item}:portable_table"
+        return f"s4:craft:{item}"
     if step.tool == "leave_shelter":
         return "s4:leave_shelter"
     return f"s4:{step.tool}:{step.arguments.get('item', step.arguments.get('block', 'default'))}"
