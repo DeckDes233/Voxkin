@@ -13,16 +13,16 @@ A persistent `GoalSupervisor` selects actions using inventory, environment and d
 
 In Studio, the Chinese command “背包里有什么” asks what Voxkin is carrying. In headless Paper tests, Voxkin returned its inventory during both mining and Nether scouting. The mining action went on to finish, and the scout continued pathfinding under the same action ID. A local rule handles this query. Automated tests cover microphone capture during replies and spoken interruptions. [Scheduling and interruptions](docs/ARCHITECTURE.md#任务语音与动作控制)
 
-Headless Paper runs cover [S3 mining and resupply](docs/evidence/HEADLESS_S3_20261122.md) and [S4–S6 survival checkpoints and End combat tests](docs/evidence/HEADLESS_S4_S6_20261123.md).
+The latest headless Paper run began with an empty inventory and passed S1–S4 across checkpoint restarts, preserving deaths and task history. In S5, Voxkin mined ten obsidian before a creeper interrupted portal construction. In a separate copy it resumed a partially built frame and entered the Nether. An independent S6 run checked resupply with no eyes of ender. [S1–S6 survival test](docs/evidence/NATURAL_S1_S6_20261124.md) · [Earlier End combat tests](docs/evidence/HEADLESS_S4_S6_20261123.md)
 
 | Area | Evidence boundary |
 | --- | --- |
 | Conversation, TTS/STT and game bridge | Implemented; engines and models require local configuration. [Benchmarks](docs/BENCHMARK_RESULTS.md) distinguish real APIs from the local test LLM |
 | S0–S2 | Fresh-world passes recorded; recent S2 passes cover daytime preparation, not actual overnight sleep or three-night survival |
-| S3 | Resuming a save with 12 raw iron, Voxkin found wood, used planks to smelt 9 ingots and crafted an iron pickaxe, an iron sword, a shield and a bucket. The stage check counted the equipped shield. Fresh-world completion and low-oxygen recovery remain open |
-| S4 | Starting from the S3 save, Voxkin mined three diamonds, recovered from a cave fight and crafted a diamond pickaxe. [Headless Paper continuation](docs/evidence/HEADLESS_S4_S6_20261123.md) |
+| S3 | In a fresh world, Voxkin started with an empty inventory, passed S1–S3 in sequence, mined and smelted its own iron, and crafted the iron pickaxe, iron sword, shield and bucket. Recovery from low oxygen during iron mining still needs a live test. [Survival rerun](docs/evidence/SURVIVAL_RERUN_20261123.md) |
+| S4 | The same empty-inventory survival run passed S4 after a host restart. Voxkin found an overland route to wood, replaced a broken iron pickaxe underground, mined four diamonds and crafted a diamond pickaxe. [Headless Paper rerun](docs/evidence/SURVIVAL_RERUN_20261123.md) |
 | S5 | The survival run obtained a water bucket and flint and steel, escaped a flooded shaft, and reached a new area to search for lava. In a separate lava-pool test Voxkin mined ten obsidian, built a portal and entered the Nether. Fortress supplies and the return trip remain open |
-| S6 | With supplies and a starting point near a natural stronghold, Voxkin followed an eye, descended and filled the frames. From the portal room's outer ledge it entered the End and bridged to the island. The saved world confirmed all eight uncaged crystals destroyed. A separate test cleared nearby Endermen before combat. Voxkin then destroyed both caged crystals and damaged the dragon. The dragon kill and return trip remain open |
+| S6 | In an earlier test the server located a stronghold and supplied a nearby starting point and equipment. Voxkin threw eyes, filled the frames, entered the End and destroyed crystals. That version could also read frames through walls. Combat saves confirm damage to the dragon. Finding the portal from a natural start, killing the dragon and returning home remain open. [Portal and combat rerun](docs/evidence/SURVIVAL_RERUN_20261123.md) |
 | Village supplies and iron-golem harvesting | Implemented and covered by offline tests. Live acceptance remains open |
 | Skills | 67 skills, 66 model tools exposed by Core (excluding `chat`); see [catalog](docs/SKILLS.md) |
 | Fabric audio mod | Builds; real-client playback and spatial audio remain unverified |
