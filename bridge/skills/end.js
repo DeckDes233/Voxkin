@@ -240,6 +240,11 @@ function eyeEntities(ctx) {
 function findBlockPositions(ctx, name, radius, count = PORTAL_FRAME_COUNT * 2) {
   const bot = botOf(ctx);
   const origin = bot.entity.position;
+  const visibleInOverworld = (position) => {
+    if (!isOverworldDimension(currentDimension(ctx))) return true;
+    const block = bot.blockAt(position);
+    return block?.name === name && bot.canSeeBlock?.(block);
+  };
   if (typeof bot.findBlocks === 'function') {
     try {
       const positions = bot.findBlocks({
@@ -248,7 +253,7 @@ function findBlockPositions(ctx, name, radius, count = PORTAL_FRAME_COUNT * 2) {
         maxDistance: radius,
         count,
       });
-      return (positions || []).filter(Boolean);
+      return (positions || []).filter(p => p && visibleInOverworld(p));
     } catch (error) {
       log(ctx, '找方块失败', name, error.message);
     }
@@ -260,7 +265,7 @@ function findBlockPositions(ctx, name, radius, count = PORTAL_FRAME_COUNT * 2) {
         matching: (candidate) => Boolean(candidate && candidate.name === name),
         maxDistance: radius,
       });
-      if (block) return [block.position];
+      if (block && visibleInOverworld(block.position)) return [block.position];
     } catch (error) {
       log(ctx, '找方块失败', name, error.message);
     }
@@ -343,7 +348,7 @@ function scanFramesFresh(ctx, radius = S6_FRAME_RADIUS) {
       fresh = false;
       continue;
     }
-    if (block.name !== FRAME_BLOCK) continue;
+    if (block.name !== FRAME_BLOCK || !bot.canSeeBlock?.(block)) continue;
     const actualPosition = block.position || position;
     if (!finitePosition(actualPosition)) {
       fresh = false;
@@ -354,6 +359,7 @@ function scanFramesFresh(ctx, radius = S6_FRAME_RADIUS) {
   const dimensionAfter = currentDimension(ctx);
   return {
     fresh,
+    line_of_sight: true,
     stable: dimensionBefore === dimensionAfter && isOverworldDimension(dimensionAfter),
     dimension: dimensionAfter,
     radius,
@@ -1551,21 +1557,21 @@ async function fightDragon(args, ctx) {
     const perched = isDragonPerched(dragon, bot);
     const distance = distanceToBot(ctx, dragon);
     try {
-      if (perched) {
-        if (bot.health < 18 && ctx.findRangedWeapon?.() && ctx.evadePerchedDragon) {
-          await ctx.evadePerchedDragon(dragon);
-          if (bot.food < 20 && distanceToBot(ctx, dragon) >= 15 && !findEntity(ctx, 'area_effect_cloud', 10)) {
-            const food = ctx.findFoodForEating?.();
-            if (food && ctx.eatFood) await ctx.eatFood({ item: food.name, count: 1 });
-          }
-          await sleepMs(ctx, 500);
-          continue;
+      const ranged = ctx.findRangedWeapon?.();
+      const canRecover = bot.food >= 18 || Boolean(ctx.findFoodForEating?.());
+      if (bot.health < 18 && (perched || !ranged) && (canRecover || ranged) && ctx.evadeDragon) {
+        await ctx.evadeDragon(dragon);
+        if (bot.food < 20 && distanceToBot(ctx, dragon) >= 15 && !findEntity(ctx, 'area_effect_cloud', 10)) {
+          const food = ctx.findFoodForEating?.();
+          if (food && ctx.eatFood) await ctx.eatFood({ item: food.name, count: 1 });
         }
+        await sleepMs(ctx, 500);
+        continue;
+      }
+      if (perched) {
         const detail = await strikePerchedDragon(ctx, dragon);
         if (detail) lastDetail = detail;
       } else {
-        const ranged =
-          typeof ctx.findRangedWeapon === 'function' ? ctx.findRangedWeapon() : null;
         if (ranged && typeof ctx.shootAt === 'function' && distance > 5) {
           const shot = await ctx.shootAt(dragon);
           if (!shot) notes.push('龙在射程外，射击没有命中');

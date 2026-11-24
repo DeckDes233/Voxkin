@@ -29,7 +29,7 @@ function observePortalRoom(bot) {
   const frames = [];
   for (const pos of bot.findBlocks({ matching: id, maxDistance: 12, count: 12 })) {
     const block = bot.blockAt(pos, false);
-    if (block?.name !== 'end_portal_frame') continue;
+    if (block?.name !== 'end_portal_frame' || !bot.canSeeBlock?.(block)) continue;
     const eye = block.getProperties().eye;
     if (![true, false, 'true', 'false', 0, 1].includes(eye)) continue;
     frames.push({ x: pos.x, y: pos.y, z: pos.z, filled: eye === true || eye === 'true' || eye === 1 });

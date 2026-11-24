@@ -172,6 +172,7 @@ test('activate_end_portal reports success after the server activates all frames 
       eyes -= 1;
       portalGenerated = frames.every((entry) => entry._properties.eye);
     },
+    canSeeBlock: () => true,
     blockAt(position) {
       return frames.find((frame) =>
         frame.position.x === position.x &&
@@ -361,7 +362,7 @@ test('throw_eye does not claim it reached the estimate when travel made no progr
 test('a resumed bearing scans for real frames before spending another eye', async () => {
   const frame = { name: 'end_portal_frame', position: makePosition(10, 64, 20) };
   const bot = { entity: { position: makePosition(10, 64, 20) }, game: { dimension: 'overworld' },
-    findBlocks: () => [frame.position], blockAt: () => frame };
+    findBlocks: () => [frame.position], blockAt: () => frame, canSeeBlock: () => true };
   const resume_search = { search_id: 'first', phase: 'bearing', scan: { dimension: 'overworld' },
     eye_accounting: { throws_completed: 2, inventory_before: 24 },
     evidence: { kind: 'eye_bearing', throw_origin: makePosition(), eye_position: makePosition(10, 72, 2) } };
@@ -430,6 +431,38 @@ test('fight_dragon accepts dragon absence when the return portal appears during 
   assert.deepEqual(result.data, {
     events: ['ender_dragon_killed'],
     evidence: 'return_portal_appeared_dragon_absent',
+  });
+});
+
+test('an injured fighter without arrows recovers before attacking a perched dragon', async () => {
+  const { bot, ctx, dragonEntity } = makeContext();
+  bot.health = 11;
+  bot.food = 20;
+  const actions = [];
+  ctx.evadeDragon = async () => { actions.push('retreat'); bot.health = 18; };
+  ctx.attackEntity = async () => { actions.push('attack'); dragonEntity.health = 0; };
+  await withFakeClock(async ({ sleep }) => {
+    ctx.sleep = sleep;
+    await skills.fight_dragon.handler({ timeout_s: 30 }, ctx);
+  });
+  assert.deepEqual(actions, ['retreat', 'attack']);
+});
+
+test('a wounded fighter without arrows does not return to the podium during flight', async () => {
+  const { bot, ctx, dragonEntity } = makeContext();
+  bot.health = 12;
+  bot.food = 20;
+  dragonEntity.position = makePosition(30, 90, 20);
+  ctx.travelTo = () => assert.fail('回到祭坛时仍未恢复');
+  ctx.evadeDragon = async () => {
+    bot.health = 18;
+    dragonEntity.position = makePosition(0, 64, 0);
+  };
+  ctx.attackEntity = async () => { dragonEntity.health = 0; };
+  await withFakeClock(async ({ sleep }) => {
+    ctx.sleep = sleep;
+    const result = await skills.fight_dragon.handler({timeout_s: 30}, ctx);
+    assert.equal(result.status, 'succeeded');
   });
 });
 
@@ -634,8 +667,10 @@ test('throw_eye continuation never throws again and descends only after safe che
     inventory: { items: () => [{ name: 'ender_eye', count: 4 }] },
     findBlocks({ matching }) {
       const frame = { name: 'end_portal_frame', position: makeBlockPosition(11, 62, 20) };
-      return descended >= 2 && matching(frame) ? [frame.position] : [];
+      return matching(frame) ? [frame.position] : [];
     },
+    // 区块从一开始就包含门框，只有下探两层以后才能看见。
+    canSeeBlock: () => descended >= 2,
     blockAt(position) {
       if (position.x === 11 && position.y === 62 && position.z === 20) {
         return { name: 'end_portal_frame', position: makeBlockPosition(11, 62, 20) };
@@ -692,6 +727,7 @@ test('throw_eye continuation never throws again and descends only after safe che
   assert.equal(result.data.stronghold_search.search_id, 's6-search-1');
   assert.equal(result.data.stronghold_search.scan.dimension, 'minecraft:overworld');
   assert.equal(result.data.stronghold_search.scan.fresh, true);
+  assert.equal(result.data.stronghold_search.scan.line_of_sight, true);
   assert.equal(result.data.stronghold_search.scan.frames.length, 1);
   assert.deepEqual(result.data.stronghold_search.scan.frames[0], { x: 11, y: 62, z: 20 });
   assert.equal(descended, 2);

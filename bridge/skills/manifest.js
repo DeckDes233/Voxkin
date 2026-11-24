@@ -1693,6 +1693,7 @@ module.exports = {
           default: 0,
           description: "至少击杀多少只目标动物；大于 0 时按击杀数收手。",
         },
+        { name: 'walk_only', type: 'boolean', required: false, default: false, description: '缺粮时步行就近搜索，禁用疾跑、跑酷和开挖。' },
         {
           name: 'species',
           type: 'string',
@@ -1967,6 +1968,7 @@ module.exports = {
           default: false,
           description: "是否再补一个返程门（要 20 个黑曜石）。",
         },
+        { name: 'resume_site', type: 'object', required: false, default: null, description: '从上次实测门址续建，包含 dimension、origin 和 axis。' },
       ],
       preconditions: "桥接已连接且 bot 已进入世界。",
       observations: "读取背包、位置、朝向、附近方块与实体状态。",
@@ -2242,6 +2244,13 @@ module.exports = {
           required: false,
           default: [],
           description: "先前侦察实际到过的区域，用于选择新的安全落脚点。",
+        },
+        {
+          name: 'walk_misses',
+          type: 'array',
+          required: false,
+          default: [],
+          description: "最近走不通的起点和落脚点，仅在相同进路附近使用。",
         },
         {
           name: 'timeout_s',
@@ -2613,6 +2622,13 @@ module.exports = {
           required: false,
           default: 0,
           description: "开始前先挖多深的垂直竖井。",
+        },
+        {
+          name: 'rise',
+          type: 'number',
+          required: false,
+          default: 0,
+          description: "只沿有支撑的干地向上开挖台阶，最多 8 层。",
         },
         {
           name: 'y',

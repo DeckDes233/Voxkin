@@ -339,6 +339,26 @@ test('raid_fortress returns only actually scanned fortress block coordinates', a
   assert.deepEqual(travelTargets[0], fortress);
 });
 
+test('a scout skips a previously unreachable approach and records the next unreachable target', async () => {
+  const { bot, ctx } = makeContext('minecraft:the_nether', new Vec3(0, 64, 0));
+  bot.pathfinder = { movements: { exclusionAreasStep: [] }, setMovements() {} };
+  bot.blockAt = p => p.y < 64 ? { name: 'netherrack', boundingBox: 'block' } : { name: 'air', boundingBox: 'empty' };
+  const previous = { from: {x: 0, y: 64, z: 0}, to: {x: 24, y: 64, z: 0} };
+  const attempts = [];
+  ctx.walkOnce = async (x, y, z) => { attempts.push({x, y, z}); return 'unreachable'; };
+  await withFakeClock(async ({sleep}) => {
+    ctx.sleep = sleep;
+    await assert.rejects(skills.raid_fortress.handler({scout_only: true, walk_misses: [previous]}, ctx), error => {
+      assert.ok(error.data, error.stack);
+      const misses = error.data.fortress_evidence.route.walk_misses;
+      assert.ok(attempts.length > 0);
+      assert.ok(!attempts.some(p => Math.hypot(p.x - 24, p.z) <= 2));
+      assert.deepEqual(misses.at(-1).to, attempts.at(-1));
+      return true;
+    });
+  });
+});
+
 test('scouting records a live blaze without initiating combat', async () => {
   const { bot, ctx } = makeContext();
   bot.entities = { blaze: { name: 'blaze', position: new Position(2, 64, 0) } };

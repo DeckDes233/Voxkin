@@ -271,15 +271,15 @@ function sheepCandidates(ctx, radius, color, processed) {
   return candidates.sort((left, right) => left.distance - right.distance);
 }
 
-function assertSafeSheepSearchConditions(ctx) {
+function assertSafeSheepSearchConditions(ctx, minFood) {
   const bot = ctx.bot;
   if (ctx.interrupted) throw new Error('寻找羊时被新的指令打断');
   const health = Number(bot.health);
   if (!Number.isFinite(health) || health <= 12) {
     throw new Error(`血量未知或不足（血量 ${Number.isFinite(health) ? health : '未知'}），停止寻找羊`);
   }
-  const food = Number(bot.food);
-  if (!Number.isFinite(food) || food < 8) {
+  const food = bot.food;
+  if (!Number.isFinite(food) || food < minFood) {
     throw new Error(`饥饿值未知或过低（${Number.isFinite(food) ? food : '未知'}），停止寻找羊`);
   }
   if (typeof ctx.isSleepTime !== 'function' || ctx.isSleepTime()) {
@@ -294,8 +294,8 @@ function assertSafeSheepSearchConditions(ctx) {
   }
 }
 
-async function ensureSafeSheepSearch(ctx, recovery) {
-  assertSafeSheepSearchConditions(ctx);
+async function ensureSafeSheepSearch(ctx, recovery, minFood = 8) {
+  assertSafeSheepSearchConditions(ctx, minFood);
   if (typeof ctx.nearbyHostiles !== 'function') {
     throw new Error('附近有敌对生物或无法确认安全，停止外出寻找羊');
   }
@@ -312,7 +312,7 @@ async function ensureSafeSheepSearch(ctx, recovery) {
   }
 
   while (recovery.attempts < SHEEP_HOSTILE_RECOVERY_MAX_ATTEMPTS) {
-    assertSafeSheepSearchConditions(ctx);
+    assertSafeSheepSearchConditions(ctx, minFood);
     const target = ctx.findHostile(16);
     if (!target || !target.position) {
       throw new Error('附近有敌对生物或无法确认安全，停止外出寻找羊');
@@ -325,7 +325,7 @@ async function ensureSafeSheepSearch(ctx, recovery) {
     for (let check = 0; check < SHEEP_HOSTILE_RECHECK_ATTEMPTS; check += 1) {
       if (ctx.interrupted) throw new Error('寻找羊时被新的指令打断');
       await ctx.sleep(750);
-      assertSafeSheepSearchConditions(ctx);
+      assertSafeSheepSearchConditions(ctx, minFood);
       const remainingHostiles = ctx.nearbyHostiles(12);
       if (!remainingHostiles) {
         throw new Error('附近有敌对生物或无法确认安全，停止外出寻找羊');
@@ -1237,6 +1237,19 @@ function cookedNames(ctx, speciesList) {
 
 // 狩猎：追上去挥剑，等掉落物，捡肉。
 async function huntAnimal(args, ctx) {
+  if (args.walk_only !== true) return huntForMeat(args, ctx, HUNT_SEARCH_MAX_STEPS, 8);
+  const movements = ctx.bot.pathfinder?.movements;
+  if (!movements) throw new Error('缺少步行寻路设置，无法低消耗寻食');
+  const original = {allowSprinting: movements.allowSprinting, allowParkour: movements.allowParkour, canDig: movements.canDig};
+  Object.assign(movements, {allowSprinting: false, allowParkour: false, canDig: false});
+  try {
+    return await huntForMeat({...args, radius: args.radius ?? 24}, ctx, 4, 0);
+  } finally {
+    Object.assign(movements, original);
+  }
+}
+
+async function huntForMeat(args, ctx, maxSearchSteps, minFood) {
   const wanted = clamp(args.count, 1, 64, 1);
   const wantedKills = Math.trunc(clamp(args.min_kills, 0, 64, 0));
   const radius = clamp(args.radius, 4, 64, 32);
@@ -1286,8 +1299,8 @@ async function huntAnimal(args, ctx) {
     }
     const target = findHuntable(ctx, speciesList, radius);
     if (!target) {
-      if (searchSteps < HUNT_SEARCH_MAX_STEPS && typeof ctx.walkOnce === 'function') {
-        await ensureSafeSheepSearch(ctx, safetyRecovery);
+      if (searchSteps < maxSearchSteps && typeof ctx.walkOnce === 'function') {
+        await ensureSafeSheepSearch(ctx, safetyRecovery, minFood);
         const position = ctx.bot.entity.position;
         const waypoint = nextSheepSearchWaypoint(
           ctx,
@@ -1297,17 +1310,17 @@ async function huntAnimal(args, ctx) {
           position.z,
           radius,
           0,
-          HUNT_SEARCH_MAX_STEPS,
+          maxSearchSteps,
           routeHeading,
           visited,
           true,
         );
         if (!waypoint) {
-          searchSteps = HUNT_SEARCH_MAX_STEPS;
+          searchSteps = maxSearchSteps;
         } else {
           searchSteps += 1;
           if (typeof ctx.log === 'function') {
-            ctx.log('狩猎搜索路线', `${searchSteps}/${HUNT_SEARCH_MAX_STEPS}`, `(${waypoint.x}, ${waypoint.y}, ${waypoint.z})`);
+            ctx.log('狩猎搜索路线', `${searchSteps}/${maxSearchSteps}`, `(${waypoint.x}, ${waypoint.y}, ${waypoint.z})`);
           }
           const outcome = await walkSheepSearchWaypoint(
             ctx,
@@ -1321,7 +1334,7 @@ async function huntAnimal(args, ctx) {
           if (outcome !== 'reached' && outcome !== 'unreachable') {
             throw new Error(`搜索动物时移动未完成（${outcome || '未知状态'}），停止搜索`);
           }
-          await ensureSafeSheepSearch(ctx, safetyRecovery);
+          await ensureSafeSheepSearch(ctx, safetyRecovery, minFood);
           if (outcome === 'reached') {
             searchedSince = Date.now();
             continue;
@@ -1997,6 +2010,7 @@ export const skills = {
     parameters: [
       { name: 'count', type: 'number', required: false, default: 1, description: '需要多少块生肉。' },
       { name: 'min_kills', type: 'number', required: false, default: 0, description: '至少击杀多少只目标动物；大于 0 时按击杀数收手。' },
+      { name: 'walk_only', type: 'boolean', required: false, default: false, description: '缺粮时步行就近搜索，禁用疾跑、跑酷和开挖。' },
       { name: 'species', type: 'string', required: false, default: null, description: '指定生物，例如 cow、pig、sheep。' },
       { name: 'exclude_species', type: 'array', required: false, default: [], description: '排除的生物名称，避免猎取羊等保留资源。' },
       { name: 'radius', type: 'number', required: false, default: 32, description: '搜索半径。' },

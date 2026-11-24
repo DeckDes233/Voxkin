@@ -40,6 +40,12 @@ async function exploreMiningSite(args, ctx) {
     if (bot.health <= 10) fail('血量不足，先处理生存恢复');
     if (ctx.nearbyHostiles?.(10)?.length) fail('附近有敌对生物，先处理生存恢复');
   };
+  // 近处敌人曾连续耗尽换区次数。先沿已验证的安全退路脱离，再检查能否开始探路。
+  const threat = ctx.findHostile?.(10);
+  if (threat && bot.health > 10 && !ctx.interrupted &&
+      !waterLike(bot.blockAt(bot.entity.position.offset(0, bot.entity.eyeHeight ?? 1.62, 0)))) {
+    await ctx.retreatFrom(threat);
+  }
   check();
   if (waterLike(bot.blockAt(bot.entity.position.offset(0, bot.entity.eyeHeight ?? 1.62, 0)))) {
     if (typeof ctx.swimToShore !== 'function' || !await ctx.swimToShore('换矿区前恢复呼吸', 25000, 8)) fail('换矿区前尚未恢复呼吸');

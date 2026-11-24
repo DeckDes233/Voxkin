@@ -464,6 +464,25 @@ test('combat search stops when hostiles appear after a waypoint without continui
   assert.deepEqual([...bot.pathfinder.movements.blocksToAvoid], [99]);
 });
 
+test('缺粮时步行寻找附近的猎物，拾取后恢复寻路设置', async () => {
+  const {ctx, inventory, walked} = makeAnimalSearchContext({targetAtStep: 1});
+  ctx.bot.food = 7;
+  const movements = ctx.bot.pathfinder.movements;
+  Object.assign(movements, {allowSprinting: true, allowParkour: true, canDig: true});
+  ctx.onWalk = () => {
+    assert.equal(movements.allowSprinting, false);
+    assert.equal(movements.allowParkour, false);
+    assert.equal(movements.canDig, false);
+    return 'reached';
+  };
+  await assert.rejects(skills.hunt_animal.handler({count: 1}, ctx), /饥饿值/);
+  const result = await skills.hunt_animal.handler({count: 1, walk_only: true}, ctx);
+  assert.equal(result.status, 'succeeded');
+  assert.ok(inventory.porkchop >= 1);
+  assert.equal(walked.length, 1);
+  assert.ok(movements.allowSprinting && movements.allowParkour && movements.canDig);
+});
+
 test('hunt_animal exits after route cancellation even if an animal appears at the waypoint', async () => {
   const { ctx, walked } = makeAnimalSearchContext({ targetAtStep: 1 });
   let approaches = 0;

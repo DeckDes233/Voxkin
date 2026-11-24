@@ -3,6 +3,22 @@ import assert from 'node:assert/strict';
 import { Vec3 } from 'vec3';
 import { dryMiningFooting, miningSiteCandidates, miningRouteExclusion, skills } from '../skills/exploration.js';
 
+test('换区前脱离逼近的敌人，并从原起点核对实际位移', async () => {
+  const ctx = context();
+  const threat = {name: 'zombie'};
+  let hostile = true;
+  ctx.findHostile = () => hostile ? threat : null;
+  ctx.nearbyHostiles = () => hostile ? [threat] : [];
+  ctx.retreatFrom = async target => {
+    assert.equal(target, threat);
+    hostile = false;
+    ctx.bot.entity.position = new Vec3(2, 64, 0);
+  };
+  const result = await skills.explore_mining_site.handler({min_distance: 16}, ctx);
+  assert.equal(result.status, 'succeeded');
+  assert.equal(result.data.relocation.origin.x, 0.5);
+});
+
 function context() {
   const ctx = {
     bot: {

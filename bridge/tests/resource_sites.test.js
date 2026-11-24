@@ -41,6 +41,7 @@ test('resource sites require village evidence for chests and beds, protect shelt
   let result = inspectResourceSites(bot);
   assert.equal(result.chests.length, 0);
   assert.equal(result.beds.length, 0);
+  assert.ok(result.sleep_bed);
   assert.equal(result.hay.length, 1);
   bot.entities = { 4: { name: 'villager', position: new Vec3(20, 64, 0) } };
   result = inspectResourceSites(bot, { position: new Vec3(0, 63, 0) });

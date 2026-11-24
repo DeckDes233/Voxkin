@@ -2,8 +2,20 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Vec3 } from 'vec3';
 
-import { skills } from '../skills/gather.js';
+import { skills, surfaceWoodRoute } from '../skills/gather.js';
 import { scanSurfaceLogs } from '../surface_wood_scan.js';
+
+test('远处补木绕过水湾并选择与角色陆地连通的树', async () => {
+  const bot = {entity: {position: new Vec3(0, 64, 0)}, blockAt(p) {
+    if (p.y !== 63) return {name: 'air', boundingBox: 'empty', skyLight: 15};
+    const water = p.x < -8 && p.x > -26 || p.x >= 12 && p.x <= 18 && p.z < 16;
+    return water ? {name: 'water', boundingBox: 'empty'} : {name: 'grass_block', boundingBox: 'block'};
+  }};
+  const far = new Vec3(42, 64, 0);
+  const route = await surfaceWoodRoute({bot}, [new Vec3(-34, 64, 0), far]);
+  assert.deepEqual(route.target, far);
+  assert.ok(route.path.some(p => p.z >= 16));
+});
 
 function makeContext({ position = { x: 0, y: 10, z: 0 }, health = 20, blocks = new Map() } = {}) {
   const inventory = {};
@@ -146,6 +158,21 @@ test('iron search accepts deepslate iron even above zero and counts raw iron', a
   assert.equal((await skills.mine_collect.handler({ block: 'iron_ore', count: 1 }, ctx)).status, 'succeeded');
 });
 
+test('脚底五格以上的近处树干可从眼高触及，不为采木寻找悬空站位', async () => {
+  const ctx = makeContext({position: {x: 0.5, y: 65, z: 0.5}});
+  const position = new Vec3(0, 70, 0);
+  ctx.registry.blocksByName.oak_log = {id: 20, name: 'oak_log', drops: [40]};
+  ctx.registry.items[40] = {id: 40, name: 'oak_log'};
+  ctx.blocks.set('0,70,0', {name: 'oak_log', position, boundingBox: 'block'});
+  ctx.bot.findBlocks = () => [position];
+  ctx.bot.canSeeBlock = () => true;
+  ctx.travelToBlock = async () => assert.fail('已经够到树干，不需要寻路');
+  ctx.collectDrops = async () => { ctx.inventory.oak_log = 1; };
+  const result = await skills.mine_collect.handler({block: 'wood_log', count: 1, surface_wood: true}, ctx);
+  assert.equal(result.status, 'succeeded');
+  assert.deepEqual(ctx.digs, [{x: 0, y: 70, z: 0}]);
+});
+
 test('地表补木先过滤深层和无天空光的原木，同一不可达树干只走一次', async () => {
   const ctx = makeContext({ position: { x: 0, y: 68, z: 0 } });
   ctx.registry.blocksByName.oak_log = { id: 20, name: 'oak_log', drops: [40] };
@@ -221,6 +248,59 @@ test('mining does not destroy ore when held tool cannot harvest its drop', async
   ctx.blocks.set('0,10,0', { name: 'iron_ore', position: new Vec3(0, 10, 0), boundingBox: 'block', canHarvest: () => false });
   ctx.bot.findBlocks = () => [new Vec3(0, 10, 0)];
   await assert.rejects(skills.mine_collect.handler({ block: 'iron_ore', count: 1 }, ctx), /工具不能采得/);
+  assert.equal(ctx.digs.length, 0);
+});
+
+test('上行台阶逐层验证站位，头顶有沙砾时不挖', async () => {
+  const ctx = makeContext();
+  const result = await skills.strip_mine.handler({rise: 3, direction: 'east'}, ctx);
+  assert.equal(result.status, 'succeeded');
+  assert.deepEqual(ctx.bot.entity.position, new Vec3(3, 13, 0));
+  const detour = makeContext();
+  detour.blocks.set('0,13,0', {name: 'gravel', position: new Vec3(0, 13, 0), boundingBox: 'block'});
+  assert.equal((await skills.strip_mine.handler({rise: 1, direction: 'east'}, detour)).status, 'succeeded');
+  assert.deepEqual(detour.bot.entity.position, new Vec3(2, 11, 0));
+  assert.ok(!detour.digs.some(p => p.x === 0 && p.y === 12 && p.z === 0));
+  const blocked = makeContext();
+  blocked.blocks.set('0,13,0', {name: 'gravel', position: new Vec3(0, 13, 0), boundingBox: 'block'});
+  for (const [x, z] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    blocked.blocks.set(`${x},9,${z}`, {name: 'air', position: new Vec3(x, 9, z), boundingBox: 'empty'});
+  }
+  await assert.rejects(skills.strip_mine.handler({rise: 1, direction: 'east'}, blocked), /未找到有支撑/);
+  assert.equal(blocked.digs.length, 0);
+});
+
+test('采矿不挖悬空的脚下支撑，结束后还原寻路落差设置', async () => {
+  const ctx = makeContext();
+  const ore = new Vec3(0, 9, 0);
+  ctx.blocks.set('0,9,0', {name: 'iron_ore', position: ore, boundingBox: 'block'});
+  ctx.blocks.set('0,8,0', {name: 'cave_air', position: ore.offset(0,-1,0), boundingBox: 'empty'});
+  const movements = {maxDropDown: 4, infiniteLiquidDropdownDistance: true, allowParkour: true};
+  ctx.bot.pathfinder = {movements};
+  ctx.bot.findBlocks = () => {
+    assert.equal(movements.maxDropDown, 2);
+    assert.equal(movements.infiniteLiquidDropdownDistance, false);
+    assert.equal(movements.allowParkour, false);
+    return [ore];
+  };
+  await assert.rejects(skills.mine_collect.handler({block: 'iron_ore', count: 1}, ctx), /脚下支撑/);
+  assert.deepEqual(ctx.digs, []);
+  assert.equal(movements.maxDropDown, 4);
+  assert.equal(movements.infiniteLiquidDropdownDistance, true);
+  assert.equal(movements.allowParkour, true);
+});
+
+test('铁镐损坏后保留已采钻石，直接返回补镐而不再走向远矿', async () => {
+  const ctx = makeContext();
+  ctx.inventory.diamond = 2;
+  const near = new Vec3(1, 10, 0), far = new Vec3(12, 10, 0);
+  for (const position of [near, far]) {
+    ctx.blocks.set(`${position.x},10,0`, {name: 'deepslate_diamond_ore', position, canHarvest: () => false});
+  }
+  ctx.bot.findBlocks = () => [near, far];
+  ctx.travelToBlock = async () => assert.fail('缺少采钻石工具时不应前往另一处矿点');
+  await assert.rejects(skills.mine_collect.handler({block: 'diamond_ore', count: 3}, ctx), /工具不能采得/);
+  assert.equal(ctx.countItem('diamond'), 2);
   assert.equal(ctx.digs.length, 0);
 });
 

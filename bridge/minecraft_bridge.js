@@ -1,5 +1,5 @@
 import { escapeWater, reachShore, waterLike, breathable, avoidWaterScaffolding, allowedDuringWaterEscape } from './water_escape.js';
-import { dryMiningFooting, leaveMagmaBlock, netherRouteExclusion } from './dry_footing.js';
+import { besideDrop, dryMiningFooting, leaveMagmaBlock, miningRouteExclusion, netherRouteExclusion } from './dry_footing.js';
 import { crystalAimPoint } from './skills/combat.js';
 import { FUEL_BURN, selectFuel } from './fuel.js';
 // 沃心 Minecraft 桥接进程：mineflayer 负责游戏内身份，WebSocket 负责与 Voxkin Core 通信。
@@ -624,7 +624,7 @@ function buildSkillContext(runSkill, token = null, actionMessage = null) {
     findRangedWeapon,
     aimPoint,
     shootAt,
-    evadePerchedDragon: dragon => evadeDragonHazard(dragon, token, () => dragon.isValid !== false
+    evadeDragon: dragon => evadeDragonHazard(dragon, token, () => dragon.isValid !== false
       && bot.entity.position.distanceTo(dragon.position) < 16),
     nearbyPlayers,
     nearbyHostiles,
@@ -1818,10 +1818,12 @@ async function craftItem(args, token = executor.active?.token) {
   const { recipe, requiresTable } = picked;
   const operations = pickRecipe([recipe], count).operations;
   if (requiresTable) {
-    // 先找已经放下的工作台；空闲闲逛会把 bot 带离上一轮放下的工作台。
-    table = nearbyBlock('crafting_table', 32);
+    // 矿井里携带工作台时就地合成，避免穿过岩层回到地表的旧工作台。
+    const carried = countItem('crafting_table') > 0;
+    table = nearbyBlock('crafting_table', carried ? 3 : 32);
+    if (carried && table && !bot.canSeeBlock(table)) table = null;
     if (!table) {
-      if (countItem('crafting_table') === 0) {
+      if (!carried) {
         throw new Error('附近 32 格内没有工作台，背包里也没有');
       }
       table = await placeCraftingTable();
@@ -2402,7 +2404,7 @@ function sleepAdvancedTime(beforeTime, beforeDay) {
   return timeAdvanced(beforeTime, beforeDay, bot);
 }
 
-async function sleepInBed() {
+async function sleepInBed(range = 16) {
   const dimension = String(bot.game.dimension || '').toLowerCase();
   if (dimension.includes('nether')) {
     throw new Error('这里是下界，不能正常睡觉，床会爆炸');
@@ -2412,8 +2414,8 @@ async function sleepInBed() {
   if (!isSleepTime() && !isThunderstorm()) {
     throw new Error(`现在是 ${clockLabel(bot.time.timeOfDay)}，不是夜晚也没有雷暴，不能睡觉`);
   }
-  const bed = findNearbyBed(16);
-  if (!bed) throw new Error('附近 16 格内没有床，先放一张床再睡');
+  const bed = findNearbyBed(range);
+  if (!bed) throw new Error(`附近 ${range} 格内没有床，先放一张床再睡`);
   const bedPosition = `(${bed.position.x}, ${bed.position.y}, ${bed.position.z})`;
   const hostile = findHostile(8);
   if (hostile) {
@@ -2491,7 +2493,19 @@ async function retreatFrom(target) {
   const destination = chooseRetreatDestination(origin, threats, { stepDistance: 12 });
   const safetyBefore = retreatSafetyScore(origin, threats);
   let movedAway = false;
+  const movements = bot.pathfinder.movements;
+  const nether = ['the_nether', 'minecraft:the_nether'].includes(bot.game.dimension);
+  const coast = ['overworld', 'minecraft:overworld'].includes(bot.game.dimension) && ['drowned', 'creeper'].includes(target.name);
+  const previous = (nether || coast) && movements && { allowParkour: movements.allowParkour, canDig: movements.canDig,
+    infiniteLiquidDropdownDistance: movements.infiniteLiquidDropdownDistance,
+    maxDropDown: movements.maxDropDown, exclusionAreasStep: movements.exclusionAreasStep };
   try {
+    if (previous) {
+      const stayDry = coast && dryMiningFooting(bot, position);
+      Object.assign(movements, {allowParkour: false, canDig: false, maxDropDown: 1, infiniteLiquidDropdownDistance: false,
+        exclusionAreasStep: [...previous.exclusionAreasStep, block =>
+          !block?.position || besideDrop(bot, block.position) ? 1000 : stayDry ? miningRouteExclusion(bot, block) : 0]});
+    }
     const trailed = await retreatAlongTrail({
       trail: retreatTrail.snapshot(bot.game?.dimension),
       currentPosition: () => bot?.entity?.position,
@@ -2518,7 +2532,29 @@ async function retreatFrom(target) {
       return true;
     }
     if (!destination || executor.active?.token?.cancelled) return false;
-    await gotoWithTimeout(bot.pathfinder, new goals.GoalXZ(destination.x, destination.z), 4000, '后撤超时');
+    let goal = new goals.GoalXZ(destination.x, destination.z);
+    if (coast) {
+      const heading = Math.atan2(destination.z - position.z, destination.x - position.x);
+      const candidates = [];
+      for (const distance of [10, 5]) for (const angle of [0, -Math.PI/4, Math.PI/4, -Math.PI/2, Math.PI/2]) {
+        const column = position.floored().offset(Math.round(distance * Math.cos(heading + angle)), 0,
+                                                 Math.round(distance * Math.sin(heading + angle)));
+        const stand = [0, 1, -1, 2, -2, 3].map(dy => column.offset(0, dy, 0)).find(p =>
+          dryMiningFooting(bot, p) && !besideDrop(bot, p));
+        if (stand && retreatSafetyScore(stand, threats) > safetyBefore) candidates.push(stand);
+      }
+      candidates.sort((a, b) => retreatSafetyScore(b, threats) - retreatSafetyScore(a, threats));
+      if (!candidates.length) return false;
+      const safe = candidates[0];
+      goal = new goals.GoalBlock(safe.x, safe.y, safe.z);
+    } else if (nether) {
+      const column = vec(Math.floor(destination.x), Math.floor(position.y), Math.floor(destination.z));
+      const safe = [0, 1, -1, 2, -2].map(dy => column.offset(0, dy, 0)).find(p =>
+        dryMiningFooting(bot, p) && !netherRouteExclusion(bot, {position: p}) && !besideDrop(bot, p));
+      if (!safe) return false;
+      goal = new goals.GoalBlock(safe.x, safe.y, safe.z);
+    }
+    await gotoWithTimeout(bot.pathfinder, goal, 4000, '后撤超时');
     const current = bot.entity.position;
     const actuallyMoved = current.distanceTo(origin) > 0.5;
     const safetyAfter = retreatSafetyScore(current, threats);
@@ -2532,6 +2568,7 @@ async function retreatFrom(target) {
   } finally {
     // stop() 单独调用会把 stopPathing 留给下一个 setGoal/resetPath；同步清目标，避免下一条 goto 被 path_stop 打断。
     if (!interrupted) stopPathfinding();
+    if (previous) Object.assign(movements, previous);
     retreatActive = false;
   }
   return movedAway;
@@ -2961,7 +2998,7 @@ async function runLocalSafety(event, data, token) {
     ? source
     : findHostile(event === 'hostile_nearby' ? 12 : 8);
   if (hostile) {
-    if (bot.health <= 8 || hostile.name === 'creeper') {
+    if (bot.health <= 8 || ['creeper', 'drowned'].includes(hostile.name) || hostile.name === 'magma_cube' && event === 'hostile_nearby') {
       await retreatFrom(hostile);
       if (bot.health <= 10 && findFood()) await eatIfPossible();
     } else {

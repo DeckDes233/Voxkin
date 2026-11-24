@@ -10,6 +10,7 @@
 
 import { findBlocksWithExploration, resourceCandidates } from '../resource_search.js';
 import { dryMiningFooting, miningRouteExclusion } from '../dry_footing.js';
+import { waterLike } from '../water_escape.js';
 import { scanSurfaceLogs } from '../surface_wood_scan.js';
 import { setImmediate as yieldToGame } from 'node:timers/promises';
 
@@ -1176,7 +1177,41 @@ function surfaceFooting(bot, column) {
   return null;
 }
 
-async function selectSurfaceTrunk(ctx, positions) {
+// 为远处的树找连通的干地。每六格取一个落脚点，并检查中间列，实际走步仍由寻路器验收。
+export async function surfaceWoodRoute(ctx, trunks) {
+  const bot = ctx.bot;
+  const start = bot.entity.position.floored();
+  if (!trunks.length || trunks.some(p => start.distanceTo(p) <= 24)) return null;
+  const queue = [{point: start, parent: null}];
+  const visited = new Set([`${start.x},${start.z}`]);
+  for (let i = 0; i < queue.length && i < 1800; i++) {
+    if (i % 16 === 0) {
+      await yieldToGame();
+      checkInterrupted(ctx);
+    }
+    const node = queue[i];
+    const target = trunks.find(p => node.point.distanceTo(p) <= 7);
+    if (target) {
+      const path = [];
+      for (let n = node; n.parent; n = n.parent) path.push(n.point);
+      return { target, path: path.reverse() };
+    }
+    for (const {x, z} of CARDINAL_HEADINGS) {
+      const end = node.point.offset(x * 6, 0, z * 6);
+      const key = `${end.x},${end.z}`;
+      if (visited.has(key) || Math.hypot(end.x - start.x, end.z - start.z) > 140) continue;
+      const middle = surfaceFooting(bot, node.point.offset(x * 3, 0, z * 3));
+      if (!middle || Math.abs(middle.y - node.point.y) > 3) continue;
+      const next = surfaceFooting(bot, middle.offset(x * 3, 0, z * 3));
+      if (!next || Math.abs(next.y - middle.y) > 3) continue;
+      visited.add(key);
+      queue.push({ point: next, parent: node });
+    }
+  }
+  return null;
+}
+
+async function selectSurfaceTrunk(ctx, positions, paths) {
   const bot = ctx.bot;
   const base = bot.entity.position.floored();
   const trunks = new Map();
@@ -1184,6 +1219,11 @@ async function selectSurfaceTrunk(ctx, positions) {
   for (const p of positions) {
     const key = `${p.x},${p.z}`;
     if (!trunks.has(key) || trunks.get(key).y > p.y) trunks.set(key, p);
+  }
+  const route = await surfaceWoodRoute(ctx, [...trunks.values()]);
+  if (route) {
+    paths.set(route.target, route.path);
+    return route.target;
   }
   let best;
   let bestCost = Infinity;
@@ -1207,6 +1247,16 @@ async function selectSurfaceTrunk(ctx, positions) {
     }
   }
   return best;
+}
+
+function woodReach(bot, position) {
+  const eye = bot.entity.position.offset(0, bot.entity.eyeHeight ?? 1.62, 0);
+  return eye.distanceTo(position.offset(0.5, 0.5, 0.5));
+}
+
+function reachableWood(bot, position) {
+  const block = bot.blockAt(position);
+  return block && woodReach(bot, position) <= MINE_REACH && (!bot.canSeeBlock || bot.canSeeBlock(block));
 }
 
 async function walkToSurfaceLog(target, ctx) {
@@ -1237,27 +1287,45 @@ async function walkToSurfaceLog(target, ctx) {
   checkInterrupted(ctx);
   checkHealth(ctx);
   checkNearbyHostiles(ctx);
-  return ctx.travelToBlock(target, 30000);
+  if (reachableWood(bot, target)) return 'reached';
+  const outcome = await ctx.travelToBlock(target, 30000);
+  if (outcome === 'unreachable' && reachableWood(bot, target)) return 'reached';
+  return outcome;
 }
 
-async function approachSurfaceLog(target, ctx) {
+async function approachSurfaceLog(target, ctx, path) {
   ctx.reportProgress?.('searching', '前往地表原木', 0, { surface_trunk: { x: target.x, y: target.y, z: target.z } });
-  return withDryMiningMovement(ctx, () => walkToSurfaceLog(target, ctx));
+  return withDryMiningMovement(ctx, async () => {
+    for (const point of path || []) {
+      checkInterrupted(ctx);
+      checkHealth(ctx);
+      checkNearbyHostiles(ctx);
+      const outcome = await ctx.walkOnce(point.x, point.y, point.z, 1, 12000);
+      if (outcome !== 'reached') return outcome;
+    }
+    return walkToSurfaceLog(target, ctx);
+  }, { surfaceOnly: true });
 }
 
-async function withDryMiningMovement(ctx, action) {
+async function withDryMiningMovement(ctx, action, { surfaceOnly = false } = {}) {
   const movements = ctx.bot.pathfinder?.movements;
   if (!movements) return action();
   const previous = {
+    canDig: movements.canDig,
     exclusionAreasStep: movements.exclusionAreasStep,
     allow1by1towers: movements.allow1by1towers,
     allowParkour: movements.allowParkour,
+    maxDropDown: movements.maxDropDown,
+    infiniteLiquidDropdownDistance: movements.infiniteLiquidDropdownDistance,
   };
   const pathfinder = ctx.bot.pathfinder;
   const tickTimeout = pathfinder.tickTimeout;
   if (Number.isFinite(tickTimeout)) pathfinder.tickTimeout = Math.min(tickTimeout, 10);
   movements.allow1by1towers = false;
   movements.allowParkour = false;
+  movements.maxDropDown = Math.min(previous.maxDropDown ?? 2, 2);
+  movements.infiniteLiquidDropdownDistance = false;
+  if (surfaceOnly) movements.canDig = false;
   movements.exclusionAreasStep = [...(previous.exclusionAreasStep || []), block => miningRouteExclusion(ctx.bot, block)];
   try {
     return await action();
@@ -1314,6 +1382,7 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
   const surfaceWood = blockName === 'wood_log' && args.surface_wood === true;
   const startY = bot.entity.position.y;
   const failedTrunks = new Set();
+  const surfacePaths = new WeakMap();
   // 只在地表补木时筛选；在区块扫描阶段就排除深处构件，避免它们占满最近候选。
   const surfaceLog = (position) => position.y >= startY - 16 && position.y <= startY + 32 &&
     !failedTrunks.has(`${position.x},${position.z}`) &&
@@ -1327,7 +1396,7 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
       : bot.findBlocks({ matching: ids, maxDistance: nearby ? Math.ceil(MINE_REACH) : range, count,
         ...(surfaceWood ? { useExtraInfo: block => surfaceLog(block.position) } : {}) });
     const positions = matches
-      .filter(p => !nearby || distanceBetween(bot.entity.position, p) <= MINE_REACH)
+      .filter(p => !nearby || (surfaceWood ? woodReach(bot, p) : distanceBetween(bot.entity.position, p)) <= MINE_REACH)
       .filter(p => !avoided.some(danger => Math.hypot(p.x - danger.x, p.z - danger.z) < 8));
     if (blockName.endsWith('_log') || blockName.endsWith('_stem')) {
       const origin = bot.entity.position;
@@ -1336,7 +1405,11 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
     return positions;
   };
   const chooseCandidate = (positions) => {
-    if (surfaceWood && !lastMinedPosition) return selectSurfaceTrunk(ctx, positions);
+    if (surfaceWood) {
+      const visible = positions.find(p => reachableWood(bot, p));
+      if (visible) return visible;
+    }
+    if (surfaceWood && !lastMinedPosition) return selectSurfaceTrunk(ctx, positions, surfacePaths);
     const origin = lastMinedPosition || bot.entity.position;
     return positions.sort((a, b) => {
       const aAdjacent = lastMinedPosition && Math.abs(a.x - lastMinedPosition.x) + Math.abs(a.y - lastMinedPosition.y) + Math.abs(a.z - lastMinedPosition.z) === 1;
@@ -1345,7 +1418,8 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
       return distanceBetween(origin, a) - distanceBetween(origin, b);
     })[0];
   };
-  for await (const position of resourceCandidates(ctx, ids, range, Math.max(need * 4, 8), scan, chooseCandidate, () => knownBlocksOnly || withinReach())) {
+  // 地表补木由阶段规划扩大搜索半径并核对换区。空扫描时保留原点，让下一轮复用已加载地形。
+  for await (const position of resourceCandidates(ctx, ids, range, Math.max(need * 4, 8), scan, chooseCandidate, () => knownBlocksOnly || surfaceWood || withinReach())) {
     if (countOwned() - owned >= need) break;
     requireConnected(ctx);
     checkHealth(ctx);
@@ -1374,10 +1448,10 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
         continue;
       }
     }
-    const distance = distanceBetween(bot.entity.position, position);
+    const distance = surfaceWood ? woodReach(bot, position) : distanceBetween(bot.entity.position, position);
     if (distance > MINE_REACH) {
       if (withinReach()) continue;
-      const outcome = surfaceWood ? await approachSurfaceLog(position, ctx) : await ctx.travelToBlock(position, 30000);
+      const outcome = surfaceWood ? await approachSurfaceLog(position, ctx, surfacePaths.get(position)) : await ctx.travelToBlock(position, 30000);
       checkInterrupted(ctx);
       if (outcome === 'cancelled' || outcome === 'stopped') throw new Error('采集被取消：收到新的指令或连接断开');
       if (outcome === 'low_health') throw new Error(`血量不足，撤退中止采集（血量 ${bot.health}）`);
@@ -1389,10 +1463,19 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
     }
     checkHealth(ctx);
     checkNearbyHostiles(ctx);
+    const feet = floorPos(bot.entity.position);
+    if (feet.x === position.x && feet.z === position.z && feet.y - 1 === position.y) {
+      const below = blockAtPos(bot, offsetPos(position, 0, -1, 0));
+      if (!below || below.boundingBox !== 'block' || isHazardBlock(below)) {
+        failures.push(`${formatPosition(position)} 是脚下支撑，下面没有安全落脚点`);
+        continue;
+      }
+    }
     const dug = await digAt(ctx, position, { expectName: block.name });
     checkInterrupted(ctx);
     if (!dug.ok) {
       failures.push(`${formatPosition(position)} ${dug.message}`);
+      if (dug.reason === 'tool' && isDiamondOre(block.name)) break;
       continue;
     }
     mined += 1;
@@ -1439,9 +1522,77 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
 
 // 挖一条主巷道加若干分支。头顶 2 格与前方 1 格必须通得过，
 // 沿途放火把，遇到岩浆或水立刻停下并上报坐标。
+function safeStairOpening(bot, position) {
+  const above = offsetPos(position, 0, 1, 0);
+  const upper = blockAtPos(bot, above);
+  if (!upper || /(?:sand|gravel|anvil|concrete_powder)$/.test(upper.name)) return false;
+  const adjacent = CARDINAL_HEADINGS.map(h => offsetPos(position, h.x, 0, h.z));
+  return [position, above, ...adjacent].every(at => {
+    const block = blockAtPos(bot, at);
+    return block && !isHazardBlock(block) && !waterLike(block);
+  });
+}
+
+async function climbMiningStairs(ctx, count, preferred) {
+  const bot = ctx.bot;
+  const headings = [preferred, ...CARDINAL_HEADINGS.filter(h => h.name !== preferred.name)];
+  const visited = new Set();
+  let climbed = 0;
+  let lateral = 0;
+  while (climbed < count) {
+    requireConnected(ctx);
+    checkInterrupted(ctx);
+    checkHealth(ctx);
+    checkNearbyHostiles(ctx);
+    const feet = floorPos(bot.entity.position);
+    visited.add(formatPosition(feet));
+    let moved = false;
+    const candidates = headings.map(heading => ({heading, rise: 1}));
+    // 沙砾覆盖上方时，保留顶板，从同一高度绕出；限制横向开挖总量。
+    if (lateral < 8) candidates.push(...headings.map(heading => ({heading, rise: 0})));
+    for (const {heading, rise} of candidates) {
+      const landing = offsetPos(feet, heading.x, rise, heading.z);
+      if (visited.has(formatPosition(landing))) continue;
+      const support = blockAtPos(bot, offsetPos(landing, 0, -1, 0));
+      if (!support || support.boundingBox !== 'block' || isHazardBlock(support) || waterLike(support)) continue;
+      const opening = [offsetPos(landing, 0, 1, 0), landing];
+      if (rise) opening.unshift(offsetPos(feet, 0, 2, 0));
+      // 只挖有支撑的上行台阶。不能从头顶放出沙砾、水或岩浆。
+      if (!opening.every(p => safeStairOpening(bot, p))) continue;
+      for (const cell of opening) {
+        checkInterrupted(ctx);
+        if (!safeStairOpening(bot, cell)) throw new Error('上行开口旁的方块或流体发生变化');
+        if (isPassableBlock(blockAtPos(bot, cell))) continue;
+        const dug = await digAt(ctx, cell);
+        if (!dug.ok) break;
+      }
+      if (!opening.every(p => isPassableBlock(blockAtPos(bot, p)))) continue;
+      const outcome = await stepForward(ctx, landing);
+      const actual = floorPos(bot.entity.position);
+      if (actual.x === landing.x && actual.y === landing.y && actual.z === landing.z) {
+        if (!dryMiningFooting(bot, bot.entity.position)) throw new Error('上行后无法确认落点仍是干地');
+        if (rise) climbed++;
+        else lateral++;
+        moved = true;
+        break;
+      }
+      if (outcome === 'stopped' || actual.x !== feet.x || actual.z !== feet.z || actual.y !== feet.y) {
+        throw new Error('上行中位置变化，停止开挖并重新观察');
+      }
+    }
+    if (!moved) throw new Error(`从 ${formatPosition(feet)} 未找到有支撑的安全上行台阶（已横移 ${lateral} 格）`);
+  }
+  return {status: 'succeeded', detail: `沿干燥台阶实际上升 ${count} 层，现在 Y=${floorPos(bot.entity.position).y}`};
+}
+
 async function stripMine(args, ctx) {
   const bot = ctx.bot;
   requireConnected(ctx);
+  const rise = clampInt(args.rise, 0, 0, 8);
+  if (rise > 0) {
+    const heading = directionFromName(args.direction) || directionFromYaw(bot.entity.yaw) || CARDINAL_HEADINGS[0];
+    return withDryMiningMovement(ctx, () => climbMiningStairs(ctx, rise, heading), {surfaceOnly: true});
+  }
   const length = clampInt(args.length, 32, 1, 128);
   const branchCount = clampInt(args.branches, 2, 0, 8);
   const branchLength = clampInt(args.branchLength, 8, 1, 32);
@@ -1889,7 +2040,9 @@ export const skills = {
         items: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } }, required: ['x', 'y', 'z'], additionalProperties: false } },
       { name: 'range', type: 'number', required: false, default: 32, description: '搜索已加载方块的半径，8-64 格；wood_log 可扩大到 128 格。' },
     ],
-    handler: mineCollect,
+    handler: (args, ctx) => String(args.block || '').endsWith('_ore')
+      ? withDryMiningMovement(ctx, () => mineCollect(args, ctx))
+      : mineCollect(args, ctx),
   },
   strip_mine: {
     description:
@@ -1899,6 +2052,7 @@ export const skills = {
       { name: 'branches', type: 'number', required: false, default: 2, description: '支巷数量。' },
       { name: 'branchLength', type: 'number', required: false, default: 8, description: '每条支巷的长度（格）。' },
       { name: 'shaft', type: 'number', required: false, default: 0, description: '开始前先挖多深的垂直竖井。' },
+      { name: 'rise', type: 'number', required: false, default: 0, description: '只沿有支撑的干地向上开挖台阶，最多 8 层。' },
       { name: 'y', type: 'number', required: false, default: null, description: '目标 Y 高度，缺省就在当前高度挖。' },
       { name: 'direction', type: 'string', required: false, default: null, description: '主巷道方向：north / south / east / west，缺省按当前朝向。' },
       { name: 'torchInterval', type: 'number', required: false, default: 8, description: '每多少格放一个火把，0 表示不放。' },

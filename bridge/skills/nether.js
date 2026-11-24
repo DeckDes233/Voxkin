@@ -462,13 +462,16 @@ async function placeObsidianFrame(ctx, frame) {
       placed += 1;
       continue;
     }
-    if (target === frame.top[1]) {
-      const corner = frame.top[0];
+    // 两根侧柱和顶梁的第一块都需要相邻的支撑面；底梁与侧柱只在对角相接。
+    const corner = target === frame.sides[0] ? frame.bottom[0]
+      : target === frame.sides[1] ? frame.bottom.at(-1)
+      : target === frame.top[1] ? frame.top[0] : null;
+    if (corner) {
       const support = blockAt(ctx, corner.x, corner.y, corner.z);
       if (support?.boundingBox !== 'block') {
         const material = ['cobblestone', 'cobbled_deepslate', 'dirt', 'netherrack', 'granite', 'andesite', 'diorite', 'stone']
           .find(name => ctx.countItem(name) > 0);
-        if (!material) throw new Error('顶梁需要一个垫角方块');
+        if (!material) throw new Error('下界门需要一个垫角方块');
         await ctx.placeBlock({ block: material, ...corner });
       }
     }
@@ -533,9 +536,10 @@ async function makeNetherPortal(args, ctx) {
   }
 
   const wantSecond = Boolean(args.second);
-  const need = PORTAL_FRAME_OBSIDIAN * (wantSecond ? 2 : 1);
+  const saved = args.resume_site;
   const have = ctx.countItem('obsidian');
-  if (have < need) {
+  let need = PORTAL_FRAME_OBSIDIAN * (wantSecond ? 2 : 1);
+  if (!saved && have < need) {
     throw new Error(`还差 ${need - have} 个黑曜石，造下界门需要 ${need} 个`);
   }
   if (ctx.countItem('flint_and_steel') <= 0) {
@@ -552,9 +556,32 @@ async function makeNetherPortal(args, ctx) {
         ? 'z'
         : 'x';
 
-  const site = choosePortalSite(ctx, axis, 2);
-  const cleared = await clearPortalSpace(ctx, site.frame);
-  const placed = await placeObsidianFrame(ctx, site.frame);
+  let site;
+  if (saved) {
+    const origin = saved.origin;
+    if (wantSecond || saved.dimension !== OVERWORLD_DIMENSION || !['x', 'z'].includes(saved.axis)
+        || !origin || !['x','y','z'].every(a => Number.isSafeInteger(origin[a]))
+        || botOf(ctx).entity.position.distanceTo(makeVec(ctx, origin.x, origin.y, origin.z)) > 16) {
+      throw new Error('无法在当前位置核对已记录的下界门址');
+    }
+    site = {origin, axis: saved.axis, frame: portalFrame(origin, saved.axis)};
+  } else {
+    site = choosePortalSite(ctx, axis, 2);
+  }
+  const frameBlocks = site.frame.frame.map(p => blockAt(ctx, p.x, p.y, p.z));
+  if (frameBlocks.some(b => !b) || !frameGroundOk(ctx, site.frame)) throw new Error('门址的方块或地基无法确认');
+  if (saved) {
+    need = frameBlocks.filter(b => b.name !== 'obsidian').length;
+    if (have < need) throw new Error(`旧门框还需 ${need} 块黑曜石，背包只有 ${have} 块`);
+  }
+  if (!wantSecond) {
+    ctx.reportProgress?.('portal_site', '已确认下界门址', 0, {
+      portal_site: {dimension, origin: site.origin, axis: site.axis},
+    });
+  }
+  const alreadyLit = portalLit(ctx, site.frame);
+  const cleared = alreadyLit ? 0 : await clearPortalSpace(ctx, site.frame);
+  const placed = alreadyLit ? PORTAL_FRAME_OBSIDIAN : await placeObsidianFrame(ctx, site.frame);
 
   if (!portalLit(ctx, site.frame)) {
     const lit = await lightPortal(ctx, site.frame);
@@ -1012,6 +1039,7 @@ function fortressEvidenceData(dimension, evidence, route = null) {
       attempted_waypoints: route.attemptedWaypoints,
       dimension: route.dimension,
       ...(route.confirmed?.length ? { visited: route.confirmed.slice(-24) } : {}),
+      ...(route.walkMisses?.length ? { walk_misses: route.walkMisses.slice(-16) } : {}),
     };
   }
   return data;
@@ -1088,6 +1116,8 @@ function nextSurveyPoint(ctx, route) {
       for (const dy of [0,1,-1,2,-2,3,-3,4,-4,5,-5,6,-6,8,-8,10,-10,12,-12]) {
         const stand = p.offset(0, dy, 0);
         if (!dryMiningFooting(bot, stand) || netherRouteExclusion(bot, {position: stand}) || besideDrop(bot, stand)) continue;
+        if (route.walkMisses.some(m => Math.hypot(here.x - m.from.x, here.y - m.from.y, here.z - m.from.z) <= 4
+            && Math.hypot(stand.x - m.to.x, stand.y - m.to.y, stand.z - m.to.z) <= 2)) continue;
         const clearance = Math.min(...route.surveyed.map(v => Math.hypot(v.x - stand.x, v.z - stand.z)));
         if (clearance >= 4) candidates.push({stand, clearance});
         break;
@@ -1138,7 +1168,11 @@ async function fallbackStep(ctx, route) {
   try {
     if (route.surveyed) {
       route.surveyed.push({x: target.x, z: target.z});
-      if (await ctx.walkOnce(target.x, target.y, target.z, 0, 12000) !== 'reached') {
+      const departure = botOf(ctx).entity.position.floored();
+      const outcome = await ctx.walkOnce(target.x, target.y, target.z, 0, 12000);
+      throwIfInterrupted(ctx, '探索下界堡垒');
+      if (outcome !== 'reached') {
+        if (outcome === 'unreachable') route.walkMisses.push({from: departure, to: {x: target.x, y: target.y, z: target.z}});
         route.walkFailures++;
         return false;
       }
@@ -1230,6 +1264,9 @@ async function searchFortress(args, ctx) {
     route.surveyed = (Array.isArray(args.surveyed) ? args.surveyed : []).filter(p => p && Number.isFinite(p.x) && Number.isFinite(p.z)).slice(-24);
     route.surveyed.push(route.origin);
     route.confirmed = [];
+    const point = p => p && [p.x, p.y, p.z].every(Number.isFinite);
+    route.walkMisses = (Array.isArray(args.walk_misses) ? args.walk_misses : []).slice(-16)
+      .filter(m => m && point(m.from) && point(m.to));
     route.walkFailures = 0;
     route.passages = 0;
   }
@@ -1742,6 +1779,7 @@ export const skills = {
     parameters: [
       { name: 'facing', type: 'string', required: false, default: null, description: '门宽方向 x 或 z，默认按朝向自动选。' },
       { name: 'second', type: 'boolean', required: false, default: false, description: '是否再补一个返程门（要 20 个黑曜石）。' },
+      { name: 'resume_site', type: 'object', required: false, default: null, description: '从上次实测门址续建，包含 dimension、origin 和 axis。' },
     ],
     handler: makeNetherPortal,
   },
@@ -1766,6 +1804,7 @@ export const skills = {
       { name: 'blazes', type: 'number', required: false, default: 1, description: '要打几只烈焰人。' },
       { name: 'scout_only', type: 'boolean', required: false, default: false, description: '只寻找烈焰人或走近堡垒方块，保留战斗给采集动作。' },
       { name: 'surveyed', type: 'array', required: false, default: [], description: '先前侦察实际到过的区域，用于选择新的安全落脚点。' },
+      { name: 'walk_misses', type: 'array', required: false, default: [], description: '最近走不通的起点和落脚点，仅在相同进路附近使用。' },
       { name: 'timeout_s', type: 'number', required: false, default: 120, description: '整个探索的最长用时。' },
     ],
     handler: raidFortress,

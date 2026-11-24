@@ -129,22 +129,26 @@ test('sleep_safe delegates new bed placement to the shared bridge bed helper', a
   assert.equal(world.getBlock(2, 1, 0).name, 'white_bed');
 });
 
-test('make_shelter searches loaded terrain and walks to a reachable remote footprint', async () => {
+test('make_shelter can reach a flat site five blocks above an excavated pit', async () => {
   const world = makeWorld({ inventory: 64 });
   for (let x = -5; x <= 5; x += 1) {
     for (let z = -5; z <= 5; z += 1) world.blocks.delete(`${x},0,${z}`);
   }
   for (let x = 6; x <= 10; x += 1) {
-    for (let z = -2; z <= 2; z += 1) world.blocks.set(`${x},0,${z}`, makeBlock('stone'));
+    for (let z = -2; z <= 2; z += 1) world.blocks.set(`${x},5,${z}`, makeBlock('stone'));
   }
-  world.bot.findBlocks = () => [{ x: 8, y: 0, z: 0 }];
+  world.bot.findBlocks = ({useExtraInfo}) => {
+    const position = { x: 8, y: 5, z: 0 };
+    assert.ok(useExtraInfo({...makeBlock('stone'), position}));
+    return [position];
+  };
 
   const result = await skills.make_shelter.handler({ size: 4 }, world.ctx);
 
   assert.equal(result.status, 'succeeded');
-  assert.match(result.detail, /\(8, 0, 0\)/);
-  assert.deepEqual(world.bot.entity.position, { x: 8, y: 1, z: 0 });
-  assertShelterStructure(world, { x: 8, y: 0, z: 0 }, 4);
+  assert.match(result.detail, /\(8, 5, 0\)/);
+  assert.deepEqual(world.bot.entity.position, { x: 8, y: 6, z: 0 });
+  assertShelterStructure(world, { x: 8, y: 5, z: 0 }, 4);
 });
 
 test('make_shelter tries the next safe footprint when pathfinding cannot reach the nearest one', async () => {

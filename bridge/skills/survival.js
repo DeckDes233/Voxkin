@@ -630,8 +630,11 @@ function findShelterCenters(ctx, plan) {
     try {
       supports = bot.findBlocks({
         matching: (block) => isSolidBlock(block) && !DANGER_BLOCKS.has(block.name),
+        // 先筛出头顶有空间的地面，避免取土坑里的地下石块占满候选。
+        useExtraInfo: block => Math.abs(block.position.y - (base.y - 1)) <= 12 &&
+          isOpenSpace(blockAt(bot, block.position.x, block.position.y + 1, block.position.z)),
         maxDistance: 40,
-        count: 4096,
+        count: 768,
       });
     } catch {
       supports = [];
@@ -646,7 +649,7 @@ function findShelterCenters(ctx, plan) {
         y: Math.floor(position.y),
         z: Math.floor(position.z),
       };
-      if (Math.abs(center.y - (base.y - 1)) > 3) continue;
+      if (Math.abs(center.y - (base.y - 1)) > 12) continue;
       const key = `${center.x},${center.y},${center.z}`;
       if (seen.has(key) || !footprintOk(ctx, plan, center)) continue;
       seen.add(key);
@@ -1326,7 +1329,7 @@ export const skills = {
         const beforeTime = Number(bot.time?.timeOfDay ?? 0);
         const beforeDay = Number(bot.time?.day ?? 0);
         try {
-          const sleepResult = await ctx.sleepInBed();
+          const sleepResult = await ctx.sleepInBed(range);
           const left = await waitLeaveBed(ctx, 15000);
           if (!left) throw new Error('躺下后一直没有离开床');
           const advanced = await waitForSleepTimeAdvance(ctx, beforeTime, beforeDay);

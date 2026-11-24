@@ -38,12 +38,15 @@ export function inspectResourceSites(bot, shelter = null, sessionId = null) {
       const site = { name: block.name, x: p.x, y: p.y, z: p.z };
       const village = anchors.some(anchor => distance(anchor, p) <= 48);
       if (block.name === 'hay_block') result.hay.push(site);
+      if (/_bed$/.test(block.name)) {
+        const properties = block.getProperties?.() || {};
+        if (properties.occupied !== true && properties.occupied !== 'true' && properties.part !== 'head') {
+          result.sleep_bed ??= site;
+          if (village && !protectedSite(p)) result.beds.push(site);
+        }
+      }
       if (protectedSite(p)) continue;
       if (block.name === 'chest' && village) result.chests.push(site);
-      if (/_bed$/.test(block.name) && village) {
-        const properties = block.getProperties?.() || {};
-        if (properties.occupied !== true && properties.occupied !== 'true' && properties.part !== 'head') result.beds.push(site);
-      }
     }
   }
   result.village_evidence = anchors.length > 0;
