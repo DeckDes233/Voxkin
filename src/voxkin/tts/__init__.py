@@ -4,6 +4,7 @@ from voxkin.config import TTSConfig
 from voxkin.tts.base import TTSAdapter, TTSError
 from voxkin.tts.genie import GenieTTS
 from voxkin.tts.gpt_sovits import GPTSoVITSClient
+from voxkin.tts.silent import SilentTTS
 
 
 def build_tts(config: TTSConfig) -> TTSAdapter:
@@ -11,6 +12,8 @@ def build_tts(config: TTSConfig) -> TTSAdapter:
         return GPTSoVITSClient(config)
     if config.engine == "genie":
         return GenieTTS(config)
+    if config.engine == "silent":
+        return SilentTTS(reason="配置选择静音输出")
     raise ValueError(f"未知的 TTS engine: {config.engine}")
 
 

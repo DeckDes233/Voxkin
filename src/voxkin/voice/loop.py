@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from typing import Any, Awaitable, Callable
 
 from voxkin.audio.capture import Microphone
@@ -41,6 +42,7 @@ class VoiceLoop:
         self._was_speaking = False
         self.on_status = on_status
         self._running = False
+        self._reply_task: asyncio.Task | None = None
         self.last_transcript = ""
         self.last_stt_ms: float | None = None
 
@@ -53,8 +55,17 @@ class VoiceLoop:
         await asyncio.to_thread(self.microphone.start)
         await self._calibrate()
         self._running = True
-        await self._status("ready", self.status())
+        try:
+            await self._status("ready", self.status())
+            await self._listen(listen_only)
+        finally:
+            self._running = False
+            await self._finish_reply("mic_stopped")
+
+    async def _listen(self, listen_only: bool) -> None:
         while self._running:
+            if self._reply_task is not None and self._reply_task.done():
+                await self._finish_reply("completed")
             chunk = await asyncio.to_thread(self.microphone.read, 0.5)
             if chunk is None:
                 continue
@@ -71,6 +82,9 @@ class VoiceLoop:
                 if self._rms(chunk) < self.barge_in_rms:
                     continue
                 await self.pipeline.interrupt("barge_in")
+                # 已让出播放权，下一帧仍是玩家正在说的话。
+                self._was_speaking = False
+                self._resume_at = 0.0
                 await self._status("barge_in", {})
             was_active = self.vad._active
             utterances = self.vad.feed(chunk)
@@ -89,8 +103,25 @@ class VoiceLoop:
             await self.emit({"type": "stt_final", "text": text, "stt_ms": self.last_stt_ms})
         if not text or listen_only:
             return
-        summary = await self.pipeline.respond(text)
+        await self._finish_reply("superseded")
+        request_id = f"mic-{uuid.uuid4().hex[:12]}"
+        self._reply_task = asyncio.create_task(self._reply(text, request_id), name=request_id)
+
+    async def _reply(self, text: str, request_id: str) -> None:
+        summary = await self.pipeline.respond(text, request_id)
         await self._status("reply", {"summary": summary})
+
+    async def _finish_reply(self, reason: str) -> None:
+        task = self._reply_task
+        if task is None:
+            return
+        if not task.done():
+            await self.pipeline.interrupt(reason, request_id=task.get_name())
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._reply_task = None
+        if not task.cancelled():
+            task.result()
 
     async def _calibrate(self) -> None:
         samples = []

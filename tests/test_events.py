@@ -3,7 +3,14 @@ import asyncio
 import numpy as np
 import pytest
 
-from voxkin.events import EventHub, MetricsStore, TurnTimeline, percentile
+from voxkin.events import (
+    FULL_TURN_MARKS,
+    EventHub,
+    MetricsStore,
+    TimelineIncomplete,
+    TurnTimeline,
+    percentile,
+)
 
 
 def test_marks_are_idempotent():
@@ -55,3 +62,48 @@ async def test_event_hub_drops_oldest_when_full():
     hub.unsubscribe(queue)
     await hub.publish({"index": 9})
     assert queue.qsize() == 1
+
+
+def test_alias_marks_share_one_timestamp():
+    timeline = TurnTimeline.start()
+    timeline.mark("t6_playback_start", 5.0)
+    timeline.mark("t_audio_start", 9.0)
+    assert timeline.marks["t6_playback_start"] == timeline.marks["t_audio_start"] == 5.0
+    timeline.mark("t7_action_start", 7.0)
+    timeline.mark("t_action_start", 11.0)
+    assert timeline.marks["t7_action_start"] == timeline.marks["t_action_start"] == 7.0
+
+
+def test_summary_reports_fast_path_latencies():
+    timeline = TurnTimeline.start()
+    timeline.mark("t0_speech_end", 0.0)
+    timeline.mark("t_cmd_final", 0.1)
+    timeline.mark("t_intent_done", 0.2)
+    timeline.mark("t_ack_ready", 0.3)
+    timeline.mark("t_audio_start", 0.4)
+    timeline.mark("t_action_submit", 0.5)
+    timeline.mark("t_action_start", 0.6)
+    timeline.mark("t8_action_done", 1.0)
+    summary = timeline.summary()
+    assert summary["intent_ms"] == 100.0
+    assert summary["ack_ready_ms"] == 200.0
+    assert summary["audio_start_ms"] == 300.0
+    assert summary["action_submit_ms"] == 400.0
+    assert summary["action_start_ms"] == 500.0
+
+
+def test_missing_marks_are_reported_and_fail_loudly():
+    timeline = TurnTimeline.start()
+    timeline.mark("t0_speech_end", 0.0)
+    missing = timeline.missing(FULL_TURN_MARKS)
+    assert "t_cmd_final" in missing
+    with pytest.raises(TimelineIncomplete) as error:
+        timeline.require(FULL_TURN_MARKS)
+    assert "t_cmd_final" in str(error.value)
+
+
+def test_require_passes_when_all_marks_present():
+    timeline = TurnTimeline.start()
+    for name in FULL_TURN_MARKS:
+        timeline.mark(name)
+    timeline.require(FULL_TURN_MARKS)

@@ -1,0 +1,9 @@
+# S3 换矿区修复后 S0–S4 Windows 隔离实测（2026-10-28）
+
+用户授权一次隔离运行。预检 marker cleanup_pending、runtime_active、owner_active 均 false，目标不存在且端口空闲。原无世界/DB的种子 `work/mc/terra_seed_20261028` 使用 level-seed=20261022，新目标 `work/mc/terra_s0_s4_relocation_20261028` 生成新世界及DB。未注入物品；normal，启用生物及昼夜循环、关闭 keepInventory、起始时间1000。另复制的 `terra_seed_relocation_20261028` 没有用于运行。旧世界及 task 7 未修改。
+
+启动：`.venv/Scripts/python.exe scripts/run_stage.py --chain-s0-s4 --isolate-from work/mc/terra_seed_20261028 --isolate-target work/mc/terra_s0_s4_relocation_20261028 --isolate-port 26786 --isolate-rcon-port 26787 --isolate-studio-port 8872 --bridge-restarts 0 --stage-timeout 1200 --server-timeout 120 --java D:/AI-Workspace/Voxkin/work/runtimes/temurin-21.0.12.1-win-x64/jdk-21.0.12.1+1/bin/java.exe --node D:/AI-Workspace/Voxkin/work/runtimes/node-v24.22.1-win-x64/node-v24.22.1-win-x64/node.exe --output work/refactor_validation_20261027/relocation_s0_s4_result.json`。隐藏 wrapper PID52880、runner17836、Bridge55916、Paper14828；Bridge ready session 97db0517-816c-4e5f-aa08-9ff761386472。
+
+S0 65.1秒、S1 164.7秒、S2 121.9秒通过；S2 sealed、inside、床在室内，night_required=false、sleep_confirmed=false。S3 243.6秒因 preemption_budget 阻塞，S4未运行。铁矿从0采到粗铁8，最低需求9；四次低氧自救后仍重复采集，最后新鲜观察 alive=true、health20、food16、位置(20.3,55,62.7)、raw_iron=8。没有死亡日志。Bridge分别于09:09:57、09:10:10、09:10:25、09:10:37 UTC触发低氧自救；日志显示前三次之后继续派发采矿，第四次后达到抢占预算。SQLite事件中 bbb260b1a2ce、ed5dfbd306af、ebf690f97d12 均以 raw8:region0:route0 和相同采集目标派发，revision 分别282、295、309。当前记录支持反复采集/低氧循环，精确采矿目标位置仍需进一步核实；不能仅凭自救后存活声称已彻底脱离危险。
+
+新换矿区策略未被派发：此轮先进入低氧抢占循环，未触发其局部矿路耗尽或结构化水包围入口，因此不能证明换矿区实机成功。S3 blocked 后运行器正常清理，Paper 17:10:38 记录 RCON stop、Saving players 与所有维度保存；Bridge Server closed 是停服清理。结果 cleanup_errors=[]、bridge_restart_history=[]，owned进程退出、26786/26787/8872 无监听。世界及DB保留。原始结果 `work/refactor_validation_20261027/relocation_s0_s4_result.json`，日志 `relocation_stdout.log`、`relocation_stderr.log` 及目标的 `logs/run_stage_console.log`、`.voxkin-studio/logs/bridge.out.log`。

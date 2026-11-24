@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -73,6 +74,11 @@ class TaskStore:
                 payload text not null default '{}',
                 updated_at real not null
             );
+            create table if not exists goal_states (
+                task_id integer primary key,
+                payload text not null,
+                updated_at real not null
+            );
             """
         )
         self._connection.commit()
@@ -114,6 +120,102 @@ class TaskStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    def latest_task(self) -> Task | None:
+        row = self._connection.execute(
+            "select * from tasks order by updated_at desc, id desc limit 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return Task(
+            id=row["id"],
+            objective=row["objective"],
+            stage=row["stage"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def latest_resumable(self) -> Task | None:
+        row = self._connection.execute(
+            "select * from tasks where status in ('active', 'cancelled', 'blocked', 'failed', 'dead', 'disconnected', 'unknown') "
+            "order by case status when 'active' then 0 else 1 end, updated_at desc, id desc limit 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return Task(
+            id=row["id"],
+            objective=row["objective"],
+            stage=row["stage"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def latest_shelter_hint(self) -> dict[str, Any] | None:
+        """从最近的目标观察中找可校验的庇护所坐标提示。"""
+        rows = self._connection.execute(
+            "select payload from goal_states order by updated_at desc, task_id desc"
+        ).fetchall()
+        dimensions = {
+            "overworld": "overworld",
+            "minecraft:overworld": "overworld",
+            "the_nether": "the_nether",
+            "minecraft:the_nether": "the_nether",
+            "nether": "the_nether",
+            "the_end": "the_end",
+            "minecraft:the_end": "the_end",
+            "end": "the_end",
+        }
+        for row in rows:
+            payload = json.loads(row["payload"])
+            observation = payload.get("last_observation")
+            if not isinstance(observation, dict):
+                continue
+            dimension = dimensions.get(str(observation.get("dimension") or "").strip().lower())
+            shelter = observation.get("shelter")
+            if not dimension or not isinstance(shelter, dict):
+                continue
+            position = shelter.get("position")
+            if not isinstance(position, dict):
+                continue
+            coordinates: dict[str, int] = {}
+            valid = True
+            for axis in "xyz":
+                value = position.get(axis)
+                if isinstance(value, bool):
+                    valid = False
+                    break
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    valid = False
+                    break
+                if not math.isfinite(numeric) or not numeric.is_integer():
+                    valid = False
+                    break
+                if axis == "y":
+                    if not -64 <= numeric <= 320:
+                        valid = False
+                        break
+                elif abs(numeric) > 30_000_000:
+                    valid = False
+                    break
+                coordinates[axis] = int(numeric)
+            raw_size = shelter.get("size")
+            if isinstance(raw_size, bool):
+                continue
+            try:
+                numeric_size = float(raw_size)
+            except (TypeError, ValueError):
+                continue
+            if not valid or not math.isfinite(numeric_size) or not numeric_size.is_integer():
+                continue
+            size = int(numeric_size)
+            if size not in {3, 4, 5}:
+                continue
+            return {"position": coordinates, "size": size, "dimension": dimension}
+        return None
 
     def set_status(self, task_id: int, status: str, stage: str | None = None) -> None:
         if stage is None:
@@ -195,6 +297,41 @@ class TaskStore:
         checkpoint = self.load_checkpoint(task_id)
         return int(checkpoint["cursor"]) if checkpoint else 0
 
+    def save_goal_state(self, task_id: int, payload: dict[str, Any]) -> None:
+        self._connection.execute(
+            "insert into goal_states (task_id, payload, updated_at) values (?, ?, ?) "
+            "on conflict(task_id) do update set payload=excluded.payload, updated_at=excluded.updated_at",
+            (task_id, json.dumps(payload, ensure_ascii=False), time.time()),
+        )
+        self._connection.commit()
+
+    def load_goal_state(self, task_id: int) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "select payload from goal_states where task_id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["payload"])
+
+    def complete_goal(self, task_id: int, payload: dict[str, Any]) -> None:
+        """在同一 SQLite 事务中提交目标终态和任务终态。"""
+        now = time.time()
+        try:
+            self._connection.execute("begin immediate")
+            self._connection.execute(
+                "insert into goal_states (task_id, payload, updated_at) values (?, ?, ?) "
+                "on conflict(task_id) do update set payload=excluded.payload, updated_at=excluded.updated_at",
+                (task_id, json.dumps(payload, ensure_ascii=False), now),
+            )
+            self._connection.execute(
+                "update tasks set status='done', updated_at=? where id=?",
+                (now, task_id),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
     def log_event(self, task_id: int, kind: str, payload: dict[str, Any] | None = None) -> None:
         self._connection.execute(
             "insert into events (task_id, kind, payload, created_at) values (?, ?, ?, ?)",
@@ -215,6 +352,13 @@ class TaskStore:
             }
             for row in reversed(rows)
         ]
+
+    def has_event(self, task_id: int, kind: str, event: str) -> bool:
+        rows = self._connection.execute(
+            "select payload from events where task_id = ? and kind = ? order by id desc",
+            (task_id, kind),
+        ).fetchall()
+        return any(json.loads(row["payload"]).get("event") == event for row in rows)
 
     def close(self) -> None:
         self._connection.close()

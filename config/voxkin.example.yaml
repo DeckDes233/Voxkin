@@ -75,3 +75,16 @@ memory:
   recent_turns: 8
   context_token_budget: 900
   summarize_delay_s: 10
+
+voice_cache:
+  enabled: true
+  root: "work/voice_cache"
+  voice_id: ""
+  preload: true
+  ack_deadline_ms: 400
+  chunk_ms: 200
+
+fast_path:
+  enabled: true
+  min_confidence: 0.75
+  action_min_confidence: 0.9

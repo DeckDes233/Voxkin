@@ -88,6 +88,7 @@ button {
 }
 button:hover { border-color: var(--accent); }
 button.primary { background: #24405f; border-color: #2f5c8a; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .legend { color: var(--muted); font-size: 12px; margin: 10px 0 6px; }
 

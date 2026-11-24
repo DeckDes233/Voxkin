@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Sequence
 
 from voxkin.agent.actions import ActionDispatcher
+from voxkin.agent.arbiter import ActionArbiter, ActionTicket
 from voxkin.agent.run_manager import RunManager
 from voxkin.agent.tasks import TaskStore
 from voxkin.audio.sinks import AudioSink, build_sink
@@ -20,8 +22,11 @@ from voxkin.services import ServiceSpec, ServiceSupervisor
 from voxkin.stt.vad import VadSegmenter
 from voxkin.stt.whisper import WhisperSTT
 from voxkin.tts import build_tts
-from voxkin.tts.base import TTSAdapter
+from voxkin.tts.base import TTSAdapter, TTSError
+from voxkin.tts.silent import SilentTTS
 from voxkin.voice.loop import VoiceLoop
+
+logger = logging.getLogger("voxkin")
 
 
 class MissingKeyLLM:
@@ -38,7 +43,9 @@ class MissingKeyLLM:
             "api_key_configured": False,
         }
 
-    async def stream_chat(self, messages) -> AsyncIterator[LLMDelta]:
+    async def stream_chat(
+        self, messages: Sequence[dict[str, str]], tools: Sequence[dict[str, Any]] | None = None
+    ) -> AsyncIterator[LLMDelta]:
         raise LLMError(
             "LLM 未配置：设置环境变量 "
             f"{self.config.llm.api_key_env} 或写入 config/local.yaml 的 llm.api_key"
@@ -62,6 +69,7 @@ class Runtime:
     dispatcher: ActionDispatcher
     pipeline: ConversationPipeline
     supervisor: ServiceSupervisor
+    arbiter: ActionArbiter | None = None
     memory: MemoryStore | None = None
     run_manager: RunManager | None = None
     voice_loop: VoiceLoop | None = None
@@ -95,7 +103,30 @@ class Runtime:
                 device=config.audio.device,
                 volume=config.audio.volume,
             )
-        dispatcher = ActionDispatcher()
+        dispatcher = ActionDispatcher(require_protocol=True)
+        arbiter = ActionArbiter(dispatcher, on_event=hub.publish)
+
+        async def dispatch_task(
+            tool: str,
+            arguments: dict[str, Any],
+            timeout_s: float | None = None,
+            *,
+            action_id: str = "",
+            goal_id: str = "",
+            intent_id: str = "",
+            origin: str = "goal",
+        ) -> Any:
+            """目标方法也经统一准入，并把 action_id 与目标关联交给 Bridge。"""
+            ticket = ActionTicket(
+                tool=tool,
+                arguments=dict(arguments or {}),
+                origin=origin,
+                timeout_s=float(timeout_s or 0.0),
+                action_id=action_id,
+                goal_id=goal_id,
+                intent_id=intent_id,
+            )
+            return await arbiter.submit(ticket)
         store: MemoryStore | None = None
         writer: MemoryWriter | None = None
         if config.memory.enabled:
@@ -114,19 +145,20 @@ class Runtime:
             memory_writer=writer,
         )
 
-        async def handle_action(call: dict[str, Any], turn) -> str:
-            return await dispatcher.dispatch(call["name"], call.get("arguments") or {})
-
-        pipeline.set_action_handler(handle_action)
+        pipeline.set_action_controller(arbiter)
         pipeline.set_state_provider(dispatcher.state_snapshot)
         task_store = TaskStore(Path("data") / "tasks.db")
         task_store.initialize()
         run_manager = RunManager(
-            dispatch=dispatcher.dispatch,
+            dispatch=dispatch_task,
             state_provider=dispatcher.state_snapshot,
             announce=pipeline.announce,
             store=task_store,
+            action_status=dispatcher.action_status,
+            state_age_provider=dispatcher.state_age_s,
+            cancel_actions=arbiter.cancel_all,
         )
+        pipeline.set_stop_handler(run_manager.request_stop)
         supervisor = ServiceSupervisor(Path("logs") / "services")
         if config.tts.manage_service:
             supervisor.register(
@@ -147,6 +179,7 @@ class Runtime:
             metrics=metrics,
             hub=hub,
             dispatcher=dispatcher,
+            arbiter=arbiter,
             pipeline=pipeline,
             supervisor=supervisor,
             memory=store,
@@ -231,21 +264,38 @@ class Runtime:
         return self.mic_status()
 
     async def start(self) -> None:
-        await self.pipeline.start()
+        try:
+            await self.pipeline.start()
+        except TTSError as error:
+            # 语音合成挂掉不应该让整个 Core 起不来：自主任务与桥接动作都不依赖语音。
+            logger.warning("TTS 不可用，语音输出降级为日志: %s", error)
+            silent = SilentTTS(reason=str(error))
+            self.pipeline.tts = silent
+            self.tts = silent
+            await self.pipeline.start()
 
     def status(self) -> dict[str, Any]:
+        cache = self.pipeline.cache
         return {
             "llm": self.llm.describe(),
             "tts": self.tts.describe(),
             "stt": self.stt.describe(),
             "audio": self.sink.describe(),
             "metrics": self.metrics.aggregate(),
+            "voice_cache": cache.describe() if cache is not None else {"enabled": False},
+            "fast_path": {
+                "enabled": self.config.fast_path.enabled,
+                "min_confidence": self.config.fast_path.min_confidence,
+                "action_min_confidence": self.config.fast_path.action_min_confidence,
+            },
             "speaking": self.pipeline.is_speaking,
             "bridge": {
                 "connected": self.dispatcher.connected,
                 "name": self.dispatcher.bridge_name,
                 "pending_actions": self.dispatcher.pending_count,
             },
+            "arbiter": self.arbiter.status() if self.arbiter is not None else {"enabled": False},
+            "run": self.run_manager.status() if self.run_manager is not None else {"running": False},
             "memory": self.memory.counts() if self.memory is not None else {"enabled": False},
             "persona": self.config.persona.name,
             "project_root": str(Path.cwd()),

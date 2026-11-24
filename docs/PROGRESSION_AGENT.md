@@ -1,5 +1,7 @@
 # 通关 Agent：规划、执行、验证的循环
 
+> 本文保留规划方案，不能作为当前模块实现或实机通过的证明。现行阶段实现见 [架构](ARCHITECTURE.md)，目标与合同差异见 [MILESTONE](MILESTONE.md)。
+
 ## 结论
 
 值得做，但先做 **TaskRunner**，不要一上来做“模型训练”。让一个 Agent 按 Minecraft 的通关顺序推进，核心是三件事：
@@ -27,9 +29,9 @@
 | S0 | 木头与工作台 | 背包有 `wooden_pickaxe`、`crafting_table` |
 | S1 | 石制工具与熔炉 | `stone_pickaxe`、`stone_sword`、`furnace` |
 | S2 | 食物与庇护所 | 食物 ≥8，夜晚有床或封闭空间 |
-| S3 | 铁装与盾 | `iron_pickaxe`、`iron_sword`、`shield`，铁锭 ≥6 |
+| S3 | 铁装、盾与空桶 | `iron_pickaxe`、`iron_sword`、`shield`、`bucket`；三件装备和桶合计准备 9 铁锭 |
 | S4 | 钻石与附魔 | `diamond_pickaxe`、`enchanting_table`，钻石 ≥3 |
-| S5 | 下界与烈焰棒 | 烈焰棒 ≥7，末影珍珠 ≥16 |
+| S5 | 下界、烈焰棒与珍珠 | S3 桶；烈焰棒 ≥12，末影珍珠 ≥24 |
 | S6 | 要塞与末地 | 进入末地，击败末影龙 |
 
 每一阶段只依赖前一阶段的产出。阶段表放在 `src/voxkin/agent/progress.py`，是唯一事实来源。

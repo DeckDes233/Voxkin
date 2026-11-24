@@ -62,6 +62,24 @@ def _is_looped(text: str) -> bool:
         unique = len(set(parts))
         if unique <= max(1, len(parts) // 3):
             return True
+    if _is_repeated_period(normalized):
+        return True
+    return False
+
+
+def _is_repeated_period(normalized: str) -> bool:
+    """整段文本由同一个短片段重复三次以上构成时判为循环。"""
+    length = len(normalized)
+    for period in range(1, length // 3 + 1):
+        if length % period:
+            continue
+        repeats = length // period
+        if repeats < 3:
+            continue
+        if period == 1 and repeats < 8:
+            continue
+        if normalized[:period] * repeats == normalized:
+            return True
     return False
 
 

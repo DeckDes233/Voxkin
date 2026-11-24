@@ -41,6 +41,15 @@ def test_repeated_chinese_is_dropped() -> None:
     assert filter_text("爱你" * 8) == ""
 
 
+def test_short_repeated_period_is_dropped() -> None:
+    assert filter_text("维持维持维持") == ""
+    assert filter_text("维持。维持。维持。") == ""
+
+
+def test_two_repetitions_are_kept() -> None:
+    assert filter_text("谢谢谢谢") == "谢谢谢谢"
+
+
 def test_low_information_noise_is_dropped() -> None:
     assert filter_text("啊啊啊啊啊啊啊啊啊啊") == ""
 

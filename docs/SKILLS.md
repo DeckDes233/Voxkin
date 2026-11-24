@@ -1,170 +1,151 @@
-# Minecraft 技能审计（只读快照）
+# Voxkin 技能介绍与总表
 
-审计时间 2026-10-22，对象为 `bridge/minecraft_bridge.js`、`src/voxkin/agent/*`、`src/voxkin/pipeline.py`、`tests/`。本次只读代码并运行现有测试（111 passed，7.93s），未连接真实 Minecraft，未改生产代码，未提交 git；工作树中的并发改动不属于本次审计。
+更新于 2026-10-28。当前 **67 项技能**：21 项内建动作、46 项模块技能；Core 从清单生成 **66 个模型工具**，仅排除游戏内聊天 `chat`。
 
-审计基线：commit `b602e1d`（`develop`）。审计期间工作树被并发修改（未提交），本表与所有行号均指该 commit；工作树差异见 §5。
+技能参数以 [`manifest.js`](../bridge/skills/manifest.js) 及其导出的 [`manifest.json`](../bridge/skills/manifest.json) 为准；实际执行见 [`minecraft_bridge.js`](../bridge/minecraft_bridge.js) 与 [`skills/`](../bridge/skills/)。本文介绍当前实现，不沿用早期审计中的旧行号和未实现技能名。模块接入方式见 [开发说明](../bridge/skills/README.md)。
 
-## 0. 口径与总量
+## 本轮新增与升级
 
-| 项 | 现状 | 证据 |
+| 能力 | 入口 | 行为与验收 |
 | --- | --- | --- |
-| bridge 动作分支 | HEAD 14 个 `case`，无注册表；审计时工作树已增到 19 个（未提交） | `bridge/minecraft_bridge.js:189-271`；§5 |
-| Python 工具 schema | HEAD 13 个；工作树 18 个（未提交） | `src/voxkin/agent/tools.py:5-215`；§5 |
-| 技能模块约定 | 只有 README，`manifest.js`、`index.js` 不存在 | `bridge/skills/README.md:96-126` |
-| 动作超时 | Core 单值 120s；bridge 从不读 `timeout_s` | `src/voxkin/agent/actions.py:20,81`；`src/voxkin/bridge/protocol.py:21` |
-| 取消 | 仅 `attack_nearest`、`stop` 抢占，且只有部分函数检查 `interrupted` | `bridge:70,134-143,303,321,356,609` |
-| 结果回填 | 工具结果只播报，不进下一轮上下文 | `src/voxkin/pipeline.py:199-206,342-389` |
-| S0 模板 | 5 步，`PLANS` 仅 S0 | `src/voxkin/agent/plans.py:5-50` |
-| 阶段表 | S0-S6 按背包判定 | `src/voxkin/agent/progress.py:15-98` |
+| 批量采集 | `mine_collect` + Core `resource_policy.py` | `count` 为期望库存，`minimum_count` 为本次最低需求。满足最低需求后只采触手可及的余料，回执注明实际库存和储备缺口。省略最低需求时按完整目标验收。 |
+| S3 地表采木 | `mine_collect`、`explore_mining_site` | 日间补木先搜 64 格，再扩大至已加载区块中的 128 格。`surface_wood` 根据出发高度和相邻格的天空光筛选原木。扩搜失败后按实际位移验收换区。 |
+| 村庄补给 | `loot_village` | 检查可见村庄箱子、闲置床与干草；按白名单和库存缺口拿物资，实际拾取与同步背包后验收。铁匠铺箱子走同一实际开箱流程。 |
+| 干草制面包 | `loot_village` + 阶段补给规划 | 1 干草块 → 9 麦子，3 麦子 → 1 面包；缺工作台时保留材料，由规划补齐依赖。 |
+| 三格柱铁傀儡取铁 | `harvest_iron_golem` | 指定可见实体，检查安全站位、武器与三块同种稳定材料；核实柱高，蹲伏并在下降、冷却完成且够得到时攻击。目标消失且背包铁锭增加才报告成功。 |
+| 群怪决策 | `attack_nearest` 与共用战斗控制 | 持续评估数量、距离、类型、血量和装备；自动目标可切换，苦力怕接近或引爆、战力不足时撤退。指定目标保持原任务语义，撤退不等于击杀。 |
+| 找不到资源继续探索 | 采集、动物猎取、水源与岩浆搜索 | 候选耗尽或不可达后使用有界移动搜索，记录已尝试地点；受到安全条件和原任务预算约束。 |
+| 后期阶段恢复 | S4–S6 规划与下界/末地技能 | 按当前库存和维度补净缺口，核实门址、过门状态和本次击杀事件。 |
 
-状态口径：existing=有工具名与 bridge 分支且参数基本吻合；partial=能力存在但不可独立调用或后置不校验；missing=没有可编排实现（内部辅助函数不算）；blocked=外部条件缺失。本表按 HEAD 计，工作树新增项见 §5。P0 20 项：existing 6、partial 7、missing 7。
+村庄判断来自附近村民或钟等可见线索；不能识别所有建筑，也不能凭箱子方块判断其玩家归属。已知庇护所附近的床与箱子受到保护。铁傀儡的下降攻击请求不等于服务器已确认暴击。实现细节与离线证据见 [资源修复](evidence/RESOURCE_VILLAGE_GOLEM_20261028.md)和 [群怪战斗修复](evidence/S4_S6_COMBAT_20261028.md)。
 
-零干预口径：`follow_player`、`come_to_player` 在独立通关时因无玩家而 blocked（`bridge:199`、`bridge:924-939`），共玩场景仍按表中状态使用。
+## 阶段规划与资源目标
 
-## 1. 总表
+`GoalSupervisor` 管理标准 S0–S6 的派发、回执对账、SQLite 持久化和预算；策略由 `goal_methods.py`、`late_game_methods.py`、`resource_policy.py` 提供。`plans.py` 保留兼容线性计划，不能用其步骤数量代表标准阶段当前的执行过程。阶段最终验收只由 [`goals.py::GOALS`](../src/voxkin/agent/goals.py) 声明。
 
-### 1.1 P0（规格 20 项）
-
-| # | skill_id | 状态 | 现有实现（文件:行号） | 缺口 | 首批 |
-| --- | --- | --- | --- | --- | --- |
-| 1 | observe_self | partial | `src/voxkin/world_state.py:79-120`；`src/voxkin/pipeline.py:109-113` | 无工具；「在哪/几点」靠状态注入，无 `state_age` 字段 | 4 |
-| 2 | observe_environment | missing | 状态帧只有 `players`（`bridge:1331-1343`） | 无周边方块/实体清单 | 2 |
-| 3 | inventory | existing | `tools.py:89-96`；`bridge:216-222` | detail 截断 400/500（`bridge:219,290`），无装备槽、耐久、手持分项 | — |
-| 4 | locate_block | missing | 内部 `bridge:1069-1081`，固定 `count=1` | 不返回坐标，只服务 `goto_block`/`break_block` | 2 |
-| 5 | locate_entity | missing | 内部 `bridge:941-948,963-974` | 结果只进战斗/跟随，无查询入口 | 2 |
-| 6 | move_to | existing | `tools.py:21-36`；`bridge:241-243,296-335` | 备用 `GoalXZ` 丢 y（`318`），垂直差 >2 仍报成功（`339-342`），最多 10 段（`302`） | — |
-| 7 | approach_target | missing | 内部 `bridge:535-545` | 吞异常只写日志，无距离参数 | 6 |
-| 8 | follow_player | partial | `tools.py:57-75`；`bridge:1118-1182` | 独立模式禁用（`199`），5 分钟自停（`1139-1143`），会索要坐标（`930-934`） | — |
-| 9 | stop_movement | partial | `tools.py:37-44`；`bridge:194-196,1184-1200` | 只停跟随与寻路，队列中后续动作照跑（`bridge:159-162`） | 3 |
-| 10 | come_to_player | existing | `tools.py:76-88`；`bridge:206-215` | 走向玩家旧坐标，垂直差 >2 仍 ok（`210-213`） | — |
-| 11 | collect_blocks | partial | `tools.py:9-19`；`bridge:345-369` | 只 `dig` 不拾取，无背包增量校验，换工具失败静默（`371-378`） | 7 |
-| 12 | mine_block | existing | `tools.py:118-136`；`bridge:380-399`（名为 `break_block`） | 无中断检查、无方块更新校验，skill 名与实现名不一致 | 1 |
-| 13 | equip_item | partial | `bridge:950-957,1253-1260` | 无工具；只认 sword/axe 与自动穿甲，无盾、副手、食物 | 8 |
-| 14 | use_item | missing | 仅 `bridge:587-601` 内部射箭 | 无右键/桶/骨粉等通用入口 | — |
-| 15 | eat_food | partial | 反射 `bridge:715-726`，触发 `892-895,919-921` | 无工具；`consume` 失败只写日志，无 food 增量校验 | 5 |
-| 16 | craft_item | existing | `tools.py:192-214`；`bridge:502-533` | 材料不足也先放工作台（`510-517`），只取 `recipes[0]`（`522`） | 8 |
-| 17 | place_block | existing | `tools.py:137-153`；`bridge:401-433` | 只收绝对坐标，目标非空即失败（`406`），无放置后校验 | — |
-| 18 | attack_target | partial | `tools.py` attack_target；`bridge` 的 `attack_target` | 已支持 id/名字/类型，拒绝玩家；未实机验证 | 6 |
-| 19 | attack_nearest | partial | `tools.py` attack_nearest；`bridge` 复用 `attackEntity` | 已接近、射箭、苦力怕后撤；未实机验证 | 6 |
-| 20 | assess_threat | missing | 内部 `bridge:896-918` | 只用于自动开战，无威胁摘要 | 2 |
-
-### 1.2 P1 / P2
-
-规格原文未入库，下表按 `docs/research/SKILL_CATALOG.md:151-177` 与 `docs/plans/INDEPENDENT_RUN_ROADMAP.md:143-164` 合并，条目待与规格核对。
-
-| 优先级 | skill_id | 状态 | 现有实现 | 缺口 |
-| --- | --- | --- | --- | --- |
-| P1 | pickup_items | partial | `tools.py` pickup_items；`bridge` 拾取后校验背包 | 仍依赖实体名称与拾取时序 |
-| P1 | smelt_item | partial | `bridge` 的 `smelt` | 未实机验证熔炉窗口、燃料与产物时序 |
-| P1 | sleep | partial | `bridge` 的 `sleep` | 未实机验证床的交互距离与多人服务器行为 |
-| P1 | equip_armor | partial | `bridge` 每 15s 自动穿甲 | 无显式技能与槽位选择 |
-| P1 | scan_surroundings | missing | 无 | 周边方块/生物摘要 |
-| P1 | use_block | missing | 无 | 门、按钮、拉杆、工作台右键 |
-| P1 | store_item / take_item | missing | 无 | 箱子窗口与槽位遍历 |
-| P1 | give_item | missing | 无 | 丢出与 `playerCollect` 确认 |
-| P1 | trade | missing | 无 | 村民清单、次数上限 |
-| P1 | dig_down / go_to_surface | missing | 无 | 安全竖井、回地表 |
-| P1 | wander / stay | partial | `bridge:998-1042` 闲逛内部 | 无工具入口；`stay` 无 |
-| P1 | defend | partial | `bridge:661-690` | 只由受伤事件触发，无显式技能 |
-| P1 | say / chat | partial | `bridge:190-193` 有 `case` | `tools.py` 无 schema，模型无法调用 |
-| P2 | build_blueprint / nether_portal / end_run / bow_kite / shield_block | missing | 无 | 见 `roadmap:130-140` |
-| P2 | fishing / 载具 / 附魔 / 收获 / waypoint / task_* | missing（`task_*` partial） | `run_manager.py:61-91` | 无阶段模板，只有 S0 |
-
-## 2. P0 详细卡
-
-约定：超时以 `src/voxkin/agent/actions.py:81` 的 120s 为默认，bridge 侧无 deadline。取消指 `stop` 抢占（`bridge:134-143`）。测试方法列只写可在本仓库执行的用例，未执行的标「未验证」。
-
-### 2.1 感知
-
-| skill_id | 参数 | 前置 | 后置 | 失败原因与恢复 | 超时 / 取消 | 测试方法 | 状态证据 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| observe_self | 无 | 桥接已连接，state 新鲜度 ≤30s（`actions.py:41-46`） | 返回坐标、朝向、维度、时间、血量、饥饿、天气 | 状态过期返回空串（`world_state.py:84-85`）；恢复=等下一帧 | 无动作；状态 5s 一帧（`bridge:1261,1322-1365`） | `tests/test_world_state.py` 已覆盖格式化；语音问答未验证 | 无工具，`pipeline.py:109-113` 注入 |
-| observe_environment | 半径 | 已进世界 | 返回周边方块/实体、坐标、距离 | 无实现，无失败路径 | 建议 1s（`bridge/skills/README.md:19`） | 新建 fake bot 断言清单 | missing |
-| inventory | 无 | 已进世界 | 物品名与数量完整 | 未进世界报「bot 尚未进入世界」（`bridge:169-172`）；detail 截断丢失尾部 | 120s / 不可取消 | `tests/test_bridge.py:104-127` 只验协议帧 | existing |
-| locate_block | block、range≤32、count | 区块已加载 | 最近坐标、距离、可挖判定 | 找不到抛「附近 N 格内没有」（`1077-1079`）；恢复=扩大范围或换目标 | 建议 1s / 不可取消 | fake `findBlocks` 返回固定坐标 | missing |
-| locate_entity | type、range、hostile 过滤 | 实体已加载 | id、类型、距离、是否敌对 | 无 | 建议 1s | fake `entities` 注入 | missing |
-| assess_threat | range | 已进世界 | 敌对列表、最近距离、是否已交战 | 无 | 建议 1s | 固定 3 只 hostile 断言排序 | missing |
-
-### 2.2 移动
-
-| skill_id | 参数 | 前置 | 后置 | 失败原因与恢复 | 超时 / 取消 | 测试方法 | 状态证据 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| move_to | x、y、z | 桥接在线，区块可加载 | 水平 ≤2 且垂直 ≤2 | 无路径报「走不过去」（`334`）；分段失败降级直连（`313`）；恢复=换目标或挖开 | 120s；仅分段与尝试间检查 `interrupted`（`303,321`） | `tests/test_actions.py:9-25` 只测派发；真实寻路未验证 | `bridge:241-243,296-335` |
-| approach_target | entity_id、distance=2 | 目标可见且存活 | 与目标距离 ≤distance | 内部 `approach` 吞异常（`542-544`），调用方继续攻击 | 无独立超时 | 断言 `pathfinder.goto` 只调用一次 | missing |
-| follow_player | player?、distance 1-6 | 玩家可见，非独立模式 | 距离稳定在 distance±1 | 独立模式直接抛错（`199`）；5 分钟自停（`1139-1143`）；玩家不可见时结束（`1144-1147`） | 内部 5min；聊天「别跟」可停（`1275-1278`） | 双 ws 客户端模拟玩家移动；未验证 | partial |
-| stop_movement | 无 | — | 无移动、无寻路目标、队列清空 | 未清队列，后续动作继续（`159-162`）；无 ack 回执 | 最高优先级（`70,146-148`） | 入队 3 个动作后 `stop`，断言只执行 1 个 | partial |
-| come_to_player | player? | 玩家可见 | 一次到达 ≤2 格 | 目标位置取调用瞬间（`208`）；垂直差 >2 仍 ok（`210-213`）；无玩家时索要坐标（`930-934`） | 120s；`travelTo` 内检查 | 固定玩家坐标，断言水平距离 | existing |
-
-### 2.3 采集与物品
-
-| skill_id | 参数 | 前置 | 后置 | 失败原因与恢复 | 超时 / 取消 | 测试方法 | 状态证据 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| collect_blocks | block、count≥1 | 32 格内有该方块 | 背包 +count，掉落物已拾取 | 0 个报「没有成功挖到」（`367`）；掉落不拾取；恢复=换方块或扩大范围 | 120s；每块检查中断（`356`） | 真实挖 3 原木并查背包；未验证 | partial |
-| mine_block | block 或 x,y,z | 目标非 air，4 格内可达 | 目标坐标变 air | 坐标缺一即报错（`385-388`）；`canDigBlock` 失败（`396`）；无掉落校验 | 120s；`stop` 会 `stopDigging`（`140`） | 固定坐标断言 `blockAt` 变化 | existing（名 `break_block`） |
-| equip_item | item、slot? | 背包有该物品 | 手持/穿戴变更可见 | 无工具；`equipWeapon` 只认 sword/axe（`950-957`）；盾与副手无 | 无 | fake inventory 断言 `bot.equip` 参数 | partial |
-| use_item | item、target? | 目标 4 格内 | 右键效果生效 | 无 `case`；仅射箭内部 `activateItem`（`593`） | 无 | 需要 fake bot 记录 `activateItem` | missing |
-| eat_food | item? | 背包有食物，food<20 | food 增加，食物 -1 | 无工具；`consume` 失败只写日志（`723-725`）；无增量校验 | 随生存 tick 1s（`bridge:1370`） | fake `consume` 后断言 food 变化；未验证 | partial |
-| craft_item | item、count 1-64 | 材料够，需要时可放工作台 | 背包 +count | 先放工作台再判配方（`510-517`），材料不足会留下一张工作台；只取 `recipes[0]`（`522`）；回收失败只写日志（`526-530`） | 120s；无中断检查 | `tests/test_runner.py:23-28` 用假 executor；真实合成未验证 | existing |
-| place_block | block、x、y、z | 目标为空且有相邻固体 | 目标坐标出现该方块 | 目标非空直接失败（`406`）；周围无可依附方块（`432`）；无放置后校验 | 120s；`stop` 不清放置 | 断言 `placeBlock` 的参考面 | existing |
-
-### 2.4 战斗
-
-| skill_id | 参数 | 前置 | 后置 | 失败原因与恢复 | 超时 / 取消 | 测试方法 | 状态证据 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| attack_target | id / name / type / range | 目标可见且存活 | 目标死亡或脱离 | 按 id、名字或类型解析；玩家拒绝；苦力怕后撤；接近与远程共用 `attackEntity` | 20 次×600ms；有中断检查 | fake 实体生命期，断言只打指定目标 | partial |
-| attack_nearest | range 3-32 | 范围内有 hostile | 目标消失 | 复用 `attackEntity`：接近、远程、苦力怕后撤；未实机验证 | 20 次×600ms；有中断检查 | 16 格放僵尸，断言接近后击杀；未验证 | partial |
-| assess_threat | range | 已进世界 | 威胁清单与建议 | 无 | 建议 1s | 同 observe_environment 夹具 | missing |
-
-## 3. 意图路由审计
-
-`src/voxkin/intent.py:24-42` 的 `classify` 未被 `pipeline.py` 调用，只有 `tests/test_intent.py:5` 引用；实际路由由模型按 `tools.py:217-227` 提示选择。因此下表的「classify」列是规则层结果，「实际工具」是模型可用的唯一落点。
-
-| # | 话术 | `classify()` | 实际工具 | 判定 | 需要修的路由 |
-| --- | --- | --- | --- | --- | --- |
-| 1 | 跟着我 | follow_player 0.9 | `follow_player` | 正确；独立模式必失败（`199`） | 独立模式改走 move_to/跟随关闭提示 |
-| 2 | 不用跟着我了 | stop_movement 0.95 | `stop` | 正确；后续队列仍执行 | `stop` 清队列 |
-| 3 | 来我这里 | come_to_player 0.85 | `come_to_player` | 正确 | 无 |
-| 4 | 你现在在哪 | observe_self 0.75 | 无工具，仅状态注入 | 可答，但无坐标核对 | 增加 `observe_self` 工具 |
-| 5 | 攻击前面那个苦力怕 | attack_nearest 0.8 | `attack_nearest` | 误：丢失「那个」，不后撤 | 先 `assess_threat`，苦力怕走撤退分支 |
-| 6 | 小心，附近有苦力怕 | assess_threat 0.7 | 无工具，可能被提示引向 `attack_nearest` | 误路由为进攻 | 新增 `assess_threat`，提示改为先评估 |
-| 7 | 把那个金苹果吃了 | eat_food 0.8 | 无工具 | 可能答「好」但不执行 | 新增 `eat_food` |
-| 8 | 天黑了，睡觉吧 | sleep 0.8 | 无工具 | 可能误调 `craft`/`place_block` | 新增 `sleep`，无床时明确说缺 |
-| 9 | 查看我有什么食物 | inventory 0.7 | `inventory` | 正确；返回全部物品 | 增加 `filter` 参数 |
-| 10 | 附近有煤矿吗 | None | 可能 `goto_block`（提示 `222` 引导走位） | 误：查询变移动 | 新增 `locate_block` |
-| 11 | 去砍三块木头 | None | `collect_blocks` | 目标正确，后置不校验 | 增背包增量与掉落拾取 |
-| 12 | 把这块石头挖了 | None | `break_block`，无坐标来源 | 可能编坐标 | 先 `locate_block` 或加「眼前方块」感知 |
-| 13 | 在这里放一块圆石 | None | `place_block`，需 x/y/z | 可能编坐标或放在脚下 | 增加相对坐标 `here` |
-| 14 | 把剑装备上 | None | 无工具，可能误调 `attack_nearest` | 误路由为攻击 | 新增 `equip_item` |
-| 15 | 打那只僵尸 | None | `attack_nearest` | 误：可能打最近的骷髅 | 新增 `attack_target` |
-
-说明：1-9 来自 `tests/test_intent.py:8-21`；10-15 按 P0 技能补的常用说法，仓库内没有对应测试。
-
-## 4. 第一批实现顺序
-
-| 序 | 修复 | 依赖 | 验收场景 | 理由 |
-| --- | --- | --- | --- | --- |
-| 1 | `bridge/skills/manifest.js` + 单一 schema 源；`mine_block` 更名或别名 | 无 | 同一份清单生成 dispatch 与 tool schema；未知参数被拒绝 | 14 个 `case` 与 13 个 schema 手写同步，新增技能必漏一侧 |
-| 2 | 感知三件套：`locate_block`、`locate_entity`、`observe_environment` | 1 | 「附近有煤矿吗」返回坐标与距离且不移动；「有怪吗」返回类型、距离、敌对 | 纯读；解锁「这块/那个/这里」指代，成本最低 |
-| 3 | 动作 deadline 与取消语义：`timeout_s` 生效、`stop` 清队列、迟到结果丢弃 | 1 | 注入 10s 不返回的 `dig`，`stop` 后队列为空，后续动作不执行 | 现在超时后 bridge 仍在跑，下一步会踩旧状态 |
-| 4 | 工具结果回填：`action_finished`/`action_failed` 以 tool 消息进上下文，允许一次改参 | 3 | `collect_blocks` 失败后同回合改调 `goto_block`，不重复原调用 | 现在失败只播报，模型下一轮不知道发生了什么 |
-| 5 | `eat_food` + food 增量校验 | 2、3 | food 14→18，bread -1；无食物时 detail 明说 | 生存链最短板，且现在完全不可编排 |
-| 6 | `approach_target`、`attack_target`、苦力怕后撤复用到 `attack_nearest` | 2 | 16 格僵尸 5s 内接近并击杀；8 格苦力怕先退到 12 格；指定 id 只打该目标 | 当前 `attack_nearest` 不接近，远目标必空挥 |
-| 7 | `collect_blocks` 拾取掉落 + 背包增量校验 | 3、4 | 挖 3 原木后 `oak_log` +3，detail 报实际数量 | 资源循环的入口，掉落 5 分钟消失 |
-| 8 | `craft_item` 材料预检与工作台回收；`equip_item` 统一装备/工具/食物 | 5 | 材料不足时不留工作台；合成后 `crafting_table` 回背包；剑可被点名装备 | 直接决定 S0 成功率 |
-
-工作树已在做的 `observe`、`eat`、`locate_*`、`sleep` 已在 `e1ee85e` 合并，覆盖批次 2、5 的一部分；合并后仍需按上表场景补真实世界验收。
-
-## 5. 未验证与文档漂移
-
-| 项 | 现状 | 证据 |
+| 阶段 | 最终目标 | 常用补给与准备 |
 | --- | --- | --- |
-| 真实 Minecraft 端到端 | 本次未运行；`node --check` 通过 | 审计命令 |
-| bridge 逻辑测试 | 无 JS 单测；`test_bridge` 只验 WebSocket 帧与派发 | `tests/test_bridge.py:104-127` |
-| 测试数量 | 文档已统一为 139；本次实跑 139 | `docs/STATUS.md:28`；`docs/MILESTONE.md:46`；`docs/plans/EVALUATION.md:17` |
-| 路线图交付物 | `scripts/run_stage.py`、`bridge/skills/manifest.js` 不存在 | `docs/plans/INDEPENDENT_RUN_ROADMAP.md:102-107` |
-| 独立模式接线 | `VOXKIN_INDEPENDENT` 只在 bridge 读取，Python 侧零引用 | `bridge:90,1209-1211` |
-| 动作数量 | 文档写 21 个，新增 5 个技能、smelt 与 attack_target 后 `case` 为 21 个 | `bridge:189-420` |
-| 并发改动 | `observe`、`eat`、`locate_block`、`locate_entity`、`sleep` 已在 `e1ee85e` 提交；本表状态仍按 `b602e1d` 基线，这 5 项未逐行重评 | `git show e1ee85e --stat` |
-| 行号基线 | 本表按 `b602e1d`，工作树行号已偏移；核对用 `git show b602e1d:bridge/minecraft_bridge.js` | 同上 |
+| S0 | 工作台、木镐 | 八种主世界原木、木板与木棍 |
+| S1 | 石镐、石剑、熔炉 | 石材、木棍与缺失工具恢复 |
+| S2 | 饥饿值达标、封闭庇护所、室内床；必要时过夜回执 | 食物、同色羊毛或现成床、建材 |
+| S3 | 铁镐、铁剑、盾、空桶 | 成品净需 9 铁锭；找矿、分段下探、燃料与熔炼，也可利用村庄铁和铁傀儡 |
+| S4 | 钻石镐 | 铁镐恢复、深层采矿与补给；附魔台不属于当前验收 |
+| S5 | 烈焰棒 ×12、末影珍珠 ×24，身处主世界 | 水桶、黑曜石、打火石、下界门、堡垒与返回补给 |
+| S6 | 本次末影龙击杀事件，身处主世界 | 弓箭、末影之眼、要塞定位、激活门与返程 |
 
-最大风险：没有真实服务器证据，且超时/取消没有世界侧确认。动作在 Core 侧已判失败时，bridge 仍可能继续执行并推进队列，界面与语音会报告「好了」或「没做成」，世界状态却已改变，后续步骤据此继续。
+阶段已经满足时直接验收；需要采集时才顺路补储备，储备不是额外通关门槛。以下是库存软目标的基线，铁锭与已有木板会折减对应原料需求；血量过低或背包空位不足时不扩大采集量。
+
+| 阶段 | 原木 | 石料 | 铁矿/粗铁 | 煤 | 钻石 | 补给食物数量 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| S0 | 8 | — | — | — | — | 8 |
+| S1/S2 | 12 | 32 | — | — | — | 8 |
+| S3 | 16 | 32 | 24 | 16 | — | 12 |
+| S4 | 16 | 32 | 12 | 16 | 6 | 16 |
+| S5 | 16 | 32 | 8 | 16 | — | 24 |
+| S6 | 16 | 32 | — | 16 | — | 24 |
+
+食物列是补给策略的物品数量目标，不是饥饿值。机会补给受白天、血量、背包空间等条件约束；S6 已开始要塞搜索后不插入新补给绕路。查过的补给地点记入当前目标账本，空箱后继续原路线。
+
+## 技能清单
+
+按清单分类：基础类 13、实用类 9、专精类 45。按执行类型：`sense` 6、`act` 52、`path` 6、`wait` 2、`voice` 1。类型是调度元数据，不表示动作只需一步或不涉及移动。以下说明来自当前清单，详细参数、超时和取消能力请查看对应条目。
+
+### 基础类
+
+| 技能 ID | 类型 | 说明 |
+| --- | --- | --- |
+| `observe` | `sense` | 报告自身状态与周围环境：维度、坐标、朝向、血量、饥饿、时刻、天气、手持物、护甲、背包前 8 项、附近玩家与敌对生物，可额外报告某一种方块的位置。 |
+| `inventory` | `sense` | 列出背包里全部物品及数量。 |
+| `locate_block` | `sense` | 按方块 ID 搜索附近方块，返回候选坐标、距离与垂直差，并指出最近的一个。 |
+| `locate_entity` | `sense` | 搜索附近实体，返回名字、类型、距离与坐标，支持按类型和名字过滤。 |
+| `look_at_player` | `act` | 把视线转向指定玩家。 |
+| `goto` | `path` | 走到指定坐标附近，远距离时分段寻路。 |
+| `goto_block` | `path` | 走到最近的指定方块旁边，不挖掘。 |
+| `follow_player` | `path` | 持续跟随玩家，距离过近时停下等待，距离变远时恢复跟随并小跑。 |
+| `come_to_player` | `path` | 走到玩家当前位置附近一次，走完即结束。 |
+| `stop` | `act` | 停止移动与跟随，并清空排队中的后续动作。 |
+| `eat` | `act` | 吃背包里的食物，饥饿值已满时不吃，不指定物品时自动挑选营养最好的食物。 |
+| `sleep` | `wait` | 走到附近的床上睡觉，睡着或天亮才算成功。 |
+| `chat` | `voice` | 在游戏内聊天频道发送一条消息。 |
+
+### 实用类
+
+| 技能 ID | 类型 | 说明 |
+| --- | --- | --- |
+| `attack_nearest` | `act` | 评估范围内群怪的威胁并自动选择攻击目标；逐次出手重新判断，苦力怕引爆或战力不足时撤退。 |
+| `attack_target` | `act` | 攻击指定实体，可按实体 ID、名字或类型查找，玩家不会被攻击。 |
+| `collect_blocks` | `path` | 在搜索半径内找到方块、走过去、挖掘并捡起掉落物，直到凑够数量。 |
+| `break_block` | `act` | 挖掉一个方块，可以按方块 ID 找最近的，也可以按坐标挖指定位置。 |
+| `place_block` | `act` | 把背包里的方块放在指定坐标，会自动依附周围的固体方块。 |
+| `pickup_items` | `path` | 走到最近的掉落物旁边并捡起它。 |
+| `craft` | `act` | 用背包里的材料合成物品，需要工作台时会自动放置并在结束后回收。 |
+| `smelt` | `wait` | 把矿石或生食放进熔炉熔炼，附近没有熔炉时会用背包里的熔炉，结束后回收。 |
+| `fill_water_bucket` | `act` | 用空桶装取附近静止水源；只有背包水桶实际增加时才报告成功。 |
+
+### 专精类
+
+| 技能 ID | 类型 | 说明 |
+| --- | --- | --- |
+| `explore_mining_site` | `act` | 局部采矿受阻后，避开已尝试区域并实际移动到新的干燥落脚点，以位置变化验收；保留失败落点供后续重规划。 |
+| `activate_end_portal` | `act` | 在要塞里激活末地门：找齐 12 个末地门框架，把背包里的末影之眼逐个放进去，确认末地门出现后走进去；缺眼或框架不齐会报出还差多少。 |
+| `break_crystal` | `act` | 用弓逐个打碎末地水晶：先退到安全距离再射，打碎一个就躲开爆炸并留出安全间隔，避免被连环爆炸。 |
+| `checkpoint_stock` | `act` | 按物资清单把箱子当检查点存放点，逐项存取后回报每种物资最终在箱子还是在背包。 |
+| `collect_blaze_rods` | `act` | 收集烈焰棒：按背包净缺口请求战斗数量，走近掉落物拾取并计数，掉进岩浆先爬出来再捡；附近无目标时只巡查实测堡垒点周围确认安全的有限位置。 |
+| `craft_bed` | `act` | 合成床并水平放置：3 个羊毛加 3 个木板，羊毛不够会提示先养羊，放置后校验那两格确实是床。 |
+| `craft_tool_set` | `act` | 按套装合成工具：先核对基础原料，中间件（木棍、木板）不够就现做出来，最后逐件合成成品。 |
+| `prepare_bow_arrows` | `act` | 准备末影龙战斗用弓和箭：核对线、羽毛、燧石，按库存选择可用木种，必要时采集原木或制作工作台，最终验证背包数量。 |
+| `craft_torch` | `act` | 做火把并按间距成排放好：木棍不够先从木板或原木折出来，放每个火把前都确认脚下有支撑方块。 |
+| `deep_mine` | `act` | 挖深层矿道（目标 y=-54~-59），扫描前方与脚下 3 格躲岩浆，水和岩浆能填埋就填埋、不能就绕行，遇到末影人或恶魂立刻撤退中止。 |
+| `eat_if_hungry` | `act` | 饥饿值低于阈值时自动进食：按熟肉 > 生肉 > 面包 > 其它有 food 值物品的优先级挑食物，吃完核对饥饿值真的上升。 |
+| `equip_armor` | `act` | 检查背包并自动穿上更好的护甲；完成后读取头盔、胸甲、护腿和靴子槽验证实际装备，没有确认到任何已穿护甲时返回失败。 |
+| `equip_shield` | `act` | 把背包里的盾装到副手并举起格挡；背包里没有盾就直接报错。 |
+| `fight_blaze` | `act` | 与烈焰人战斗：保持距离、来袭火球就横移躲开、被烧到就后撤，优先用弓打，没有弓就贴脸砍并用盾挡。 |
+| `fight_dragon` | `act` | 打末影龙：先打碎末地水晶阻止回血，再在龙停到中央祭坛时近战、在空中时用弓射；血量低会进食后撤，躲开龙息与火球，龙死后回报实际剩余血量。 |
+| `find_diamond` | `sense` | 在指定 Y 区间里找钻石矿，diamond_ore 与 deepslate_diamond_ore 都认，返回坐标列表。 |
+| `flee_low_health` | `act` | 低血撤退：血量低于阈值或刚受伤时立刻远离威胁、找掩体、停下追击，并回报血量与位置。 |
+| `hunt_material` | `act` | 有限猎取成年羊、鸡或蜘蛛来收集同色羊毛、羽毛或线；会移动搜索、拾取并核对背包。 |
+| `hunt_animal` | `act` | 狩猎牛、猪、羊等被动生物拿生肉：追到近战距离挥剑，等它掉落肉再走过去捡；血量太低会撤退，天快黑会先提醒回去。 |
+| `hunt_enderman` | `act` | 猎取末影人拿末影珍珠：使用近战攻击，逐轮评估周围威胁并在压力过高时撤退；投射物会被末影人瞬移躲开，结束后核验背包数量。 |
+| `leave_shelter` | `act` | 从封闭庇护所里挖出一格宽、两格高的出口：先找一面外侧是空地的墙，挖掉脚下与头顶两格，再走到墙外并确认已经离开。 |
+| `list_chest` | `sense` | 列出附近箱子的内容摘要，给上层决策用。 |
+| `make_nether_portal` | `act` | 建造并点燃下界门：清出门内 2×3 的空间，摆 10 个黑曜石当门框，用打火石点火并确认门被点燃；材料不够会直接报还差几个黑曜石。 |
+| `make_shelter` | `act` | 在脚下的平地上搭一个四面墙加完整屋顶的全封闭庇护所，没有门洞；材料可以土石与木板混用，搭完逐格验收墙和屋顶，材料不够会报缺什么方块和数量。 |
+| `collect_flint` | `act` | 有限挖掘砂砾并实际收集燧石；按背包燧石数量停下，不把砂砾数量当成燧石产出。 |
+| `collect_obsidian` | `act` | 优先采集现有黑曜石；不足时在主世界将可安全接近的静止岩浆源逐个浇成黑曜石，回收水源后用钻石镐采集并按背包验收。 |
+| `mine_collect` | `act` | 挖指定方块：按目标换工具，挖掉之后等掉落物，走过去真的捡起来，最后核对背包数量。 |
+| `nether_travel` | `act` | 下界坐标换算与过门：主世界与下界按 1:8 互算坐标，enter 走进下界、exit 穿回主世界；结果分别记录实测源门和过门后抵达点。 |
+| `parkour_safe` | `act` | 受控跳跃：只在前方 1 格被挡或有 1 格沟时起跳，带跳跃冷却，落差能直接走就走。 |
+| `raid_fortress` | `act` | 搜索堡垒方块与烈焰人。S5 侦察模式根据已访问位置选择安全落脚点并回报发现，默认模式发现烈焰人后交给战斗技能。 |
+| `return_home` | `act` | 从末地返回主世界：走到中央祭坛的返回传送门并穿过去，确认维度切回主世界；龙还活着、传送门没出现时会说明原因。 |
+| `safe_descend` | `act` | 安全下降到指定的 y 坐标：逐层下降，每层先扫描岩浆与水，保证每层都有落脚方块。 |
+| `safe_travel` | `act` | 带避障的长距离移动：分段走向目标坐标，遇到岩浆、火、仙人掌、深坑绕行，路径失败会重试并说明原因。 |
+| `shear_sheep` | `act` | 用剪刀从成年且未剪过的羊身上剪取同色羊毛；逐只验证背包增量，附近没有羊时仅在白天、安全状态下做最多 48 段、96 格半径的随机游走并沿途观察。 |
+| `sleep_safe` | `act` | 安全过夜：确认夜晚或雷暴，找床（没有就合成一张），睡到天亮并确认已经离开床；床被破坏时重找或重建再试一次。 |
+| `smelt_batch` | `act` | 批量熔炼矿石或生食：先算燃料够不够，再放熔炉、投料、等进度、取出产物，结束后回收熔炉。 |
+| `store_items` | `act` | 把背包里的物资存进附近的箱子，箱子满了会报只放进多少个。 |
+| `strip_mine` | `act` | 挖一条主巷道加若干分支，头顶 2 格与前方 1 格必须通得过，沿途放火把，遇岩浆或水停下并上报坐标。 |
+| `swim_escape` | `act` | 落水脱困：确认脚下和身体是水，朝最近的岸边游过去并上岸。 |
+| `swim_out` | `act` | 落水自救：发现脚下是水就朝最近的岸边游，上岸后回报位置。 |
+| `throw_eye` | `act` | 在主世界投掷末影之眼找要塞：跟踪投掷方向，多次投掷后用射线求交估算坐标并尝试靠近，在到达位置重新搜索末地门框架；只有实际发现框架才报告成功。 |
+| `wait_for_day` | `act` | 在安全位置守到天亮：持续读取游戏时间，确认从夜晚/黄昏进入白天，期间每小时检查一次血量，超时会说明还没有天亮。 |
+| `withdraw_items` | `act` | 从附近的箱子取回物资，可以只取还差的数量，箱子里不够会报只拿到多少个。 |
+| `loot_village` | `act` | 检查当前可见的村庄箱子、闲置床和干草块；只取目标白名单物资，按背包目标量核对增量。 |
+| `harvest_iron_golem` | `act` | 采集一只指定的可见铁傀儡：验证白天、血量、近战武器、三块稳定垫脚方块、平坦安全站位和周围威胁；有界靠近安全站位后搭建并确认三格立柱，蹲伏并在冷却完成且下降时、眼位进入目标实体近战距离后攻击，按背包铁锭增量确认结果。 |
+
+## 调用与结果约定
+
+模型工具由 [`build_tools()`](../src/voxkin/agent/tools.py) 从清单生成；阶段策略通过同一个动作派发链执行。Bridge 内建分支与注册模块由 `ExecutionController` 管理，模块间调用使用 `ctx.runSkill` 复用当前动作上下文。
+
+- `craft.count` 是期望产出数量，不是配方执行次数；`mine_collect.count` 是目标库存。不要假定所有技能的 `count` 都是新增数量，调用前读取参数说明。
+- 动作回执包含 `action_id`、`skill_id`、`status`、`detail`，以及可选的结构化 `data`。协议状态包括 `accepted`、`running`、`succeeded`、`partial`、`failed`、`cancelled`、`disconnected`、`blocked`、`dead`；前两项不能作为完成回执。
+- 技能成功只表示该动作的验收满足。阶段监督器仍用新鲜观察核对阶段条件；`partial` 不自动推进完整阶段。
+- 取消需释放移动、跳跃、潜行、挖掘和已打开窗口等资源；结果未知的动作必须先对账，不能把断线当作可直接重放的失败。
+- `stop` 停止桥接动作；活动阶段任务的停止另由 Core 任务管理处理。任务恢复保留原 deadline、动作计数和预算。
+
+## 验证与实机状态
+
+2026-10-28 最新 Windows 离线结果：Python **507 passed**，Bridge **273 passed**。Python 默认断言重写在收集阶段出现原生访问违规，随后使用 `--assert=plain` 完整通过，正常断言仍执行。世界、动作、容器与跳跃状态使用确定性测试替身，详见 [测试记录](evidence/RESOURCE_VILLAGE_GOLEM_20261028.md)。
+
+最新 Terra Windows 隔离新世界连跑中，S0/S1/S2 分别在 63.1/140.3/109.7 秒通过；S2 只完成白天准备。S3 遇到低氧避险后仍溺水死亡，重生后重建物资，最终 360.4 秒超时；S4 未运行。新增村庄补给和铁傀儡技能尚无实机通过记录。本轮没有 Bridge 重启，但不能证明历史原生崩溃已修复。见 [Terra 实测](evidence/S0_S4_TERRA_WINDOWS_20261028.md)与 [STATUS](STATUS.md)。
+
+开始实机前须遵守 [AGENTS.md](../AGENTS.md)，先读取本地 `work/refactor_validation_20261027/active_progress.json`。有待清理运行时不得再开一轮；运行阻塞且没有新环境恢复证据时，不重复原失败条件。技能测试不要通过临时修改标准阶段验收或重置旧任务预算完成。
