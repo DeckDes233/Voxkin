@@ -203,6 +203,14 @@ export function magmaCubeAboveCeiling(bot, entity, feet = bot.entity?.position) 
   return entity?.name === 'magma_cube' && twoSolidLayers(bot, entity.position, feet);
 }
 
+export function creeperBehindRock(bot, entity) {
+  if (entity?.name !== 'creeper' || creeperIsFusing(entity, bot.registry)) return false;
+  const feet = bot.entity?.position;
+  const mob = entity.position;
+  if (!feet || !mob || Math.abs(feet.y - mob.y) < 6 || Math.hypot(feet.x - mob.x, feet.z - mob.z) > 6) return false;
+  return feet.y > mob.y ? twoSolidLayers(bot, feet, mob, 1) : twoSolidLayers(bot, mob, feet, 1);
+}
+
 function fullCollisionBlock(block) {
   return block?.shapes?.some(shape => shape.length === 6 && shape.every((v, i) => v === (i < 3 ? 0 : 1)));
 }
@@ -236,16 +244,20 @@ export function magmaCubeBehindCover(bot, entity, feet = bot.entity?.position) {
   return false;
 }
 
-function twoSolidLayers(bot, origin, target) {
+function twoSolidLayers(bot, origin, target, radius = 0) {
   if (!origin || !target || origin.y - target.y < 6) return false;
   const depth = origin.y - target.y;
   let layers = 0;
   for (let y = Math.floor(origin.y) - 1; y > target.y + 2; y--) {
     const fraction = (origin.y - y - 0.5) / depth;
     const point = origin.offset((target.x - origin.x) * fraction, y + 0.5 - origin.y, (target.z - origin.z) * fraction);
-    const block = bot.blockAt(point.floored(), false);
-    if (!block) return false;
-    const solid = fullCollisionBlock(block);
+    const center = point.floored();
+    let solid = true;
+    for (let x = -radius; x <= radius && solid; x++) for (let z = -radius; z <= radius && solid; z++) {
+      const block = bot.blockAt(center.offset(x, 0, z), false);
+      if (!block) return false;
+      solid = fullCollisionBlock(block);
+    }
     layers = solid ? layers + 1 : 0;
     if (layers >= 2) return true;
   }

@@ -41,6 +41,7 @@ import {
   bestMeleeWeapon,
   chooseRetreatDestination,
   combatEquipment,
+  creeperBehindRock,
   evaluateEncounterStep,
   HOSTILE_MOBS,
   isAutomaticCombatTarget,
@@ -2203,10 +2204,14 @@ function nearbyPlayers(radius, limit = 4) {
     .slice(0, limit);
 }
 
+function hostileBehindCover(entity, emergencyHunt = executor.active?.token?.seekingEmergencyFood) {
+  return magmaCubeBehindCover(bot, entity) || creeperBehindRock(bot, entity) || (emergencyHunt && zombieBehindFloor(bot, entity));
+}
+
 function nearbyHostiles(radius, limit = 4) {
   return assessCombatEncounter({
     entities: bot.entities,
-    behindFloor: entity => magmaCubeBehindCover(bot, entity) || (executor.active?.token?.seekingEmergencyFood && zombieBehindFloor(bot, entity)),
+    behindFloor: hostileBehindCover,
     origin: bot.entity.position,
     registry: bot.registry,
     health: bot.health,
@@ -2675,7 +2680,7 @@ async function attackEntity(target, { allowTargetSwitch = false, encounterRadius
   const updateEncounter = async () => {
     const decision = await evaluateEncounterStep({
       entities: bot.entities,
-      behindFloor: entity => magmaCubeBehindCover(bot, entity) || (emergencyHunt && zombieBehindFloor(bot, entity)),
+      behindFloor: entity => hostileBehindCover(entity, emergencyHunt),
       origin: bot.entity.position,
       registry: bot.registry,
       health: bot.health,
@@ -3222,7 +3227,7 @@ function resolvePlayer(name) {
 function findHostile(range) {
   return assessCombatEncounter({
     entities: bot.entities,
-    behindFloor: entity => magmaCubeBehindCover(bot, entity) || (executor.active?.token?.seekingEmergencyFood && zombieBehindFloor(bot, entity)),
+    behindFloor: hostileBehindCover,
     origin: bot.entity.position,
     registry: bot.registry,
     health: bot.health,

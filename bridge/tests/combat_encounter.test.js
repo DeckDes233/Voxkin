@@ -7,6 +7,7 @@ import {
   bestMeleeWeapon,
   chooseRetreatDestination,
   combatEquipment,
+  creeperBehindRock,
   evaluateEncounterStep,
   isAutomaticCombatTarget,
   retreatSafetyScore,
@@ -28,6 +29,23 @@ function makeEntity(id, name, x, options = {}) {
 }
 
 const origin = { x: 0, y: 64, z: 0 };
+
+test('两层完整岩石隔开的苦力怕在洞顶或脚下时可继续采矿', () => {
+  const low = new Vec3(-0.44, 68, 198.5), high = new Vec3(1.51, 75, 196.21);
+  const solid = {shapes: [[0, 0, 0, 1, 1, 1]]};
+  const bot = {entity: {position: low}, blockAt: p => [71, 72].includes(p.y) ? solid : {shapes: []}};
+  const mob = {name: 'creeper', position: high};
+  assert.equal(creeperBehindRock(bot, mob), true);
+  bot.entity.position = high;
+  mob.position = low;
+  assert.equal(creeperBehindRock(bot, mob), true);
+  assert.equal(creeperBehindRock(bot, {...mob, isIgnited: true}), false);
+  assert.equal(creeperBehindRock(bot, {...mob, position: high.offset(0, -3, 0)}), false);
+  bot.blockAt = p => [71, 72].includes(p.y) && p.x !== 0 ? solid : {shapes: []};
+  assert.equal(creeperBehindRock(bot, mob), false);
+  bot.blockAt = () => null;
+  assert.equal(creeperBehindRock(bot, mob), false);
+});
 
 test('上层岩浆怪须隔两层实心顶板才能排除为近战威胁', () => {
   const bot = {entity: {position: new Vec3(-32, 83, 86)}, blockAt: p => ({shapes: p.y === 86 || p.y === 87 ? [[0,0,0,1,1,1]] : []})};
