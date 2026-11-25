@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { Vec3 } from 'vec3';
 
 import {
   assessCombatEncounter,
@@ -9,6 +10,9 @@ import {
   evaluateEncounterStep,
   isAutomaticCombatTarget,
   retreatSafetyScore,
+  zombieBehindFloor,
+  magmaCubeAboveCeiling,
+  magmaCubeBehindCover,
 } from '../combat_encounter.js';
 
 function makeEntity(id, name, x, options = {}) {
@@ -24,6 +28,43 @@ function makeEntity(id, name, x, options = {}) {
 }
 
 const origin = { x: 0, y: 64, z: 0 };
+
+test('上层岩浆怪须隔两层实心顶板才能排除为近战威胁', () => {
+  const bot = {entity: {position: new Vec3(-32, 83, 86)}, blockAt: p => ({shapes: p.y === 86 || p.y === 87 ? [[0,0,0,1,1,1]] : []})};
+  const mob = {name: 'magma_cube', position: new Vec3(-29, 90, 83)};
+  assert.equal(magmaCubeAboveCeiling(bot, mob), true);
+  bot.blockAt = p => ({shapes: p.y === 87 ? [[0,0,0,1,1,1]] : []});
+  assert.equal(magmaCubeAboveCeiling(bot, mob), false);
+  assert.equal(magmaCubeAboveCeiling(bot, {...mob, position: new Vec3(-29, 84, 83)}), false);
+});
+
+test('地下斜对面的岩浆怪由实测厚墙隔开，薄墙、缺口和贴身仍有威胁', () => {
+  const feet = new Vec3(-4.5, 58, -129.46);
+  const mob = {name: 'magma_cube', position: new Vec3(0.52, 55, -133.52)};
+  const solid = {shapes: [[0,0,0,1,1,1]]}, air = {shapes: []};
+  const wall = p => [-2,-1].includes(p.x) && p.z >= -133 && p.z <= -131 && p.y >= 56 && p.y <= 59;
+  const bot = {entity: {position: feet}, blockAt: p => wall(p) ? solid : air};
+  assert.equal(magmaCubeBehindCover(bot, mob), true);
+  bot.blockAt = p => p.x === -2 && wall(p) ? solid : air;
+  assert.equal(magmaCubeBehindCover(bot, mob), false);
+  bot.blockAt = p => p.x === -2 && p.z === -132 && p.y === 58 ? null : wall(p) ? solid : air;
+  assert.equal(magmaCubeBehindCover(bot, mob), false);
+  assert.equal(magmaCubeBehindCover(bot, {...mob, position: feet.offset(1, 0, 0)}), false);
+});
+
+test('emergency foraging discounts a zombie only across two confirmed solid layers', () => {
+  const ground = new Set([68, 67]);
+  const bot = {entity: {position: new Vec3(39, 70, 90)}, blockAt: p => ({shapes: ground.has(p.y) ? [[0,0,0,1,1,1]] : []})};
+  const mob = {...makeEntity(1, 'zombie', 39), position: new Vec3(42, 59, 90)};
+  const args = {entities: [mob], origin: bot.entity.position, health: 3, behindFloor: e => zombieBehindFloor(bot, e)};
+  assert.equal(assessCombatEncounter(args).threats.length, 0);
+  assert.equal(assessCombatEncounter({...args, currentTarget: mob}).threats.length, 1);
+  assert.equal(zombieBehindFloor(bot, {...mob, name: 'warden'}), false);
+  ground.delete(67);
+  assert.equal(assessCombatEncounter(args).threats.length, 1);
+  bot.blockAt = () => null;
+  assert.equal(zombieBehindFloor(bot, mob), false);
+});
 
 test('combat encounter switches to a visibly higher-threat hostile instead of retaining the nearest target', async () => {
   const zombie = makeEntity(1, 'zombie', 7);

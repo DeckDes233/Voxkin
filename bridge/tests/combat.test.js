@@ -483,6 +483,56 @@ test('缺粮时步行寻找附近的猎物，拾取后恢复寻路设置', async
   assert.ok(movements.allowSprinting && movements.allowParkour && movements.canDig);
 });
 
+test('最近的猎物连续无法接近时，改追同一片区域的其他猎物', async () => {
+  const {ctx, bot, inventory} = makeAnimalSearchContext();
+  const pig = id => ({id, name: 'pig', isValid: true, position: makePosition(id, 1, 0)});
+  const near = pig(7), far = pig(12);
+  bot.entities = {7: near, 12: far};
+  let failedApproaches = 0;
+  ctx.approach = async target => {
+    if (target === near) assert.ok(++failedApproaches <= 3);
+    else bot.entity.position.x = target.position.x;
+  };
+  const result = await skills.hunt_animal.handler({count: 1}, ctx);
+  assert.equal(result.status, 'succeeded');
+  assert.ok(inventory.porkchop && near.isValid && !far.isValid);
+});
+
+test('nearby-only recovery stops without wandering and restores movement restrictions', async () => {
+  const {ctx, walked} = makeAnimalSearchContext({targetAtStep: 1});
+  ctx.bot.health = 3;
+  const mov = ctx.bot.pathfinder.movements;
+  const exclusions = [];
+  Object.assign(mov, {maxDropDown: 4, infiniteLiquidDropdownDistance: true, exclusionAreasStep: exclusions});
+  await assert.rejects(skills.hunt_animal.handler({nearby_only: true, min_health: 2}, ctx), /附近没有可从干地接近的猎物/);
+  assert.deepEqual(walked, []);
+  assert.equal(mov.maxDropDown, 4);
+  assert.equal(mov.infiniteLiquidDropdownDistance, true);
+  assert.equal(mov.exclusionAreasStep, exclusions);
+});
+
+test('普通白天狩猎也排除水路，并在寻猎结束后恢复原设置', async () => {
+  const {ctx} = makeAnimalSearchContext({targetAtStep: 1});
+  const mov = ctx.bot.pathfinder.movements;
+  const previous = [];
+  Object.assign(mov, {exclusionAreasStep: previous, maxDropDown: 4, infiniteLiquidDropdownDistance: true});
+  let checked = false;
+  ctx.onWalk = () => {
+    const blockAt = ctx.bot.blockAt;
+    try {
+      ctx.bot.blockAt = () => ({name: 'water', boundingBox: 'empty'});
+      assert.ok(mov.exclusionAreasStep.at(-1)({position: new Vec3(0,63,0)}) >= 100);
+      assert.equal(mov.infiniteLiquidDropdownDistance, false);
+      assert.equal(mov.maxDropDown, 1);
+    } finally { ctx.bot.blockAt = blockAt; }
+    checked = true;
+    return 'reached';
+  };
+  await skills.hunt_animal.handler({count: 1}, ctx);
+  assert.ok(checked);
+  assert.equal(mov.exclusionAreasStep, previous);
+});
+
 test('hunt_animal exits after route cancellation even if an animal appears at the waypoint', async () => {
   const { ctx, walked } = makeAnimalSearchContext({ targetAtStep: 1 });
   let approaches = 0;

@@ -51,6 +51,7 @@ const BLOCK_LABELS = {
 // 填埋水坑时优先用背包里已有的方块。
 const FILL_BLOCK_ORDER = [
   'cobblestone',
+  'cobbled_deepslate',
   'dirt',
   'stone',
   'deepslate',
@@ -674,6 +675,17 @@ export const skills = {
               );
             }
           } else if (landing === 'open') {
+            if (['the_nether', 'minecraft:the_nether'].includes(bot.game?.dimension)) {
+              if (!blockAt(ctx, origin.x, landingY, origin.z)) throw new Error('下层方块尚未加载，保留脚下方块');
+              let bed = null;
+              for (let depth = 1; depth <= 20; depth++) {
+                const block = blockAt(ctx, origin.x, landingY - depth, origin.z);
+                if (!block || !['air', 'cave_air', 'void_air'].includes(block.name)) { bed = block; break; }
+              }
+              if (classifyFooting(bed) !== 'solid' || ['magma_block', 'campfire', 'soul_campfire', 'gravel', 'sand'].includes(bed.name)) {
+                throw new Error('玄武岩台地下方没有已观察到的安全实地，保留脚下方块');
+              }
+            }
             // 没有落脚方块：先垫一块再挖。
             let done = false;
             if (allowFill) {

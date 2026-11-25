@@ -9,8 +9,8 @@
 //   如果 ctx 没有 craftItem，就只能在返回里说明缺什么。
 
 import { findBlocksWithExploration, resourceCandidates } from '../resource_search.js';
-import { dryMiningFooting, miningRouteExclusion } from '../dry_footing.js';
-import { waterLike } from '../water_escape.js';
+import { besideDrop, dryMiningFooting, exposedMagmaCube, followDryGround, followNetherPath, miningRouteExclusion, netherRouteExclusion, reachableDryGround, reachableNetherGround, walkNetherCell } from '../dry_footing.js';
+import { surfaceSkyLight, waterLike } from '../water_escape.js';
 import { scanSurfaceLogs } from '../surface_wood_scan.js';
 import { setImmediate as yieldToGame } from 'node:timers/promises';
 
@@ -305,7 +305,9 @@ function checkNearbyHostiles(ctx) {
   const hostiles = ctx.nearbyHostiles(MINE_HOSTILE_RADIUS);
   if (hostiles.length > 0) {
     const names = hostiles.map((hostile) => hostile.name).join('、');
-    throw new Error(`附近 ${MINE_HOSTILE_RADIUS} 格内有敌对生物（${names}），停止采矿`);
+    const error = new Error(`附近 ${MINE_HOSTILE_RADIUS} 格内有敌对生物（${names}），停止采矿`);
+    error.data = {phase: 'safe_stop', reason: 'nearby_hostiles', hostiles};
+    throw error;
   }
 }
 
@@ -749,7 +751,8 @@ async function digAt(ctx, position, options = {}) {
     return { ok: false, reason: 'tool', message: `换工具失败：${error.message}` };
   }
   checkInterrupted(ctx);
-  if (typeof block.canHarvest === 'function' && !block.canHarvest(bot.heldItem?.type ?? null)) {
+  const passageStone = options.clearByHand && ['stone', 'cobblestone', 'andesite', 'diorite', 'granite', 'tuff', 'deepslate', 'cobbled_deepslate'].includes(block.name);
+  if (!passageStone && typeof block.canHarvest === 'function' && !block.canHarvest(bot.heldItem?.type ?? null)) {
     return { ok: false, reason: 'tool', block, message: '当前工具不能采得该方块的掉落物' };
   }
   if (typeof bot.canDigBlock === 'function' && !bot.canDigBlock(block)) {
@@ -849,6 +852,9 @@ function dropFailureState(ctx, position) {
 // 往前走一步。返回 'reached' | 'unreachable' | 'stopped' | 'cancelled'。
 async function stepForward(ctx, position) {
   checkInterrupted(ctx);
+  if (['the_nether', 'minecraft:the_nether'].includes(ctx.bot.game?.dimension) && ctx.bot.setControlState && ctx.bot.look) {
+    return walkNetherCell(ctx, toVec3(ctx.bot, position));
+  }
   if (typeof ctx.walkOnce !== 'function') return 'unreachable';
   const outcome = await ctx.walkOnce(position.x, position.y, position.z, 0, 8000);
   checkInterrupted(ctx);
@@ -858,10 +864,38 @@ async function stepForward(ctx, position) {
 
 // 往前挖一格：先确认前方不是岩浆/水，再把前方那一格和它的头顶两格挖开，
 // 确认走廊安全（头顶 2 格与前方 1 格都是空气）之后才走进去。
+function supportedNetherPassage(bot, position, front) {
+  const next = toVec3(bot, front);
+  return bot.blockAt(next.offset(0, -1, 0))?.boundingBox === 'block' && !netherRouteExclusion(bot, {position: next})
+    && !besideDrop(bot, next) && [position, front].every(base =>
+      [0, 1, 2].every(y => safeStairOpening(bot, offsetPos(base, 0, y, 0))));
+}
+
+export function observeNetherPassages(bot) {
+  const origin = floorPos(bot.entity.position);
+  const lengths = {};
+  const cubes = Object.values(bot.entities || {}).filter(e => e?.name === 'magma_cube');
+  for (const heading of CARDINAL_HEADINGS) {
+    let from = origin;
+    for (let step = 1; step <= 4; step++) {
+      const next = offsetPos(from, heading.x, 0, heading.z);
+      if (!supportedNetherPassage(bot, from, next) || exposedMagmaCube(bot, toVec3(bot, next), cubes)) break;
+      lengths[heading.name] = step;
+      from = next;
+    }
+  }
+  return {origin, lengths};
+}
+
 async function digForward(ctx, position, heading, state, options = {}) {
   const bot = ctx.bot;
   const front = offsetPos(position, heading.x, 0, heading.z);
   const frontBlock = blockAtPos(bot, front);
+  if (['the_nether', 'minecraft:the_nether'].includes(bot.game?.dimension)) {
+    if (!supportedNetherPassage(bot, position, front)) {
+      return {ok: false, reason: 'hazard', position: front, message: '下界前方缺少安全支撑或开挖会暴露危险'};
+    }
+  }
   if (isHazardBlock(frontBlock)) {
     return {
       ok: false,
@@ -895,12 +929,14 @@ async function digForward(ctx, position, heading, state, options = {}) {
       state.mined += 1;
     }
   }
-  const dug = await digAt(ctx, front);
-  checkInterrupted(ctx);
-  if (!dug.ok) {
-    return { ok: false, reason: dug.reason, position: front, message: dug.message };
+  if (!isPassableBlock(frontBlock)) {
+    const dug = await digAt(ctx, front);
+    checkInterrupted(ctx);
+    if (!dug.ok) {
+      return { ok: false, reason: dug.reason, position: front, message: dug.message };
+    }
+    state.mined += 1;
   }
-  state.mined += 1;
   // 等方块更新同步到客户端再寻路。
   await ctx.sleep(250);
   checkInterrupted(ctx);
@@ -992,7 +1028,8 @@ async function placeTorch(ctx, cell, state, notes) {
 // 沿有支撑的阶梯下降；不跨空腔、流体或未加载区块。
 async function digShaftDown(ctx, depth, state, lowHealth = LOW_HEALTH, targetY = null) {
   const bot = ctx.bot;
-  const preferred = directionFromYaw(bot.entity.yaw) || CARDINAL_HEADINGS[0];
+  let preferred = directionFromYaw(bot.entity.yaw) || CARDINAL_HEADINGS[0];
+  const triedStairs = new Set();
   for (let step = 0; step < depth; step += 1) {
     requireConnected(ctx);
     checkHealth(ctx, lowHealth);
@@ -1036,6 +1073,12 @@ async function digShaftDown(ctx, depth, state, lowHealth = LOW_HEALTH, targetY =
       if (isPassableBlock(floor)) {
         failures.push(`${formatPosition(floorPosition)} 没有实心支撑`);
         candidate.reason = 'unsupported';
+        candidateEvidence.push(candidate);
+        continue;
+      }
+      if ([footPosition, headPosition].some(p => !isPassableBlock(blockAtPos(bot, p)) && !safeStairOpening(bot, p))) {
+        failures.push(`${formatPosition(footPosition)} 开口可能引入流体或落沙`);
+        candidate.reason = 'unstable_opening';
         candidateEvidence.push(candidate);
         continue;
       }
@@ -1090,6 +1133,32 @@ async function digShaftDown(ctx, depth, state, lowHealth = LOW_HEALTH, targetY =
       break;
     }
     if (!descended) {
+      if (['the_nether', 'minecraft:the_nether'].includes(bot.game?.dimension) && triedStairs.size < 3
+          && candidateEvidence.length === 4 && candidateEvidence.every(e => e.reason === 'unsupported')) {
+        const {here, points, parents} = await reachableNetherGround(ctx, 200, 16);
+        triedStairs.add(here.toString());
+        let approach;
+        for (const p of points) {
+          if (p.y !== here.y || triedStairs.has(p.toString())) continue;
+          const heading = CARDINAL_HEADINGS.find(h => [1, 2, 3].every(d => {
+            const next = p.offset(h.x * d, -d, h.z * d);
+            const ground = bot.blockAt(next.offset(0, -1, 0));
+            return ground?.boundingBox === 'block' && !isHazardBlock(ground)
+              && !netherRouteExclusion(bot, {position: next}) && !besideDrop(bot, next)
+              && safeStairOpening(bot, next) && safeStairOpening(bot, next.offset(0, 1, 0));
+          }));
+          if (heading) { approach = {p, heading}; break; }
+        }
+        if (approach && triedStairs.size < 3) {
+          triedStairs.add(approach.p.toString());
+          if (await followNetherPath(ctx, parents, approach.p) === 'reached') {
+            preferred = approach.heading;
+            step--;
+            continue;
+          }
+          checkInterrupted(ctx);
+        }
+      }
       const error = new Error(
         `没有安全的阶梯落点，已停止下探（当前 ${formatPosition(feet)}${failures.length ? `；${failures.join('；')}` : ''}）`,
       );
@@ -1172,7 +1241,7 @@ function scanOre(ctx, name, radius = 8) {
 function surfaceFooting(bot, column) {
   for (const dy of SURFACE_HEIGHT_OFFSETS) {
     const feet = column.offset(0, dy, 0);
-    if (bot.blockAt(feet, false)?.skyLight > 0 && dryMiningFooting(bot, feet)) return feet;
+    if (dryMiningFooting(bot, feet) && surfaceSkyLight(bot, feet) > 0) return feet;
   }
   return null;
 }
@@ -1282,7 +1351,25 @@ async function walkToSurfaceLog(target, ctx) {
         break;
       }
     }
-    if (!advanced) break;
+    if (!advanced) {
+      const ground = await reachableDryGround(ctx, 1800, 28);
+      let closest, remaining = horizontal(bot.entity.position) - 4;
+      for (const point of ground.points) {
+        const d = horizontal(point);
+        if (d < remaining && surfaceSkyLight(bot, point) > 0) {
+          closest = point;
+          remaining = d;
+        }
+      }
+      if (!closest) break;
+      const outcome = await followDryGround(ctx, ground.parents, closest, () => {
+        checkInterrupted(ctx);
+        checkHealth(ctx);
+        checkNearbyHostiles(ctx);
+      });
+      if (outcome === 'cancelled' || outcome === 'stopped') return outcome;
+      if (horizontal(bot.entity.position) > distance - 4) break;
+    }
   }
   checkInterrupted(ctx);
   checkHealth(ctx);
@@ -1301,10 +1388,62 @@ async function approachSurfaceLog(target, ctx, path) {
       checkHealth(ctx);
       checkNearbyHostiles(ctx);
       const outcome = await ctx.walkOnce(point.x, point.y, point.z, 1, 12000);
-      if (outcome !== 'reached') return outcome;
+      if (outcome === 'cancelled' || outcome === 'stopped') return outcome;
+      if (outcome !== 'reached') break;
     }
     return walkToSurfaceLog(target, ctx);
   }, { surfaceOnly: true });
+}
+
+// 近处矿脉从可见的岩面逐格开短通道。仅清普通岩石，保留脚下支撑和挡水顶板。
+async function approachNearbyOre(ctx, target) {
+  const bot = ctx.bot;
+  const ordinary = new Set(['stone', 'deepslate', 'diorite', 'granite', 'andesite', 'tuff', 'dirt', 'cobblestone', 'cobbled_deepslate']);
+  const safe = p => {
+    const block = bot.blockAt(p);
+    return block && !waterLike(block) && !isHazardBlock(block) &&
+      (isPassableBlock(block) || ordinary.has(block.name) && safeStairOpening(bot, p));
+  };
+  const center = target.offset(0.5, 0.5, 0.5);
+  for (let step = 0; step < 18; step++) {
+    checkInterrupted(ctx);
+    checkHealth(ctx);
+    checkNearbyHostiles(ctx);
+    const actual = bot.entity.position, feet = actual.floored();
+    const eye = actual.offset(0, bot.entity.eyeHeight ?? 1.62, 0);
+    const ray = center.minus(eye), length = ray.norm();
+    if (length <= MINE_REACH) {
+      const face = bot.world.raycast(eye, ray.scaled(1 / length), length + 0.1);
+      if (face?.position.equals(target)) return 'reached';
+      if (face && !face.position.equals(feet.offset(0, -1, 0)) && ordinary.has(face.name) && safe(face.position)) {
+        if (!(await digAt(ctx, face.position)).ok) return 'unreachable';
+        continue;
+      }
+    }
+    const options = [];
+    for (const heading of CARDINAL_HEADINGS) {
+      for (const rise of [0, 1, -1]) {
+        const next = feet.offset(heading.x, rise, heading.z);
+        const distance = next.offset(0.5, 1.5, 0.5).distanceTo(center);
+        if (distance >= feet.offset(0.5, 1.5, 0.5).distanceTo(center)) continue;
+        const floor = bot.blockAt(next.offset(0, -1, 0));
+        if (floor?.boundingBox !== 'block' || waterLike(floor) || /magma|campfire|cactus/.test(floor.name)) continue;
+        const cells = [next.offset(0, 1, 0), next];
+        if (rise > 0) cells.unshift(feet.offset(0, 2, 0));
+        if (rise < 0) cells.unshift(next.offset(0, 2, 0));
+        if (cells.every(safe)) options.push({next, cells, distance});
+      }
+    }
+    const route = options.sort((a, b) => a.distance - b.distance)[0];
+    if (!route) return 'unreachable';
+    for (const p of route.cells) {
+      if (!safe(p)) return 'unreachable';
+      if (!isPassableBlock(bot.blockAt(p)) && !(await digAt(ctx, p)).ok) return 'unreachable';
+    }
+    if (!dryMiningFooting(bot, route.next) || await stepForward(ctx, route.next) !== 'reached'
+      || !bot.entity.position.floored().equals(route.next)) return 'unreachable';
+  }
+  return 'unreachable';
 }
 
 async function withDryMiningMovement(ctx, action, { surfaceOnly = false } = {}) {
@@ -1347,7 +1486,9 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
   if (!Number.isInteger(minimum) || minimum < 1 || minimum > want) throw new Error('minimum_count 必须是 1 到 count 的整数');
   const avoided = Array.isArray(args.avoid_positions) ? args.avoid_positions : [];
   if (avoided.some(p => !p || !['x', 'y', 'z'].every(axis => Number.isFinite(p[axis])))) throw new Error('avoid_positions 必须是有效坐标列表');
-  const range = clampInt(args.range, 32, 8, blockName === 'wood_log' ? 128 : 64);
+  const localVein = args.local_vein === true;
+  if (localVein && !/(?:coal|iron|diamond)_ore$/.test(blockName)) throw new Error('近矿短通道只支持煤、铁和钻石矿');
+  const range = localVein ? clampInt(args.range, 12, 8, 16) : clampInt(args.range, 32, 8, blockName === 'wood_log' ? 128 : 64);
   const oreBase = blockName.replace(/^deepslate_/, '');
   const family = blockName === 'wood_log' ? OVERWORLD_LOGS
     : ['iron_ore', 'coal_ore', 'diamond_ore'].includes(oreBase) ? [oreBase, `deepslate_${oreBase}`]
@@ -1387,7 +1528,7 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
   const surfaceLog = (position) => position.y >= startY - 16 && position.y <= startY + 32 &&
     !failedTrunks.has(`${position.x},${position.z}`) &&
     CARDINAL_HEADINGS.some(({ x, z }) =>
-      (bot.blockAt(position.offset(x, 0, z), false)?.skyLight ?? 0) > 0);
+      surfaceSkyLight(bot, position.offset(x, 0, z)) > 0);
   const scan = async (excludedCount) => {
     const nearby = withinReach();
     const count = avoided.length ? 512 : Math.max(need * 4, surfaceWood && !nearby ? 128 : 8) + excludedCount;
@@ -1419,7 +1560,7 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
     })[0];
   };
   // 地表补木由阶段规划扩大搜索半径并核对换区。空扫描时保留原点，让下一轮复用已加载地形。
-  for await (const position of resourceCandidates(ctx, ids, range, Math.max(need * 4, 8), scan, chooseCandidate, () => knownBlocksOnly || surfaceWood || withinReach())) {
+  for await (const position of resourceCandidates(ctx, ids, range, Math.max(need * 4, 8), scan, chooseCandidate, () => localVein || knownBlocksOnly || surfaceWood || withinReach())) {
     if (countOwned() - owned >= need) break;
     requireConnected(ctx);
     checkHealth(ctx);
@@ -1449,9 +1590,19 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
       }
     }
     const distance = surfaceWood ? woodReach(bot, position) : distanceBetween(bot.entity.position, position);
-    if (distance > MINE_REACH) {
+    const shortMine = (localVein || /(?:iron|diamond)_ore$/.test(block.name)) && distance <= 16 && !withinReach()
+      && bot.world?.raycast && typeof ctx.walkOnce === 'function' && dryMiningFooting(bot, bot.entity.position);
+    if (localVein && !shortMine && !withinReach()) continue;
+    if (shortMine || distance > MINE_REACH) {
       if (withinReach()) continue;
-      const outcome = surfaceWood ? await approachSurfaceLog(position, ctx, surfacePaths.get(position)) : await ctx.travelToBlock(position, 30000);
+      let outcome;
+      if (shortMine) {
+        outcome = await withDryMiningMovement(ctx, () => approachNearbyOre(ctx, position), {surfaceOnly: true});
+      } else if (surfaceWood) {
+        outcome = await approachSurfaceLog(position, ctx, surfacePaths.get(position));
+      } else {
+        outcome = await ctx.travelToBlock(position, 30000);
+      }
       checkInterrupted(ctx);
       if (outcome === 'cancelled' || outcome === 'stopped') throw new Error('采集被取消：收到新的指令或连接断开');
       if (outcome === 'low_health') throw new Error(`血量不足，撤退中止采集（血量 ${bot.health}）`);
@@ -1464,6 +1615,10 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
     checkHealth(ctx);
     checkNearbyHostiles(ctx);
     const feet = floorPos(bot.entity.position);
+    if ((localVein || /(?:iron|diamond)_ore$/.test(block.name)) && !safeStairOpening(bot, position)) {
+      failures.push(`${formatPosition(position)} 邻接流体、未知空间或不稳定顶板，保留矿壁`);
+      continue;
+    }
     if (feet.x === position.x && feet.z === position.z && feet.y - 1 === position.y) {
       const below = blockAtPos(bot, offsetPos(position, 0, -1, 0));
       if (!below || below.boundingBox !== 'block' || isHazardBlock(below)) {
@@ -1533,7 +1688,43 @@ function safeStairOpening(bot, position) {
   });
 }
 
-async function climbMiningStairs(ctx, count, preferred) {
+export async function leaveCoveredMiningSite(ctx, threat, origin, minimum, attempted) {
+  const bot = ctx.bot;
+  const danger = threat.position.clone();
+  const initialHealth = bot.health;
+  const distance = (a, b) => Math.hypot(a.x - b.x, a.z - b.z);
+  for (let i = 0; i < minimum + 8; i++) {
+    checkInterrupted(ctx);
+    const actual = bot.entity.position;
+    if (distance(actual, origin) >= minimum && !ctx.nearbyHostiles(10).length) return;
+    const currentThreat = ctx.findHostile(10);
+    const source = currentThreat?.position || danger;
+    const feet = actual.floored();
+    const candidates = CARDINAL_HEADINGS.map(h => feet.offset(h.x, 0, h.z))
+      .filter(p => distance(p, source) > distance(feet, source) && distance(p, origin.floored()) > distance(feet, origin.floored()))
+      .sort((a, b) => distance(b, source) - distance(a, source));
+    let moved = false;
+    for (const next of candidates) {
+      const floor = bot.blockAt(next.offset(0, -1, 0));
+      const cells = [next.offset(0, 1, 0), next];
+      if (floor?.boundingBox !== 'block' || waterLike(floor) || isHazardBlock(floor) || !cells.every(p => safeStairOpening(bot, p))) continue;
+      attempted.push({x: next.x, y: next.y, z: next.z});
+      for (const p of cells) {
+        checkInterrupted(ctx);
+        if (bot.health < initialHealth || bot.health <= 10) throw new Error('开撤离通道时受伤，转入生存恢复');
+        if (!safeStairOpening(bot, p)) break;
+        if (!isPassableBlock(bot.blockAt(p)) && !(await digAt(ctx, p, {clearByHand: true})).ok) break;
+      }
+      if (!dryMiningFooting(bot, next)) continue;
+      if (await stepForward(ctx, next) !== 'reached' || !bot.entity.position.floored().equals(next)) continue;
+      moved = true;
+      break;
+    }
+    if (!moved) throw new Error('远离敌怪的方向缺少可安全开挖的通道');
+  }
+}
+
+async function climbMiningStairs(ctx, count, preferred, fillGaps, clearByHand) {
   const bot = ctx.bot;
   const headings = [preferred, ...CARDINAL_HEADINGS.filter(h => h.name !== preferred.name)];
   const visited = new Set();
@@ -1553,20 +1744,39 @@ async function climbMiningStairs(ctx, count, preferred) {
     for (const {heading, rise} of candidates) {
       const landing = offsetPos(feet, heading.x, rise, heading.z);
       if (visited.has(formatPosition(landing))) continue;
-      const support = blockAtPos(bot, offsetPos(landing, 0, -1, 0));
-      if (!support || support.boundingBox !== 'block' || isHazardBlock(support) || waterLike(support)) continue;
+      const floorAt = offsetPos(landing, 0, -1, 0);
+      let support = blockAtPos(bot, floorAt);
+      const placeFloor = !rise && fillGaps && (isPassableBlock(support) || support?.name === 'water')
+        && dryMiningFooting(bot, bot.entity.position) && ['stone','sandstone','dirt','deepslate','cobblestone'].includes(
+          blockAtPos(bot, offsetPos(floorAt, 0, -1, 0))?.name) && ctx.countItem('cobblestone') > 0;
+      if (!placeFloor && (!support || support.boundingBox !== 'block' || isHazardBlock(support) || waterLike(support))) continue;
       const opening = [offsetPos(landing, 0, 1, 0), landing];
       if (rise) opening.unshift(offsetPos(feet, 0, 2, 0));
       // 只挖有支撑的上行台阶。不能从头顶放出沙砾、水或岩浆。
-      if (!opening.every(p => safeStairOpening(bot, p))) continue;
+      const safeOpening = p => {
+        const cell = blockAtPos(bot, p);
+        return isPassableBlock(cell) ? !waterLike(cell) && !isHazardBlock(cell) : safeStairOpening(bot, p);
+      };
+      if (!opening.every(safeOpening)) continue;
       for (const cell of opening) {
         checkInterrupted(ctx);
-        if (!safeStairOpening(bot, cell)) throw new Error('上行开口旁的方块或流体发生变化');
         if (isPassableBlock(blockAtPos(bot, cell))) continue;
-        const dug = await digAt(ctx, cell);
+        if (!safeStairOpening(bot, cell)) throw new Error('上行开口旁的方块或流体发生变化');
+        const dug = await digAt(ctx, cell, {clearByHand});
         if (!dug.ok) break;
       }
-      if (!opening.every(p => isPassableBlock(blockAtPos(bot, p)))) continue;
+      if (!opening.every(p => isPassableBlock(blockAtPos(bot, p)) && safeOpening(p))) continue;
+      if (placeFloor) {
+        try {
+          await ctx.placeBlock({block: 'cobblestone', ...floorAt});
+        } catch {
+          checkInterrupted(ctx);
+          continue;
+        }
+        checkInterrupted(ctx);
+        support = blockAtPos(bot, floorAt);
+        if (support?.name !== 'cobblestone' || support.boundingBox !== 'block') continue;
+      }
       const outcome = await stepForward(ctx, landing);
       const actual = floorPos(bot.entity.position);
       if (actual.x === landing.x && actual.y === landing.y && actual.z === landing.z) {
@@ -1591,7 +1801,7 @@ async function stripMine(args, ctx) {
   const rise = clampInt(args.rise, 0, 0, 8);
   if (rise > 0) {
     const heading = directionFromName(args.direction) || directionFromYaw(bot.entity.yaw) || CARDINAL_HEADINGS[0];
-    return withDryMiningMovement(ctx, () => climbMiningStairs(ctx, rise, heading), {surfaceOnly: true});
+    return withDryMiningMovement(ctx, () => climbMiningStairs(ctx, rise, heading, args.fill_gaps === true, args.clear_by_hand === true), {surfaceOnly: true});
   }
   const length = clampInt(args.length, 32, 1, 128);
   const branchCount = clampInt(args.branches, 2, 0, 8);
@@ -1639,6 +1849,11 @@ async function stripMine(args, ctx) {
       notes,
     });
     if (!result.ok) {
+      if (args.direction && ['the_nether', 'minecraft:the_nether'].includes(bot.game?.dimension)) {
+        const error = new Error(`下界巷道沿${heading.name}方向在第 ${step} 格受阻：${result.message || result.reason}（已挖 ${state.steps} 格长度的巷道）`);
+        error.data = {reason: result.reason, nether_passages: observeNetherPassages(bot)};
+        throw error;
+      }
       if (result.reason === 'hazard') {
         throw new Error(
           `${result.message}，已停止挖矿：坐标 ${formatPosition(result.position)}（已挖 ${state.steps} 格长度的巷道）`,
@@ -2035,6 +2250,7 @@ export const skills = {
       { name: 'count', type: 'number', required: true, default: 1, description: '背包掉落物总目标，范围 1-2304，可跨多堆；已有数量算在内。' },
       { name: 'minimum_count', type: 'number', required: false, default: null, description: '可选最低背包总量。达到后只采触手可及的方块以补足 count，按实际库存回报。' },
       { name: 'within_reach', type: 'boolean', required: false, default: false, description: '只采挖掘距离内的方块，候选耗尽即回报。' },
+      { name: 'local_vein', type: 'boolean', required: false, default: false, description: '只沿干燥、有支撑的短通道接近已加载的煤、铁或钻石矿，最远 16 格。' },
       { name: 'surface_wood', type: 'boolean', required: false, default: false, description: '地表补木时仅搜索接近出发高度且相邻空间有天空光的主世界原木。' },
       { name: 'avoid_positions', type: 'array', required: false, default: [], description: '已确认的危险坐标；跳过其水平八格范围内的矿点，换区后也不返回危险点。',
         items: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } }, required: ['x', 'y', 'z'], additionalProperties: false } },
@@ -2053,6 +2269,8 @@ export const skills = {
       { name: 'branchLength', type: 'number', required: false, default: 8, description: '每条支巷的长度（格）。' },
       { name: 'shaft', type: 'number', required: false, default: 0, description: '开始前先挖多深的垂直竖井。' },
       { name: 'rise', type: 'number', required: false, default: 0, description: '只沿有支撑的干地向上开挖台阶，最多 8 层。' },
+      { name: 'fill_gaps', type: 'boolean', required: false, default: false, description: '上行横移时可用圆石填补底部有支撑的一格浅缺口。' },
+      { name: 'clear_by_hand', type: 'boolean', required: false, default: false, description: '缺镐时允许徒手清除上行通道中的普通岩石。' },
       { name: 'y', type: 'number', required: false, default: null, description: '目标 Y 高度，缺省就在当前高度挖。' },
       { name: 'direction', type: 'string', required: false, default: null, description: '主巷道方向：north / south / east / west，缺省按当前朝向。' },
       { name: 'torchInterval', type: 'number', required: false, default: 8, description: '每多少格放一个火把，0 表示不放。' },

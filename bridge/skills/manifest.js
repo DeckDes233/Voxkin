@@ -220,6 +220,7 @@ module.exports = {
           default: null,
           description: '目标坐标 Z。',
         },
+        {name: 'nether_safe', type: 'boolean', required: false, default: false, description: '只沿已连通的下界干地回到附近路标。'},
       ],
       preconditions: '桥接已连接且 bot 已进入世界；目标坐标可寻路。',
       observations: '实时读取 bot.entity.position。',
@@ -1430,9 +1431,12 @@ module.exports = {
       skill_id: 'explore_mining_site',
       group: '专精类',
       type: 'act',
-      description: "局部采矿受阻后，避开已尝试区域，实际走到新的干燥落脚点；不挖路、不搭柱，按真实位置变化验收。",
+      description: "避开失败矿点，走到新的干燥落脚点。步行撤离敌怪受阻时可开挖有支撑的侧向通道。",
       intent_examples: ["执行换地点继续寻找矿区", "需要换地点继续寻找矿区时调用", "用换地点继续寻找矿区推进当前任务"],
       parameters: [
+        {name: 'covered_escape', type: 'boolean', required: false, default: false, description: '步行撤退失败后允许背离敌怪开挖干燥通道。'},
+        {name: 'connected_route', type: 'boolean', required: false, default: false, description: '从脚下搜索连通干地，沿观察到的路点分段行走。'},
+        {name: 'toward', type: 'object', required: false, default: null, description: '已观测资源的 x/y/z 坐标，连通干地优先选靠近目标的落脚点。'},
         {
           name: 'min_distance',
           type: 'number',
@@ -1451,7 +1455,7 @@ module.exports = {
       ],
       preconditions: "桥接已连接且 bot 已进入世界。",
       observations: "读取背包、位置、朝向、附近方块与实体状态。",
-      execution_steps: ["局部采矿受阻后，避开已尝试区域，实际走到新的干燥落脚点", "不挖路、不搭柱，按真实位置变化验收。"],
+      execution_steps: ["优先步行，受阻时按授权背离敌怪挖通道", "核对实际位置、地面和附近敌怪。"],
       postconditions: "动作完成，返回中文结果描述。",
       failure_conditions: [
         "前置材料、装备或位置不满足时中止，并在错误里说明缺什么。",
@@ -1694,6 +1698,7 @@ module.exports = {
           description: "至少击杀多少只目标动物；大于 0 时按击杀数收手。",
         },
         { name: 'walk_only', type: 'boolean', required: false, default: false, description: '缺粮时步行就近搜索，禁用疾跑、跑酷和开挖。' },
+        { name: 'nearby_only', type: 'boolean', required: false, default: false, description: '只步行接近附近干地上已感知的猎物，附近无目标时立即返回。' },
         {
           name: 'species',
           type: 'string',
@@ -2047,6 +2052,7 @@ module.exports = {
           description: "可选最低背包总量。达到后只采触手可及的方块以补足 count，按实际库存回报。",
         },
         { name: 'within_reach', type: 'boolean', required: false, default: false, description: '只采挖掘距离内的方块，候选耗尽即回报。' },
+        { name: 'local_vein', type: 'boolean', required: false, default: false, description: '只沿干燥、有支撑的短通道接近已加载的煤、铁或钻石矿，最远 16 格。' },
         { name: 'surface_wood', type: 'boolean', required: false, default: false, description: '地表补木时仅搜索接近出发高度且相邻空间有天空光的主世界原木。' },
         {
           name: 'avoid_positions',
@@ -2533,6 +2539,20 @@ module.exports = {
       verifies: "返回文本里带出实际数量、坐标或状态，且与背包或世界状态一致。",
     },
     {
+      skill_id: 'discard_rubble',
+      group: '专精类', type: 'act',
+      description: '背包拥挤时丢出多余的普通采矿石料，至少保留两组该材料。',
+      intent_examples: ['把多余的玄武岩丢一点', '留两组圆石就够了', '丢一些下界岩，腾地方捡烈焰棒'],
+      parameters: [{name: 'item', type: 'string', required: true, default: null, description: '背包中的普通采矿石料。'}],
+      preconditions: '背包拥挤且有额外整组采矿石料。',
+      observations: '读取背包堆叠、空格和打开的窗口。',
+      execution_steps: ['逐组丢出石料并与服务端同步。'],
+      postconditions: '保留至少两组该石料，记录实际空格。',
+      failure_conditions: ['材料不在允许清理的范围，或无法腾出两格。'],
+      recovery_strategy: '在新位置观察背包，附近有箱子时可存箱。',
+      timeout_s: 30, cancellable: true, verifies: '背包中至少有两个空格。',
+    },
+    {
       skill_id: 'store_items',
       group: '专精类',
       type: 'act',
@@ -2574,6 +2594,7 @@ module.exports = {
           default: false,
           description: "附近没有箱子时，先从背包里放一个出来。",
         },
+        { name: 'craft_if_missing', type: 'boolean', required: false, default: false, description: '允许用随身木料制作缺少的储物箱，与 place_if_missing 配合。' },
       ],
       preconditions: "桥接已连接且 bot 已进入世界。",
       observations: "读取背包、位置、朝向、附近方块与实体状态。",
@@ -2630,6 +2651,8 @@ module.exports = {
           default: 0,
           description: "只沿有支撑的干地向上开挖台阶，最多 8 层。",
         },
+        { name: 'fill_gaps', type: 'boolean', required: false, default: false, description: "上行横移时可用圆石填补底部有支撑的一格浅缺口。" },
+        { name: 'clear_by_hand', type: 'boolean', required: false, default: false, description: "缺镐时允许徒手清除上行通道中的普通岩石。" },
         {
           name: 'y',
           type: 'number',
@@ -2714,6 +2737,14 @@ module.exports = {
       description: "落水自救：先恢复呼吸，再寻找并确认安全干地。",
       intent_examples: ["执行落水脱困", "需要落水脱困时调用", "用落水脱困推进当前任务"],
       parameters: [
+        { name: 'block_flow', type: 'boolean', required: false, default: false, description: '已确认矿道进水时，尝试在触及范围内用圆石封住单宽上游。' },
+        {
+          name: 'shallow_exit',
+          type: 'boolean',
+          required: false,
+          default: false,
+          description: "在干洞中复核浅水深度和近岸后，打开一格顶板上浮。",
+        },
         {
           name: 'radius',
           type: 'number',

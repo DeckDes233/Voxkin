@@ -10,7 +10,43 @@
 // 本模块直接用 ctx.bot 的窗口模型读格子，并自己实现「拿起—逐个放入—放回」的精确搬运，
 // 免得 shift 快速移动把整叠都搬走，导致存取数量对不上。
 
+import { followNetherPath, reachableNetherGround } from '../dry_footing.js';
+
 export const skills = {
+  discard_rubble: {
+    description: '背包拥挤时丢出多余的普通采矿石料，至少保留两组该材料。',
+    parameters: [{name: 'item', type: 'string', required: true, description: '背包中的普通采矿石料。'}],
+    handler: async ({item}, ctx) => {
+      const {bot} = ctx;
+      if (!['cobblestone', 'cobbled_deepslate', 'basalt', 'blackstone', 'netherrack'].includes(item)) {
+        throw new Error('只允许清理普通采矿石料');
+      }
+      let route, exit;
+      if (String(bot.game?.dimension).endsWith('the_nether')) {
+        route = await reachableNetherGround(ctx, 100, 6);
+        exit = route.points.find(p => Math.hypot(p.x - route.here.x, p.z - route.here.z) >= 4);
+        if (!exit) throw new Error('附近没有已观察的干燥路线离开掉落物');
+        await bot.look(Math.atan2(exit.x - route.here.x, exit.z - route.here.z), 0, true);
+      }
+      const before = countItem(ctx, item);
+      for (let i = 0; i < 3 && !ctx.interrupted && bot.inventory.emptySlotCount() < 3; i++) {
+        if (bot.currentWindow || bot.inventory.selectedItem || countItem(ctx, item) < 192) break;
+        const stack = bot.inventory.items().find(s => s.name === item && s.count === 64);
+        if (!stack) break;
+        await bot.tossStack(stack);
+        await ctx.syncInventory();
+      }
+      if (countItem(ctx, item) < before && !ctx.interrupted) {
+        if (exit) await followNetherPath(ctx, route.parents, exit);
+        await sleepCtx(ctx, 2300);
+        await ctx.syncInventory();
+      }
+      const remaining = countItem(ctx, item);
+      const free = bot.inventory.emptySlotCount();
+      return {status: free >= 2 ? 'succeeded' : 'blocked', detail: `丢出 ${before - remaining} 块 ${item}，余 ${remaining} 块，背包空格 ${free}`,
+        data: {inventory_free_slots: free}};
+    },
+  },
   store_items: {
     description: '把背包里的物资存进附近的箱子，箱子满了会报只放进多少个。',
     parameters: [
@@ -19,6 +55,7 @@ export const skills = {
       { name: 'items', type: 'string|array|object', required: false, default: null, description: '物资清单，例如 "cobblestone 16, iron_ingot 6"。' },
       { name: 'range', type: 'number', required: false, default: 16, description: '搜索箱子的半径。' },
       { name: 'place_if_missing', type: 'boolean', required: false, default: false, description: '附近没有箱子时，先从背包里放一个出来。' },
+      { name: 'craft_if_missing', type: 'boolean', required: false, default: false, description: '允许用随身木料制作缺少的储物箱，与 place_if_missing 配合。' },
     ],
     handler: async (args, ctx) => storeItems(args, ctx),
   },
@@ -604,15 +641,18 @@ async function moveExact(ctx, window, itemName, count, direction) {
   if (typeof ctx.clickWindowSlot === 'function') paths.push('ctx.clickWindowSlot');
   if (ctx.bot && typeof ctx.bot.clickWindow === 'function') paths.push('bot.clickWindow');
   if (!paths.length) throw new Error('没有点击箱子的能力');
-  let last = { moved: 0, path: '' };
+  let moved = 0, usedPath = '';
   for (const path of paths) {
-    const result = await attemptMove(ctx, window, itemName, count, direction, path);
-    last = result;
-    if (result.moved > 0) return result;
-    // 这次点击没生效（服务端可能因状态编号不符忽略了它）：先同步窗口，再换一条路径。
-    await resyncWindow(ctx, window);
+    while (moved < count && !ctx.interrupted) {
+      // 一次 shift-click 至多搬一叠。服务端确认窗口后，才选择下一叠及剩余数量。
+      const result = await attemptMove(ctx, window, itemName, count - moved, direction, path);
+      if (!result.moved) break;
+      moved += result.moved;
+      usedPath = path;
+    }
+    if (moved >= count || ctx.interrupted) break;
   }
-  return last;
+  return { moved, path: usedPath };
 }
 
 async function attemptMove(ctx, window, itemName, count, direction, path) {
@@ -695,6 +735,22 @@ async function storeItems(args, ctx) {
   const wanted = collectWanted(args);
   if (!wanted.length) throw new Error('没有指定要存的物品');
   const range = clampRange(args.range);
+  let placedTable = null;
+  if (args.craft_if_missing && args.place_if_missing && !countItem(ctx, 'chest') && !findChestBlock(ctx, range)) {
+    const stock = ctx.bot.inventory.items();
+    const plank = stock.find(stack => stack.name.endsWith('_planks') && countItem(ctx, stack.name) >= 8)?.name;
+    if (!plank) {
+      const log = stock.find(stack => /_(log|stem)$/.test(stack.name)
+        && countItem(ctx, stack.name) * 4 + countItem(ctx, stack.name.replace(/_(log|stem)$/, '_planks')) >= 8);
+      if (!log) throw new Error('随身木材不足以制作箱子');
+      const boards = log.name.replace(/_(log|stem)$/, '_planks');
+      if (!countItem(ctx, boards) && ctx.bot.inventory.emptySlotCount() === 0 && countItem(ctx, 'crafting_table') === 1) {
+        placedTable = await ctx.placeCraftingTable();
+      }
+      await ctx.craftItem({item: boards, count: 8 - countItem(ctx, boards)});
+    }
+    await ctx.craftItem({item: 'chest', count: 1});
+  }
   const chest = await ensureChest(ctx, range, args.place_if_missing);
   // 背包里一个都没有就不要开箱子了。
   const available = wanted.map((entry) => ({ item: entry.item, count: countItem(ctx, entry.item) }));
@@ -736,6 +792,7 @@ async function storeItems(args, ctx) {
     return { detail, status: 'succeeded' };
   } finally {
     await closeChest(ctx, window);
+    if (placedTable && ctx.bot.inventory.emptySlotCount() > 0 && !ctx.interrupted) await ctx.recoverPlacedTable(placedTable);
   }
 }
 

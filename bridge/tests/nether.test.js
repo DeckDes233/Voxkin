@@ -102,6 +102,21 @@ test('make_nether_portal honors cancellation before changing the world', async (
   assert.equal(itemReads, 0);
 });
 
+test('无门址回执仅在两种朝向都未找到地基且尚未施工时产生', async () => {
+  const {ctx} = makeTravelContext('minecraft:overworld');
+  const sampled = new Set();
+  ctx.bot.entity.position = new Vec3(0, 64, 0);
+  ctx.countItem = () => 10;
+  ctx.bot.blockAt = p => { sampled.add(p.x + ',' + p.z); return null; };
+  ctx.reportProgress = () => assert.fail('尚无真实门址');
+  ctx.placeBlock = ctx.breakBlock = () => assert.fail('选址失败不能修改世界');
+  await assert.rejects(skills.make_nether_portal.handler({}, ctx), err => {
+    assert.deepEqual(err.data.portal_search, {outcome: 'no_site_before_build', position: {x: 0, y: 64, z: 0}});
+    return true;
+  });
+  assert.ok(sampled.has('0,2') && sampled.has('2,0'));
+});
+
 test('续建只在原门址补缺块，点燃后重查时不再消耗黑曜石', async () => {
   const origin = {x: 2, y: 64, z: 2};
   const site = {dimension: 'minecraft:overworld', origin, axis: 'x'};
@@ -110,18 +125,26 @@ test('续建只在原门址补缺块，点燃后重查时不再消耗黑曜石',
   const blocks = new Map(frame.bottom.slice(1, -1).map(p => [key(p), 'obsidian']));
   for (const p of frame.full) blocks.set(key({...p, y: 62}), 'stone');
   const portal = frame.interior[0];
+  const inlet = {...portal, z: portal.z + 1};
+  blocks.set(key(portal), 'water');
+  blocks.set(key(inlet), 'water');
   const {ctx} = makeTravelContext('minecraft:overworld');
   ctx.bot.entity.position = new Vec3(0, 64, 0);
   ctx.bot.blockAt = p => {
     const name = blocks.get(key(p)) || 'air';
-    return {name, position: p, boundingBox: ['air', 'nether_portal'].includes(name) ? 'empty' : 'block'};
+    return {name, position: p, boundingBox: ['air', 'nether_portal', 'water'].includes(name) ? 'empty' : 'block'};
   };
   ctx.nearbyBlock = () => blocks.get(key(portal)) === 'nether_portal' ? {position: portal} : null;
   let stock = 8;
   ctx.countItem = item => item === 'obsidian' ? stock : 1;
   ctx.bot.inventory = {items: () => [{name: 'flint_and_steel'}]};
   ctx.bot.equip = async () => {};
-  ctx.bot.activateBlock = async () => { blocks.set(key(portal), 'nether_portal'); };
+  ctx.breakBlock = async p => { blocks.delete(key(p)); };
+  ctx.bot.activateBlock = async () => {
+    assert.equal(blocks.get(key(inlet)), 'cobblestone');
+    assert.ok(!blocks.has(key(portal)));
+    blocks.set(key(portal), 'nether_portal');
+  };
   ctx.placeBlock = async p => {
     const neighbors = [[0,-1,0], [0,1,0], [-1,0,0], [1,0,0], [0,0,-1], [0,0,1]];
     assert.ok(neighbors.some(([dx,dy,dz]) => blocks.has(key({x: p.x+dx, y: p.y+dy, z: p.z+dz}))));

@@ -1,6 +1,6 @@
 // 战斗技能模块：狩猎被动生物、与烈焰人交战、猎取末影人、破坏末地水晶、举盾格挡。
 import { assessCombatEncounter, combatEquipment } from '../combat_encounter.js';
-import { dryMiningFooting } from '../dry_footing.js';
+import { dryMiningFooting, withDryGroundMovement } from '../dry_footing.js';
 //
 // 约束（见 docs/plans/SKILL_MODULE_CONTRACT.md）：
 // - 只用 ctx 提供的能力，不 import 任何运行时依赖；bot 从 ctx.bot 取。
@@ -222,20 +222,25 @@ function findEntity(ctx, name, radius) {
 }
 
 // 扫描全部可狩猎生物，返回最近的。
-function findHuntable(ctx, speciesList, radius) {
+function findHuntable(ctx, speciesList, radius, dryOnly = false, unreachable) {
   const bot = ctx.bot;
   const origin = bot.entity.position;
   const candidates = [];
   for (const entity of Object.values(bot.entities || {})) {
-    if (!entity || !entity.position) continue;
-    if (!speciesList.includes(entity.name)) continue;
+    if (!entity || !entity.position || entity.isValid === false) continue;
+    if (!speciesList.includes(entity.name) || unreachable?.has(entity)) continue;
     if (entity.type === 'player') continue;
     const distance = origin.distanceTo(entity.position);
     if (distance > radius) continue;
+    if (dryOnly && !dryMiningFooting(bot, entity.position)) continue;
     candidates.push({ name: entity.name, entity, position: entity.position, distance });
   }
   const picked = pickHuntTarget(candidates, origin);
   return picked ? picked.entity : null;
+}
+
+export function nearbyFoodAnimal(bot) {
+  return Boolean(bot?.entity?.position && findHuntable({bot}, HUNTABLE, 24, true));
 }
 
 function sheepWoolState(ctx, sheep) {
@@ -435,6 +440,7 @@ function nextSheepSearchWaypoint(
   routeHeading,
   visited,
   forwardOnly = false,
+  dryFallback = false,
 ) {
   const bot = ctx.bot;
   if (typeof bot.findBlocks !== 'function' || typeof bot.blockAt !== 'function') return null;
@@ -527,6 +533,13 @@ function nextSheepSearchWaypoint(
       if (Math.hypot(x - originX, z - originZ) > radius) continue;
       const key = `${Math.round(x)},${Math.round(z)}`;
       if (visited.has(key)) continue;
+      if (dryFallback) {
+        const y = Math.floor(bot.entity.position.y);
+        const at = dy => bot.blockAt(sheepBlockPosition(bot.entity.position, x, y + dy, z));
+        const floor = at(-1);
+        if (floor?.boundingBox !== 'block' || isSheepSearchHazard(floor.name)
+            || !isSheepSearchAir(at(0)) || !isSheepSearchAir(at(1))) continue;
+      }
       visited.add(key);
       if (typeof ctx.log === 'function') {
         ctx.log('剪羊搜索改用寻路探索点', `(${x}, ${Math.floor(bot.entity.position.y)}, ${z})`);
@@ -557,7 +570,7 @@ function isSheepSearchAir(block) {
 }
 
 function isSheepSearchHazard(name) {
-  return /water|lava|fire|cactus|magma_block|sweet_berry_bush|powder_snow|wither_rose|campfire/i.test(String(name || ''));
+  return /water|bubble_column|lava|fire|cactus|magma_block|sweet_berry_bush|powder_snow|wither_rose|campfire/i.test(String(name || ''));
 }
 
 async function walkSheepSearchWaypoint(ctx, waypoint, timeoutMs = SHEEP_SEARCH_STEP_TIMEOUT_MS) {
@@ -1237,16 +1250,20 @@ function cookedNames(ctx, speciesList) {
 
 // 狩猎：追上去挥剑，等掉落物，捡肉。
 async function huntAnimal(args, ctx) {
-  if (args.walk_only !== true) return huntForMeat(args, ctx, HUNT_SEARCH_MAX_STEPS, 8);
+  const nearbyOnly = args.nearby_only === true;
+  const walking = args.walk_only === true || nearbyOnly;
   const movements = ctx.bot.pathfinder?.movements;
-  if (!movements) throw new Error('缺少步行寻路设置，无法低消耗寻食');
-  const original = {allowSprinting: movements.allowSprinting, allowParkour: movements.allowParkour, canDig: movements.canDig};
-  Object.assign(movements, {allowSprinting: false, allowParkour: false, canDig: false});
-  try {
-    return await huntForMeat({...args, radius: args.radius ?? 24}, ctx, 4, 0);
-  } finally {
-    Object.assign(movements, original);
+  if (!movements) {
+    if (walking) throw new Error('缺少步行寻路设置，无法低消耗寻食');
+    return huntForMeat(args, ctx, HUNT_SEARCH_MAX_STEPS, 8);
   }
+  return withDryGroundMovement(ctx.bot, async () => {
+    if (!walking) return await huntForMeat(args, ctx, HUNT_SEARCH_MAX_STEPS, 8);
+    if (nearbyOnly) {
+      return await huntForMeat({...args, radius: Math.min(Number(args.radius) || 24, 24)}, ctx, 0, 0);
+    }
+    return await huntForMeat({...args, radius: args.radius ?? 24}, ctx, 4, 0);
+  }, walking);
 }
 
 async function huntForMeat(args, ctx, maxSearchSteps, minFood) {
@@ -1285,6 +1302,7 @@ async function huntForMeat(args, ctx, maxSearchSteps, minFood) {
   let searchedSince = Date.now();
   let note = '';
   const visited = new Set();
+  const unreachable = new Set();
   const randomValue = typeof ctx.random === 'function' ? ctx.random : Math.random;
   const routeHeading = randomValue() * Math.PI * 2;
   const safetyRecovery = { attempts: 0 };
@@ -1297,7 +1315,14 @@ async function huntForMeat(args, ctx, maxSearchSteps, minFood) {
       note = `，天快黑了（第 ${ctx.bot.time.day ?? '?'} 天），先回去`;
       break;
     }
-    const target = findHuntable(ctx, speciesList, radius);
+    const target = findHuntable(ctx, speciesList, radius, args.nearby_only === true, unreachable);
+    if (args.nearby_only === true) {
+      assertCombatSearchSafe(ctx, minHealth, '就近寻食');
+      if (!target || !dryMiningFooting(ctx.bot, ctx.bot.entity.position)) {
+        note = '，附近没有可从干地接近的猎物';
+        break;
+      }
+    }
     if (!target) {
       if (searchSteps < maxSearchSteps && typeof ctx.walkOnce === 'function') {
         await ensureSafeSheepSearch(ctx, safetyRecovery, minFood);
@@ -1313,6 +1338,7 @@ async function huntForMeat(args, ctx, maxSearchSteps, minFood) {
           maxSearchSteps,
           routeHeading,
           visited,
+          true,
           true,
         );
         if (!waypoint) {
@@ -1357,12 +1383,13 @@ async function huntForMeat(args, ctx, maxSearchSteps, minFood) {
     throwIfInterrupted(ctx, '狩猎动物');
     if (chased === 'gone') continue;
     if (chased === 'failed') {
+      unreachable.add(target);
       ctx.log('追不上目标', label);
       await ctx.sleep(500);
       continue;
     }
 
-    await ctx.attackEntity(target);
+    await ctx.attackEntity(target, {emergencyHunt: args.nearby_only === true});
     attempts += 1;
     const dead = target.isValid === false;
     if (dead) {
@@ -2011,6 +2038,7 @@ export const skills = {
       { name: 'count', type: 'number', required: false, default: 1, description: '需要多少块生肉。' },
       { name: 'min_kills', type: 'number', required: false, default: 0, description: '至少击杀多少只目标动物；大于 0 时按击杀数收手。' },
       { name: 'walk_only', type: 'boolean', required: false, default: false, description: '缺粮时步行就近搜索，禁用疾跑、跑酷和开挖。' },
+      { name: 'nearby_only', type: 'boolean', required: false, default: false, description: '只步行接近附近干地上已感知的猎物，附近无目标时立即返回。' },
       { name: 'species', type: 'string', required: false, default: null, description: '指定生物，例如 cow、pig、sheep。' },
       { name: 'exclude_species', type: 'array', required: false, default: [], description: '排除的生物名称，避免猎取羊等保留资源。' },
       { name: 'radius', type: 'number', required: false, default: 32, description: '搜索半径。' },

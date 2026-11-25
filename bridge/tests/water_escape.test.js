@@ -2,10 +2,68 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Vec3 } from 'vec3';
 import { besideDrop, leaveMagmaBlock, netherRouteExclusion } from '../dry_footing.js';
-import { escapeWater, reachShore, waterLike, breathable, avoidWaterScaffolding, allowedDuringWaterEscape } from '../water_escape.js';
+import { escapeWater, reachShore, waterLike, breathable, avoidWaterScaffolding, allowedDuringWaterEscape, shallowSurfaceExit, shaftFlowBarrier, shoreHeadroomBlock, surfaceSkyLight, waterLanding } from '../water_escape.js';
 
 const block = (name, box = 'empty', props = {}) => ({ name, boundingBox: box, getProperties: () => props });
 const water = block('water'), air = block('air'), stone = block('iron_ore', 'block');
+
+test('主世界已加载的露天空气列有直射天光，隔着顶板或未加载时保留原值', () => {
+  const pos = new Vec3(-15, 63, 68);
+  const column = {minY: -64, worldHeight: 384, sections: []};
+  const bot = {blockAt: () => ({skyLight: 0}), game: {dimension: 'overworld'},
+    registry: {blocksByName: {air: {defaultState: 0}}}, world: {getColumnAt: () => column}};
+  assert.equal(surfaceSkyLight(bot, pos), 15);
+  column.sections[11] = {solidBlockCount: 1, get: p => Number(p.x === 1 && p.y === 2 && p.z === 4)};
+  assert.equal(surfaceSkyLight(bot, pos), 0);
+  assert.equal(surfaceSkyLight(bot, pos.offset(1, 0, 0)), 15);
+  bot.world.getColumnAt = () => null;
+  assert.equal(surfaceSkyLight(bot, pos), 0);
+});
+test('水面踏脚石靠实体侧壁放置，避开角色和低顶空间', () => {
+  const p = new Vec3(0.5,58.2,0.5);
+  let clear = true;
+  const bot = {entity: {position: p}, blockAt(v) {
+    if (v.y === 58 && v.x === 2) return stone;
+    if (v.y === 58 && v.x === 1 && v.z === 0) return water;
+    return clear && v.y > 58 ? air : stone;
+  }};
+  assert.deepEqual(waterLanding(bot), [new Vec3(1,58,0)]);
+  clear = false;
+  assert.deepEqual(waterLanding(bot), []);
+});
+test('只在两侧有墙且上游水位更高的一格宽通道封水', () => {
+  let openSide = false, level = 1;
+  const bot = {entity: {position: new Vec3(101.5, 18, 9.5)}, blockAt(p) {
+    if (p.x !== 101) return openSide && p.x === 100 ? air : stone;
+    if (p.z === 7 && p.y === 18 || p.z === 6 && p.y === 19) return block('water', 'empty', {level});
+    return p.y <= 17 ? stone : air;
+  }};
+  assert.deepEqual(shaftFlowBarrier(bot), [new Vec3(101,18,7), new Vec3(101,19,7)]);
+  level = 0;
+  assert.deepEqual(shaftFlowBarrier(bot), []);
+  level = 1; openSide = true;
+  assert.deepEqual(shaftFlowBarrier(bot), []);
+});
+test('浅水出口须有稳定单格顶板、明亮水面和可达干岸', () => {
+  let cover = 'dirt', waterTop = 60, bank = true;
+  const terrain = (x, y) => {
+    if (x >= 23 && bank && y === waterTop) return stone;
+    if (y < 58) return air;
+    if (y === 58) return block(cover, 'block');
+    return y <= waterTop ? water : {...air, skyLight: 15};
+  };
+  const {bot} = fixture(terrain, () => {});
+  Object.assign(bot, {health: 20, food: 17, time: {isDay: true}, game: {dimension: 'overworld'}, canDigBlock: () => true});
+  assert.equal(shallowSurfaceExit(bot)?.surfaceY, 60);
+  bank = false;
+  assert.equal(shallowSurfaceExit(bot), null);
+  bank = true;
+  cover = 'sand';
+  assert.equal(shallowSurfaceExit(bot), null);
+  cover = 'stone';
+  waterTop = 64;
+  assert.equal(shallowSurfaceExit(bot), null);
+});
 test('寻路垫块不选择水中、水面或未知脚下方块', () => {
   const position = new Vec3(0, 1, 0);
   assert.ok(avoidWaterScaffolding({ blockAt: () => water }, { ...air, position }) > 100);
@@ -27,6 +85,35 @@ test('纯上浮直到眼部空气和氧气恢复', async () => {
   const f = fixture((x,y,z) => y >= 59 ? air : water, (b,c) => { if(c.jump) b.entity.position.y += .4; if(b.entity.position.y >= 57.4) b.oxygenLevel = 20; });
   assert.equal(await escapeWater(f.bot, f.options), true); assert.ok(f.bot.entity.position.y > 57); assert.equal(f.controls.jump, false);
 });
+test('在水底岩浆块上回气时潜行横移，离开气泡柱后再上浮', async () => {
+  const magma = block('magma_block', 'block'), bubble = block('bubble_column', 'empty', {drag: true});
+  for (const escape of [escapeWater, reachShore]) {
+    const f = fixture((x,y,z) => {
+      if (z !== 63 || x < 22) return stone;
+      if (y === 53) return x === 22 ? magma : stone;
+      if (x === 22 && y <= 57) return bubble;
+      return x === 23 && y === 54 ? water : air;
+    }, (bot, controls) => {
+      if (bot.entity.position.x < 23) {
+        assert.ok(controls.sneak && controls.forward && !controls.jump);
+        bot.entity.position.x = 23.5;
+      } else if (controls.forward) {
+        bot.entity.position.x = 24.5;
+      }
+    });
+    f.bot.entity.position = new Vec3(22.8,54,63.4);
+    f.bot.oxygenLevel = 20;
+    assert.ok(await escape(f.bot, f.options));
+    assert.ok(f.bot.entity.position.x >= 23);
+    assert.equal(f.controls.sneak, false);
+  }
+});
+test('岩浆柱没有已知出口时，水中自救到时仍保持潜行保护', async () => {
+  const f = fixture((x,y,z) => x === 21 && z === 63 && y === 55 ? block('magma_block','block') : stone, () => {});
+  assert.equal(await escapeWater(f.bot, f.options), false);
+  assert.equal(f.controls.sneak, true);
+  assert.equal(f.controls.forward, false);
+});
 test('恢复呼吸后仍在水里时，继续移动到真实干地', async () => {
   const f = fixture((x,y,z) => x >= 23 && y === 55 ? stone : x >= 23 && y >= 56 ? air : y >= 57 ? air : water,
     (b,c) => { if (c.forward) b.entity.position.x += .5; });
@@ -41,6 +128,13 @@ test('水面旁有一格高的岸时跳上岸并验收', async () => {
   f.bot.oxygenLevel = 20;
   assert.equal(await reachShore(f.bot, f.options), true);
   assert.ok(f.bot.entity.position.y >= 57);
+});
+test('补给靠岸跳过河中单独一块干地', async () => {
+  const f = fixture((x,y,z) => y === 55 && ((x === 21 && z === 63) || x >= 24) ? stone
+    : y >= 56 ? {...air, skyLight: 15} : water, (b,c) => { if (c.forward) b.entity.position.x += .5; });
+  f.bot.oxygenLevel = 20;
+  assert.equal(await reachShore(f.bot, {...f.options, connected: true}), true);
+  assert.ok(f.bot.entity.position.x >= 24);
 });
 test('水面可呼吸但附近没有干地时不能宣称已经靠岸', async () => {
   const f = fixture((x,y,z) => y >= 57 ? air : water, () => {});
@@ -184,6 +278,32 @@ test('气穴旁没有天然岸边时在完整岩壁开一级台阶', async () =>
   });
   assert.equal(await reachShore(f.bot, f.options), true);
   assert.deepEqual(dug, ['22,58,63','22,57,63']);
+});
+
+test('低顶气穴旁已有干岸时先清出自己起跳所需的净空', async () => {
+  let cap = 'air', removed = false;
+  const f = fixture((x,y,z) => {
+    let name = 'stone';
+    if (x === 27 && z === 77) {
+      if (y === 61 || y === 62) return water;
+      if (y === 63 || y === 64 && removed) return air;
+      if (y === 65) name = cap;
+    }
+    if (x === 27 && z === 78 && (y === 63 || y === 64)) return air;
+    return {...block(name, name === 'air' ? 'empty' : 'block'), position: new Vec3(x,y,z)};
+  }, (bot, controls) => {
+    if (removed && controls.jump && controls.forward) bot.entity.position = new Vec3(27.5,63,78.5);
+  });
+  f.bot.entity.position = new Vec3(27.49,62.2,77.7);
+  Object.assign(f.bot, {oxygenLevel: 20, pathfinder: {bestHarvestTool: () => null}, canDigBlock: () => true,
+    digTime: () => 250, async dig(b) { assert.deepEqual(b.position, new Vec3(27,64,77)); removed = true; }});
+  for (cap of ['water', 'lava', 'gravel']) assert.equal(shoreHeadroomBlock(f.bot), null);
+  cap = 'air';
+  f.bot.entity.position.y = 61.75;
+  assert.deepEqual(shoreHeadroomBlock(f.bot).position, new Vec3(27,64,77));
+  f.bot.entity.position.y = 62.2;
+  assert.equal(await reachShore(f.bot, f.options), true);
+  assert.ok(removed);
 });
 test('a scout rejects solid footing beside a deep open shaft and permits a shallow step', () => {
   const p = new Vec3(2, 90, 2);

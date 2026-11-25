@@ -193,6 +193,65 @@ export function chooseRetreatDestination(origin, threats, { stepDistance = 12, c
   return best;
 }
 
+// 低血量寻食时，区分脚下洞穴里的僵尸与同一地面的近身威胁。
+export function zombieBehindFloor(bot, entity) {
+  if (!['zombie', 'husk', 'zombie_villager'].includes(entity?.name)) return false;
+  return twoSolidLayers(bot, bot.entity?.position, entity.position);
+}
+
+export function magmaCubeAboveCeiling(bot, entity, feet = bot.entity?.position) {
+  return entity?.name === 'magma_cube' && twoSolidLayers(bot, entity.position, feet);
+}
+
+function fullCollisionBlock(block) {
+  return block?.shapes?.some(shape => shape.length === 6 && shape.every((v, i) => v === (i < 3 ? 0 : 1)));
+}
+
+export function magmaCubeBehindCover(bot, entity, feet = bot.entity?.position) {
+  if (entity?.name !== 'magma_cube' || !feet || !entity.position) return false;
+  if (magmaCubeAboveCeiling(bot, entity, feet)) return true;
+  const mob = entity.position;
+  const dx = mob.x - feet.x, dz = mob.z - feet.z, horizontal = Math.hypot(dx, dz);
+  if (horizontal < 5 || horizontal > 12 || typeof feet.offset !== 'function' || typeof bot.blockAt !== 'function') return false;
+  const axis = Math.abs(dx) >= Math.abs(dz) ? 'x' : 'z';
+  const side = axis === 'x' ? 'z' : 'x';
+  const sign = Math.sign(mob[axis] - feet[axis]);
+  const end = Math.floor(mob[axis]);
+  // 检查两格厚、三格宽、四格高的整块岩壁。贴近、缺块或绕过墙后立即恢复警戒。
+  for (let col = Math.floor(feet[axis]) + sign; (end - col) * sign >= 2; col += sign) {
+    const t = (col + 0.5 - feet[axis]) / (mob[axis] - feet[axis]);
+    const across = Math.floor(feet[side] + t * (mob[side] - feet[side]));
+    const y = Math.floor(feet.y + 1 + t * (mob.y + 0.8 - feet.y - 1));
+    const base = feet.floored();
+    const wall = axis === 'x' ? base.offset(col - base.x, y - base.y, across - base.z)
+                              : base.offset(across - base.x, y - base.y, col - base.z);
+    let solid = true;
+    for (let d = 0; d < 2 && solid; d++) for (let w = -1; w <= 1 && solid; w++) {
+      for (let h = -1; h <= 2 && solid; h++) {
+        solid = fullCollisionBlock(bot.blockAt(wall.offset(axis === 'x' ? sign * d : w, h, axis === 'x' ? w : sign * d), false));
+      }
+    }
+    if (solid) return true;
+  }
+  return false;
+}
+
+function twoSolidLayers(bot, origin, target) {
+  if (!origin || !target || origin.y - target.y < 6) return false;
+  const depth = origin.y - target.y;
+  let layers = 0;
+  for (let y = Math.floor(origin.y) - 1; y > target.y + 2; y--) {
+    const fraction = (origin.y - y - 0.5) / depth;
+    const point = origin.offset((target.x - origin.x) * fraction, y + 0.5 - origin.y, (target.z - origin.z) * fraction);
+    const block = bot.blockAt(point.floored(), false);
+    if (!block) return false;
+    const solid = fullCollisionBlock(block);
+    layers = solid ? layers + 1 : 0;
+    if (layers >= 2) return true;
+  }
+  return false;
+}
+
 // 返回当前可见的敌对实体、威胁分数和是否该暂停交战。
 export function assessCombatEncounter({
   entities,
@@ -202,6 +261,7 @@ export function assessCombatEncounter({
   radius = 16,
   currentTarget,
   equipment,
+  behindFloor,
 }) {
   const maximum = Number(radius);
   const safeRadius = Number.isFinite(maximum) ? Math.max(0, maximum) : 16;
@@ -213,6 +273,7 @@ export function assessCombatEncounter({
     if (name === 'enderman' && entity !== currentTarget && !endermanIsAggressive(entity, registry)) continue;
     const distance = distance3(origin, entity.position);
     if (distance > safeRadius) continue;
+    if (entity !== currentTarget && behindFloor?.(entity)) continue;
     const closing = closingSpeed(entity, origin);
     const fusing = name === 'creeper' && creeperIsFusing(entity, registry);
     threats.push({
@@ -303,8 +364,9 @@ export async function evaluateEncounterStep({
   allowTargetSwitch = false,
   equipment,
   retreat,
+  behindFloor,
 }) {
-  const encounter = assessCombatEncounter({ entities, origin, registry, health, radius, currentTarget, equipment });
+  const encounter = assessCombatEncounter({ entities, origin, registry, health, radius, currentTarget, equipment, behindFloor });
   if (encounter.should_retreat) {
     const threat = encounter.urgent && encounter.urgent.entity
       ? encounter.urgent.entity

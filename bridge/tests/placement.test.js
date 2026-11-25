@@ -1,12 +1,30 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { Vec3 } from 'vec3';
 
 import {
+  dryStationAlcove,
   findSupportedPlacementTargets,
   inspectSupportedPlacementTargets,
   placementHeightOffsets,
   placementOffsets,
 } from '../placement.js';
+
+test('工作站排除脚部或头部进水的空间', () => {
+  for (const wetY of [63, 64, 65]) {
+    const cells = y => ({name: y === wetY ? 'water' : y === 63 ? 'stone' : 'air',
+      boundingBox: y === 63 ? 'block' : 'empty'});
+    const { targets } = inspectSupportedPlacementTargets({base: {x: 0, y: 64, z: 0},
+      offsets: [[1, 0]], heights: [-1], getBlock: p => cells(p.y)});
+    assert.deepEqual(targets, []);
+  }
+});
+
+test('挖工作站凹位时保留含水层的侧壁，改用另一侧岩石', () => {
+  const bot = {entity: {position: new Vec3(0.5, 64, 0.5)}, blockAt: p => p.x === 2
+    ? {name: 'water', boundingBox: 'empty'} : {name: 'stone', boundingBox: 'block'}};
+  assert.equal(dryStationAlcove(bot).target.x, -1);
+});
 
 test('placement offsets search nearest candidates first across the requested radius', () => {
   const offsets = placementOffsets(1);
