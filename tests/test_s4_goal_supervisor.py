@@ -154,6 +154,26 @@ def test_s4_replans_a_supply_ascent_after_a_creeper_stops_mining(tmp_path):
     assert not supervisor._recover_s4_mining_threat({**row, "receipt_confirmed": False})
 
 
+def test_s4_rebinds_a_retreat_only_after_moving_to_a_new_threat(tmp_path):
+    state = s4_state(y=65)
+    end = state["position"]
+    origin = {**end, "x": end["x"] - 12}
+    supervisor = GoalSupervisor(GOALS["S4"], TaskStore(tmp_path / "task.db"), None, lambda: state)
+    supervisor.state = {"s4_threat_position": origin}
+    data = {"observation": state, "relocation": {"origin": origin}}
+    row = {"action_id": "second-creeper", "tool": "explore_mining_site", "status": "blocked",
+           "session_id": state["session_id"], "revision": state["revision"] - 1, "receipt_confirmed": True,
+           "expected_condition": {"type": "s4_threat_relocation"}, "result_data": data,
+           "result_detail": "动作 explore_mining_site 执行失败: 附近有敌对生物，先处理生存恢复"}
+    assert supervisor._recover_s4_mining_threat(row)
+    assert supervisor.state["s4_threat_position"] == end
+    row["result_detail"] = ""
+    data["reason"] = "nearby_hostiles"
+    assert supervisor._recover_s4_mining_threat(row)
+    data["relocation"]["origin"] = {**end, "z": end["z"] - 1}
+    assert not supervisor._recover_s4_mining_threat(row)
+
+
 def test_s4_hunts_above_the_observed_local_exit_even_when_the_shelter_is_lower():
     exit_point = {"x": -60, "y": 72, "z": 202}
     state = s4_state(position={"x": -59.5, "y": 66, "z": 202.5}, time=2000, is_day=True,

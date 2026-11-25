@@ -40,11 +40,12 @@ async function exploreMiningSite(args, ctx) {
   let extent;
   const relocation = () => ({origin: point(origin), min_distance: minimum, attempted_positions: attempted,
     ...(Number.isFinite(extent) ? {dry_ground_extent: extent} : {})});
-  const fail = (detail) => { const error = new Error(detail); error.data = { relocation: relocation() }; throw error; };
+  const fail = (detail, data = {}) => { const error = new Error(detail); error.data = { relocation: relocation(), ...data }; throw error; };
   const check = () => {
     if (ctx.interrupted || !bot.entity) fail('换矿区已取消或断开连接');
     if (bot.health <= 10) fail('血量不足，先处理生存恢复');
-    if (ctx.nearbyHostiles?.(10)?.length) fail('附近有敌对生物，先处理生存恢复');
+    const hostiles = ctx.nearbyHostiles?.(10);
+    if (hostiles?.length) fail('附近有敌对生物，先处理生存恢复', {reason: 'nearby_hostiles', hostiles});
   };
   // 近处敌人曾连续耗尽换区次数。先沿已验证的安全退路脱离，再检查能否开始探路。
   const threat = ctx.findHostile?.(10);

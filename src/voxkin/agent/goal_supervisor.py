@@ -2437,15 +2437,22 @@ class GoalSupervisor:
         return handled
 
     def _recover_s4_mining_threat(self, row: dict) -> bool:
-        if (self._method_stage != "S4" or row.get("tool") not in {"strip_mine", "mine_collect"}
+        retreat = row.get("tool") == "explore_mining_site" and (row.get("expected_condition") or {}).get("type") == "s4_threat_relocation"
+        if (self._method_stage != "S4" or (row.get("tool") not in {"strip_mine", "mine_collect"} and not retreat)
                 or row.get("status") not in {"blocked", "failed"} or row.get("receipt_confirmed") is not True):
             return False
         data = row.get("result_data") or {}
         terminal = _fresh_terminal_observation(row, data)
         detail = str(row.get("result_detail") or "")
         if not terminal or not (data.get("reason") == "nearby_hostiles" or (
-                "格内有敌对生物（" in detail and detail.endswith("），停止采矿"))):
+                "格内有敌对生物（" in detail and detail.endswith("），停止采矿")) or (
+                retreat and detail.endswith("附近有敌对生物，先处理生存恢复"))):
             return False
+        if retreat:
+            start = (data.get("relocation") or {}).get("origin")
+            end = terminal["position"]
+            if not self._finite_position(start) or math.hypot(end["x"] - start["x"], end["z"] - start["z"]) < 8:
+                return False
         self.state["s4_threat_position"] = dict(terminal["position"])
         self.state["s4_last_threat_action"] = row.get("action_id")
         return True
