@@ -159,11 +159,37 @@ def test_s5_uses_the_shaft_lip_and_reconsiders_routes_from_the_surface(tmp_path)
     state["position"] = lip
     step, _ = supervisor._s5_obsidian_site(request, state, "s5:obsidian")
     assert step.tool == "explore_mining_site" and old_target not in step.arguments["avoid_positions"]
-    supervisor.state = {"s5_obsidian_region": 2}
-    _, upper = supervisor._s5_obsidian_site(request, state, "s5:obsidian")
-    state["position"] = {**lip, "y": lip["y"] - 8}
-    _, lower = supervisor._s5_obsidian_site(request, state, "s5:obsidian")
-    assert upper != lower
+    for region in (0, 2):
+        supervisor.state = {"s5_obsidian_region": region}
+        state["position"] = lip
+        _, upper = supervisor._s5_obsidian_site(request, state, "s5:obsidian")
+        state["position"] = {**lip, "y": lip["y"] - 8}
+        _, lower = supervisor._s5_obsidian_site(request, state, "s5:obsidian")
+        assert upper != lower
+    state["inventory"] = {"bucket": 1}
+    _, water = supervisor._s5_obsidian_site(request, state, "s5:obsidian")
+    assert water != lower
+    state["position"]["z"] += 128
+    assert supervisor._s5_obsidian_site(request, state, "s5:obsidian")[1] != water
+    state["inventory"] = {"water_bucket": 1}
+    stop = state["position"]
+    supervisor.state = {"action_history": [
+        {"tool": "safe_descend", "method_key": "s5:lava_descent:0:71", "status": "failed",
+         "receipt_confirmed": True, "result_detail": "下方竖井连通水层", "terminal_observation": {"position": stop}},
+        {"tool": "collect_obsidian", "status": "partial", "receipt_confirmed": True,
+         "result_detail": "静止岩浆源耗尽", "terminal_observation": {"position": stop}},
+    ]}
+    bypass, key = supervisor._s5_obsidian_site(request, state, "s5:obsidian")
+    assert bypass.tool == "strip_mine" and key.startswith("s5:lava_bypass:0:")
+
+
+def test_s5_uses_hearty_rations_to_depart_with_a_ready_portal():
+    state = world(obsidian=11, flint_and_steel=1, cooked_beef=2, porkchop=1)
+    assert choose_s5_action(state, {})[0].tool == "make_nether_portal"
+    state["inventory"].pop("porkchop")
+    assert choose_s5_action(state, {})[0].tool == "hunt_animal"
+    state["inventory"].update(cooked_beef=0, porkchop=3)
+    assert choose_s5_action(state, {})[0].tool == "hunt_animal"
 
 
 def test_s5_existing_igniter_skips_all_of_its_consumed_ingredients():
@@ -173,6 +199,81 @@ def test_s5_existing_igniter_skips_all_of_its_consumed_ingredients():
     state["inventory"].pop("obsidian")
     step, index = choose_s5_action(state, {"method_index": 6})
     assert (step.tool, index) == ("nether_travel", 6)
+
+
+def test_low_health_without_ordinary_food_uses_emergency_meat_below_regeneration_threshold():
+    state = {"dimension": "overworld", "health": 9, "food": 15, "inventory": {"rotten_flesh": 2}}
+    hunt = StepSpec("补粮", "hunt_animal", {}, {})
+    chosen, _ = prepare_late_action(hunt, None, state, {})
+    assert chosen.tool == "eat" and chosen.arguments == {"item": "rotten_flesh", "count": 1}
+    state["food"] = 18
+    assert prepare_late_action(hunt, None, state, {})[0] is None
+    state.update(food=15, inventory={"beef": 1, "rotten_flesh": 2})
+    assert prepare_late_action(hunt, None, state, {})[0].tool == "eat_if_hungry"
+
+
+def test_daylight_emergency_hunt_only_uses_nearby_prey_on_dry_land():
+    state = world()
+    state.update(health=3.2, food=16, is_day=True, time=600, surface_access={"sky_light": 0}, nearby_food_animal=True)
+    ledger = {}
+    step, _ = prepare_late_action(*choose_s5_action(state, ledger), state, ledger)
+    assert step.arguments["nearby_only"] and step.arguments["walk_only"] and step.arguments["radius"] == 24
+    for key, value in [("executor", {"safety_active": True}), ("health", 2), ("food", 18),
+                       ("nearby_food_animal", False), ("surface_access", {"sky_light": 15, "in_water": True}), ("time", 12000)]:
+        unsafe = {**state, key: value}
+        assert prepare_late_action(*choose_s5_action(unsafe, ledger), unsafe, ledger)[0] is None
+
+
+def test_late_hunt_builds_cover_before_dark_and_leaves_in_daylight():
+    state = world(cobblestone=25)
+    state.update(time=11300, day=3, food=16, health=18, surface_access={"connected_land": True})
+    ledger = {"stage": "S5"}
+    def next_step():
+        return prepare_late_action(*choose_s5_action(state, ledger), state, ledger)[0]
+    camp = next_step()
+    assert camp.tool == "make_shelter" and camp.verify["type"] == "sealed_camp"
+    ledger["counters"] = {"method_failures": {late_method_key("S5", camp): 1}}
+    assert next_step() is None
+    state.update(day=4)
+    assert next_step().tool == "make_shelter"
+    state.update(shelter={"sealed": True, "inside": True}, time=14000, is_day=False)
+    assert next_step() is None and "封闭庇护所" in ledger["late_game_wait_reason"]
+    state["resource_sites"] = {"sleep_bed": {"x": 1, "y": 64, "z": 1}}
+    assert next_step().tool == "sleep_safe"
+    state.update(time=200, is_day=True)
+    assert next_step().tool == "leave_shelter"
+
+
+def test_expedition_cooks_a_batch_with_surplus_fuel_but_eats_immediately_when_weak():
+    state = world(mutton=3, coal=2, furnace=1)
+    state.update(health=19, food=15, is_day=True, time=1000)
+    step, _ = choose_s5_action(state, {})
+    assert step.arguments == {"item": "mutton", "count": 3, "output": "cooked_mutton", "fuel": "coal"}
+    assert step.verify["items"] == {"cooked_mutton": 3}
+    state["health"] = 9
+    assert choose_s5_action(state, {})[0].tool == "eat_if_hungry"
+    state.update(health=19, time=12000)
+    assert choose_s5_action(state, {})[0].tool == "eat_if_hungry"
+    state.update(nearby_owned_crafting_table=True, surface_access={"sky_light": 0}, is_day=False)
+    state["position"]["y"] = -7
+    assert choose_s5_action(state, {})[0].tool == "smelt_batch"
+    state["surface_access"]["in_water"] = True
+    assert choose_s5_action(state, {})[0].tool == "eat_if_hungry"
+
+
+def test_s5_smelt_can_spend_a_replaced_wooden_pickaxe():
+    inventory = {"raw_iron": 1, "furnace": 1, "wooden_pickaxe": 1, "diamond_pickaxe": 1}
+    assert ingot_dependency(inventory, 1).arguments["fuel"] == "wooden_pickaxe"
+    del inventory["diamond_pickaxe"]
+    assert ingot_dependency(inventory, 1).tool == "mine_collect"
+
+
+def test_s5_rebuilds_missing_pickaxe_under_its_own_goal(tmp_path):
+    state = world(flint_and_steel=1, cooked_beef=6)
+    supervisor = GoalSupervisor(GOALS["S5"], TaskStore(tmp_path / "tasks.db"), None, lambda: state)
+    assert choose_s5_action(state, supervisor.state) == (None, None)
+    assert supervisor._method_stage == "S4"
+    assert supervisor.goal.stage == "S5"
 
 
 def test_s5_igniter_needs_one_iron_and_uses_non_oak_fuel():
@@ -193,6 +294,18 @@ def test_s5_uses_the_night_underground_for_stationary_preparation_before_hunting
     assert choose_s5_action(state, {})[0].tool == "hunt_animal"
 
 
+def test_s5_replaces_worn_nether_pickaxe_with_carried_supplies():
+    state = world("the_nether", cooked_beef=4, diamond=3, stick=3, crafting_table=1)
+    step, index = choose_s5_action(state, {})
+    assert step.arguments == {"item": "diamond_pickaxe", "count": 1} and index is None
+    state["inventory"].update(diamond=0, blackstone=3, stick=0, oak_planks=2)
+    assert choose_s5_action(state, {})[0].arguments["item"] == "stick"
+    state["inventory"]["stick"] = 4
+    assert choose_s5_action(state, {})[0].arguments["item"] == "stone_pickaxe"
+    state["inventory"].update(stick=0, oak_planks=0)
+    assert choose_s5_action(state, {})[0].tool == "raid_fortress"
+
+
 def test_s5_finishes_batched_obsidian_with_food_on_hand_then_restocks_before_portal():
     state = world(obsidian=2, diamond_pickaxe=1, flint_and_steel=1, water_bucket=1, mutton=3)
     state.update(food=18, time=11000)
@@ -203,18 +316,45 @@ def test_s5_finishes_batched_obsidian_with_food_on_hand_then_restocks_before_por
     assert choose_s5_action(state, ledger)[0].tool == "hunt_animal"
 
 
-def test_s5_resumes_preempted_build_only_at_receipted_site(tmp_path):
+@pytest.mark.parametrize("status", ["preempted", "blocked", "failed"])
+def test_s5_resumes_unfinished_build_only_at_receipted_site(tmp_path, status):
     state = world(obsidian=4, flint_and_steel=1, mutton=4)
     state.update(position={"x": 1, "y": 64, "z": 1}, alive=True)
     supervisor = GoalSupervisor(GOALS["S5"], TaskStore(tmp_path / "tasks.db"), None, lambda: state)
     supervisor.state = {"method_index": 5}
-    entry = {"tool": "make_nether_portal", "status": "preempted", "receipt_confirmed": True}
+    entry = {"tool": "make_nether_portal", "status": status, "receipt_confirmed": True}
     assert not supervisor._late_action_recovery(entry, state)
     site = {"dimension": "minecraft:overworld", "axis": "x", "origin": {"x": 2, "y": 64, "z": 1}}
     entry["result_data"] = {"portal_site": site}
     assert supervisor._late_action_recovery(entry, state)
     step, index = choose_s5_action(state, supervisor.state)
     assert index == 5 and step.arguments == {"resume_site": site}
+
+
+def test_s5_relocates_only_after_receipted_prebuild_failure(tmp_path):
+    state = world(obsidian=10, flint_and_steel=1, diamond_pickaxe=1, cooked_beef=4)
+    supervisor = GoalSupervisor(GOALS["S5"], TaskStore(tmp_path / "tasks.db"), None, lambda: state)
+    supervisor.state = {"method_index": 5}
+    entry = {"tool": "make_nether_portal", "action_id": "portal", "status": "blocked", "receipt_confirmed": True}
+    pos = dict(state["position"])
+    legacy = {**entry, "result_detail": "附近没有足够大的空地放下下界门框"}
+    assert not supervisor._late_action_recovery(legacy, state)
+    receipt = {**entry, "arguments": {"resume_site": {}}, "terminal_observation": {"position": pos}}
+    supervisor.state["action_history"] = [receipt]
+    assert not supervisor._late_action_recovery(legacy, state)
+    receipt["arguments"] = {}
+    assert supervisor._late_action_recovery(legacy, state)
+    entry["result_data"] = {"portal_search": {"outcome": "no_site_before_build", "position": pos}}
+    assert not supervisor._late_action_recovery({**entry, "status": "unknown"}, state)
+    assert supervisor._late_action_recovery(entry, state)
+    assert supervisor.state["s5_portal_search_stops"] == [pos]
+    step, _ = choose_s5_action(state, supervisor.state)
+    assert step.verify["type"] == "s5_portal_relocation"
+    state["surface_access"] = {"exit": {**pos, "y": pos["y"] + 8}}
+    step, _ = choose_s5_action(state, supervisor.state)
+    assert step.tool == "goto"
+    state["position"] = step.arguments
+    assert choose_s5_action(state, supervisor.state)[0].tool == "make_nether_portal"
 
 
 def test_late_supply_climbs_in_short_verified_segments_before_dawn():
@@ -242,6 +382,10 @@ def test_daytime_hunt_uses_observed_surface_above_a_cave_at_normal_surface_eleva
     ledger["counters"]["method_failures"][key] = 1
     step, _ = prepare_late_action(*choose_s5_action(state, ledger), state, ledger)
     assert step.tool == "strip_mine" and step.verify["y"] == 68
+    ledger["counters"]["method_failures"][late_method_key("S5", step)] = 1
+    step, _ = prepare_late_action(*choose_s5_action(state, ledger), state, ledger)
+    assert step.arguments["clear_by_hand"] and step.verify["y"] == 64
+    assert late_method_key("S5", step) == "s5:ascent:62:hand"
     state["surface_access"] = {"sky_light": 15, "exit": None}
     assert prepare_late_action(*choose_s5_action(state, {}), state, {})[0].tool == "hunt_animal"
 

@@ -891,6 +891,17 @@ def test_s3_preflight_eats_existing_food_inside_then_exits_before_hunting():
     assert step.verify["type"] == "inventory_any"
 
 
+def test_s3_processes_collected_iron_before_leaving_to_hunt():
+    state = modern_state(health=20, food=18, inventory={"raw_iron": 9, "crafting_table": 1, "stone_pickaxe": 1,
+                         "cobblestone": 92, "stick": 4, "oak_planks": 9, "mutton": 1}, shelter={"inside": False})
+    ready, step = choose_s3_preflight_action(state, {})
+    if ready:
+        step = choose_s3_resource_action(state, {})
+    assert step.tool == "craft" and step.arguments["item"] == "furnace"
+    state["inventory"]["raw_iron"] = 2
+    assert choose_s3_preflight_action(state, {})[1].tool == "hunt_animal"
+
+
 def test_s3_preflight_never_hunts_inside_at_night_or_with_missing_safety():
     goal_state: dict = {}
     state = modern_state(
@@ -3584,6 +3595,17 @@ def test_s3_failed_relocation_persists_attempted_sites_without_reset(tmp_path):
     assert saved["s3_ore_no_progress"] == 1
     store.close()
 
+def test_s3_retries_ore_in_a_distant_respawn_area_and_retains_the_old_budget():
+    state = modern_state(position={"x": 95, "y": 55, "z": 20}, inventory={"stone_pickaxe": 1})
+    before = {**state, "session_id": "old", "position": {"x": 15, "y": 47, "z": 139}}
+    ledger = {"s3_ore_no_progress": 1, "s3_ore_expose_used": 12, "s3_relocation_failed": True,
+              "last_s3_mining_failure": {"data": {"observation": before}},
+              "counters": {"method_failures": {"s3:ore_relocate:0": 3}}}
+    assert choose_s3_resource_action(state, ledger).tool == "mine_collect"
+    assert choose_s3_resource_action(state, ledger).tool == "mine_collect"
+    assert ledger["s3_ore_regions"] == 1 and ledger["counters"]["method_failures"]["s3:ore_relocate:0"] == 3
+
+
 def test_s3_relocation_failure_returns_to_known_surface_once():
     state = modern_state(position={"x": 2, "y": 58, "z": 83}, is_day=True,
         inventory={"raw_iron": 8, "stone_pickaxe": 1},
@@ -3597,6 +3619,204 @@ def test_s3_relocation_failure_returns_to_known_surface_once():
     next_step = choose_s3_resource_action(state, ledger)
     assert next_step.tool == "explore_mining_site"
     assert ledger["s3_ore_expose_used"] == 12
+
+
+def test_wood_search_climbs_out_of_a_dark_failed_relocation(tmp_path):
+    state = modern_state(position={"x": 82, "y": 55, "z": 18}, inventory={"iron_pickaxe": 1},
+                         surface_access={"sky_light": 1, "exit": None}, is_day=True)
+    supervisor = GoalSupervisor(GOALS["S3"], TaskStore(tmp_path / "tasks.db"), None, lambda: state)
+    key = "s3:wood_search:overworld:2:6:0:wood_log"
+    supervisor.state = {"counters": {"method_failures": {key: 1, key + ":wide": 1, key + ":relocate": 3}}}
+    request = StepSpec("采木", "mine_collect", {"block": "wood_log"}, {})
+    step, method = supervisor._expand_wood_search(request, state, key)
+    assert (step.tool, step.verify, method) == ("strip_mine", {"type": "min_height", "y": 61}, key + ":ascent:55")
+    state["surface_access"]["sky_light"] = 15
+    assert supervisor._expand_wood_search(request, state, key)[0].tool == "explore_mining_site"
+    state["surface_access"].update(connected_land=False, exit={"x": 82, "y": 62, "z": 18})
+    state["inventory"] = {}
+    step, method = supervisor._expand_wood_search(request, state, key)
+    assert step.tool == "strip_mine" and step.arguments["clear_by_hand"]
+    assert step.verify == {"type": "min_height", "y": 57}
+    state["surface_access"]["connected_land"] = True
+    assert supervisor._expand_wood_search(request, state, key)[0].tool == "explore_mining_site"
+
+
+def test_wood_relocation_at_attempt_limit_replans_toward_observed_tree(tmp_path):
+    position = {"x": -31, "y": 64, "z": 91}
+    state = modern_state(position=position, inventory={}, surface_access={"sky_light": 15, "connected_land": True}, is_day=True)
+    supervisor = GoalSupervisor(GOALS["S3"], TaskStore(tmp_path / "tasks.db"), None, lambda: state)
+    key = "s3:wood_search:overworld:-1:8:2:land:wood_log"
+    connected = key + ":relocate:connected"
+    trunk = {"x": -50, "y": 63, "z": 11}
+    survey = {"origin": position, "dry_ground_extent": 3.7}
+    supervisor.state = {"counters": {"method_failures": {key + ":wide": 1, key + ":relocate": 3, connected: 3}},
+                        "action_history": [
+                            {"tool": "mine_collect", "receipt_confirmed": True, "arguments": {"surface_wood": True},
+                             "result_data": {"surface_trunk": trunk}, "terminal_observation": {"dimension": state["dimension"]}},
+                            {"tool": "explore_mining_site", "method_key": connected, "status": "blocked", "receipt_confirmed": True,
+                             "expected_condition": {"type": "s3_wood_relocation"}, "result_data": {"relocation": survey}}]}
+    assert supervisor._retry_or_block_method(connected, "窄岸") == "retry"
+    request = StepSpec("采木", "mine_collect", {"block": "wood_log"}, {})
+    step, _ = supervisor._expand_wood_search(request, state, key)
+    assert step.tool == "strip_mine" and step.arguments["direction"] == "north"
+    assert supervisor._method_failure_count(connected) == 3
+    survey["dry_ground_extent"] = 40
+    step, _ = supervisor._expand_wood_search(request, state, key)
+    assert step.tool == "explore_mining_site" and step.arguments["toward"] == trunk
+    state["position"] = {**position, "y": 68}
+    step, new_key = supervisor._expand_wood_search(request, state, key)
+    assert step.tool == "explore_mining_site" and new_key == connected + ":site:-31:68:91"
+
+
+def test_s5_fortress_scout_can_exit_a_portal_in_a_rock_wall(tmp_path):
+    supervisor = GoalSupervisor(GOALS["S5"], TaskStore(tmp_path / "tasks.db"), None, lambda: {})
+    key = "s5:raid_fortress:default:chunk:0:1"
+    origin = {"x": 8, "y": 81, "z": 21}
+    evidence = {"route": {"origin": origin, "attempted_waypoints": 0}}
+    supervisor.state = {"counters": {"method_failures": {key: 3}}, "action_history": [
+        {"method_key": key, "status": "blocked", "result_data": {"fortress_evidence": evidence}}]}
+    state = modern_state(position=origin, dimension="the_nether", nether_portal_bank="north",
+                         health=20, food=18, inventory={"iron_pickaxe": 1})
+    scout = StepSpec("侦察", "raid_fortress", {"scout_only": True}, {})
+    step, method = supervisor._fortress_portal_exit(scout, state, key)
+    assert (step.tool, step.arguments, method) == ("strip_mine", {"rise": 4, "direction": "north"}, key + ":bank:north:81")
+    state.update(position={**origin, "y": 85}, nether_portal_bank=None)
+    assert supervisor._fortress_portal_exit(scout, state, key) == (scout, key + ":layer:21")
+
+
+def test_s5_repeated_lower_gallery_checks_an_unsurveyed_height(tmp_path):
+    supervisor = GoalSupervisor(GOALS["S5"], TaskStore(tmp_path / "tasks.db"), None, lambda: {})
+    origin = {"x": -4, "y": 58, "z": -140}
+    key = "s5:raid_fortress:default:chunk:-1:-9"
+    def receipt(y, z):
+        route = {"origin": {**origin, "y": y, "z": z}, "visited": [origin]}
+        return {"tool": "raid_fortress", "method_key": key, "status": "blocked",
+                "receipt_confirmed": True, "result_data": {"fortress_evidence": {"route": route}}}
+    history = [receipt(58, z) for z in (-123, -136, -142, -147)]
+    supervisor.state = {"action_history": history}
+    state = modern_state(position=origin, dimension="the_nether", health=20, food=20, inventory={"diamond_pickaxe": 1})
+    scout = StepSpec("侦察", "raid_fortress", {"surveyed": [{"x": -4, "z": -11}]}, {})
+    step, method = supervisor._fortress_portal_exit(scout, state, key)
+    assert step.arguments == {"rise": 6} and method.endswith(":ascend")
+    supervisor.state["counters"] = {"method_failures": {method: 1}}
+    history.append({"method_key": method, "status": "failed", "receipt_confirmed": True,
+                    "result_data": {"reason": "nearby_hostiles"}})
+    assert supervisor._fortress_portal_exit(scout, state, key)[1] != method + ":threat_cleared"
+    state["nether_mining_hostiles"] = []
+    assert supervisor._fortress_portal_exit(scout, state, key)[1] == method + ":threat_cleared"
+    history.append(receipt(64, -138))
+    step, method = supervisor._fortress_portal_exit(scout, state, key)
+    assert "rise" not in step.arguments
+
+
+def test_s5_exhausted_survey_backtracks_only_to_confirmed_nether_waypoints(tmp_path):
+    supervisor = GoalSupervisor(GOALS["S5"], TaskStore(tmp_path / "tasks.db"), None, lambda: {})
+    origin = {"x": -5, "y": 59, "z": -132}
+    target = {"x": -9, "y": 58, "z": -146}
+    key = "s5:raid_fortress:default:chunk:-1:-9"
+    gallery = key + ":gallery:-1:14:-17"
+    route = {"origin": origin, "dimension": "minecraft:the_nether", "visited": [target]}
+    entry = {"tool": "raid_fortress", "method_key": gallery, "receipt_confirmed": True, "status": "blocked",
+             "result_data": {"fortress_evidence": {"route": route}}}
+    supervisor.state = {"counters": {"method_failures": {gallery: 3}}, "action_history": [entry]}
+    state = modern_state(position=origin, dimension="the_nether", inventory={})
+    scout = StepSpec("侦察", "raid_fortress", {"surveyed": [{"x": -4, "z": -11}]}, {})
+    step, method = supervisor._fortress_portal_exit(scout, state, key)
+    assert step.tool == "goto" and step.arguments == {**target, "nether_safe": True}
+    supervisor.state["action_history"].append({"tool": "goto", "method_key": method, "status": "failed"})
+    assert supervisor._fortress_portal_exit(scout, state, key)[0] == scout
+
+
+def test_s5_exhausted_connected_survey_opens_a_gallery_then_scouts_from_new_ground(tmp_path):
+    supervisor = GoalSupervisor(GOALS["S5"], TaskStore(tmp_path / "tasks.db"), None, lambda: {})
+    key = "s5:raid_fortress:default:chunk:-2:4"
+    origin = {"x": -24, "y": 83, "z": 65}
+    route = {"origin": origin, "attempted_waypoints": 0}
+    supervisor.state = {"action_history": [{"tool": "raid_fortress", "method_key": key + ":follow_cells",
+        "receipt_confirmed": True, "status": "blocked", "result_data": {"fortress_evidence": {"route": route}}}]}
+    state = modern_state(position=origin, dimension="the_nether", health=20, food=20, inventory={"diamond_pickaxe": 1})
+    scout = StepSpec("侦察", "raid_fortress", {"scout_only": True, "surveyed": [{"x": -24, "z": 54}]}, {})
+    step, method = supervisor._fortress_portal_exit(scout, state, key)
+    assert step.tool == "strip_mine" and step.arguments["direction"] == "south"
+    assert method.endswith(":south")
+    previous = {"tool": "strip_mine", "receipt_confirmed": True, "status": "failed",
+                "result_data": {"nether_passages": {"origin": origin, "lengths": {"west": 2}}},
+                "terminal_observation": {"session_id": state["session_id"]}}
+    supervisor.state["action_history"].append(previous)
+    alternative, _ = supervisor._fortress_portal_exit(scout, state, key)
+    assert alternative.arguments["length"] == 2 and alternative.arguments["direction"] == "west"
+    previous["terminal_observation"]["session_id"] = "old-session"
+    assert supervisor._fortress_portal_exit(scout, state, key)[0] == step
+    state["position"] = step.verify["target"]
+    step, method = supervisor._fortress_portal_exit(scout, state, key)
+    assert step == scout and ":gallery:" in method
+    supervisor.state["counters"] = {"method_failures": {method: 2}}
+    step, method = supervisor._fortress_portal_exit(scout, state, key)
+    assert method.endswith(":descend") and step.arguments["shaft"] == 6
+    state["position"]["y"] -= 6
+    assert supervisor.verifier.check(step.verify, state)[0]
+    state["dimension"] = "overworld"
+    assert not supervisor.verifier.check(step.verify, state)[0]
+
+
+def test_s4_flooded_descent_requires_a_confirmed_same_session_safety_receipt(tmp_path):
+    supervisor = GoalSupervisor(GOALS["S4"], TaskStore(tmp_path / "tasks.db"), None, lambda: {})
+    pos = {"x": 101, "y": 17, "z": 9}
+    receipt = modern_state(revision=41, ready=False, position=pos)
+    entry = {"action_id": "shaft", "tool": "strip_mine", "status": "preempted", "receipt_confirmed": True,
+             "session_id": "world-1", "revision": 35, "expected_condition": {"type": "s4_depth_reached", "target_y": 16},
+             "result_data": {"preempt_cause": "safety_priority", "observation": receipt,
+                             "safety_interruption": {"event": "low_oxygen", "safety_action_id": "air", "position": pos}}}
+    supervisor.state = {"action_history": [entry], "s4_descent_segments": 3}
+    current = modern_state(session_id="after-restart", revision=4)
+    assert supervisor._recover_s4_interrupted_shaft(entry, current)
+    assert supervisor.state["s4_flooded_shaft"]["position"] == pos
+    assert supervisor.state["s4_descent_segments"] == 3
+    entry["result_data"]["observation"] = {**receipt, "session_id": "wrong"}
+    assert not supervisor._recover_s4_interrupted_shaft(entry, current)
+
+
+def test_s4_flood_bypass_requires_a_dry_destination_away_from_the_water(tmp_path):
+    supervisor = GoalSupervisor(GOALS["S4"], TaskStore(tmp_path / "tasks.db"), None, lambda: {})
+    rule = {"type": "s4_water_bypass", "hazard": {"x": 101, "y": 17, "z": 9}}
+    pending = {"session_id": "world-1", "revision": 1, "receipt_confirmed": True,
+               "baseline_position": {"x": 101, "y": 17, "z": 7}}
+    state = modern_state(revision=2, position={"x": 109, "y": 17, "z": 7}, surface_access={"sky_light": 0})
+    check = supervisor._verify_pending_method_condition
+    assert check(rule, state, pending, "succeeded", {"observation": state})[0]
+    state["surface_access"]["in_water"] = True
+    assert not check(rule, state, pending, "succeeded", {"observation": state})[0]
+    state.update(position={"x": 105, "y": 17, "z": 9}, surface_access={"sky_light": 0})
+    assert not check(rule, state, pending, "succeeded", {"observation": state})[0]
+
+
+async def test_s3_horizontal_arrival_below_exit_switches_to_stairs(tmp_path):
+    store = TaskStore(tmp_path / "exit.db")
+    store.initialize()
+    task = store.create_task("S3", "S3")
+    state = modern_state(is_day=True, food=20, position={"x": 86, "y": 52, "z": 20},
+                         surface_access={"sky_light": 0, "exit": {"x": 86, "y": 66, "z": 20}},
+                         shelter={"position": {"x": 28, "y": 61, "z": 124}, "size": 4, "inside": False},
+                         inventory={"iron_pickaxe": 1, "iron_sword": 1, "bucket": 1, "iron_ingot": 1,
+                                    "oak_planks": 3, "porkchop": 4, "crafting_table": 1})
+    calls = []
+
+    async def dispatch(tool, arguments, timeout_s=0, **kwargs):
+        calls.append(tool)
+        state["revision"] += 1
+        if tool == "strip_mine":
+            assert arguments == {"rise": 6}
+            state["position"]["y"] += arguments["rise"]
+            state["inventory"]["shield"] = 1
+        return ActionResult(action_id=kwargs["action_id"], ok=True, status="succeeded", detail="完成",
+                            data={"observation": dict(state)})
+
+    supervisor = GoalSupervisor(GOALS["S3"], store, dispatch, lambda: state)
+    result = await asyncio.wait_for(supervisor.run(task.id), 8)
+    assert result["status"] == "done", result
+    assert calls == ["goto", "strip_mine"]
+    store.close()
+
 
 @pytest.mark.asyncio
 async def test_s3_surface_recovery_stale_admission_does_not_consume_route(tmp_path):

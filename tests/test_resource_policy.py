@@ -10,6 +10,68 @@ from voxkin.agent.tasks import TaskStore
 from voxkin.bridge.protocol import ActionResult
 
 
+def test_full_mining_inventory_stores_excess_before_collecting_new_drops():
+    state = world(cobblestone=640, diamond_pickaxe=1, diamond=3, oak_log=15, crafting_table=1)
+    state.update(inventory_free_slots=0, is_day=False)
+    step, key = choose_supply_opportunity("S5", state, {})
+    assert step.tool == "store_items"
+    assert step.arguments == {"item": "cobblestone", "count": 512, "range": 5,
+                              "place_if_missing": True, "craft_if_missing": True}
+    assert step.verify == {"type": "inventory_free_slots", "min": 2}
+    assert choose_supply_opportunity("S5", state, {"counters": {"method_failures": {key: 1}}}) is None
+    state["inventory_free_slots"] = 6
+    assert choose_supply_opportunity("S5", state, {}) is None
+
+
+def test_full_nether_inventory_preserves_wood_and_avoids_repeated_drops_in_one_chunk():
+    state = world(basalt=384, oak_planks=4, diamond=3)
+    state.update(dimension="the_nether", inventory_free_slots=0)
+    step, key = choose_supply_opportunity("S5", state, {})
+    assert step.tool == "discard_rubble" and step.arguments == {"item": "basalt"}
+    assert step.verify == {"type": "inventory_free_slots", "min": 2}
+    state["inventory"]["diamond_pickaxe"] = 1
+    assert choose_supply_opportunity("S5", state, {"method_index": 7}) is None
+    assert choose_supply_opportunity("S5", state, {"method_index": 8})[0].tool == "discard_rubble"
+    ledger = {"action_history": [{"method_key": key, "status": "succeeded"}]}
+    assert choose_supply_opportunity("S5", state, ledger) is None
+    state["resource_sites"]["chests"] = [{"x": 1, "y": 64, "z": 1}]
+    assert choose_supply_opportunity("S5", state, {})[0].tool == "store_items"
+    state["resource_sites"]["chests"] = []
+    state["inventory"]["basalt"] = 128
+    assert choose_supply_opportunity("S5", state, {}) is None
+
+
+def test_visible_water_fills_a_bucket_after_s3_only_once_per_source():
+    state = world(bucket=1)
+    state["resource_sites"]["water_source"] = {"x": 1, "y": 63, "z": 0}
+    ledger = {}
+    assert choose_supply_opportunity("S3", state, ledger) is None
+    step, _ = choose_supply_opportunity("S4", state, ledger)
+    assert step.tool == "fill_water_bucket"
+    assert choose_supply_opportunity("S4", state, ledger) is None
+
+
+def test_early_stock_plants_one_available_sapling_without_counting_wood():
+    state, ledger = world(oak_sapling=3), {}
+    soil = {"x": 2, "y": 64, "z": 0}
+    state["resource_sites"]["oak_planting_site"] = soil
+    step, _ = choose_supply_opportunity("S1", state, ledger)
+    assert step.tool == "place_block" and step.arguments == {"block": "oak_sapling", **soil}
+    assert choose_supply_opportunity("S1", state, ledger) is None
+    assert state["inventory"] == {"oak_sapling": 3}
+
+
+def test_prepares_wood_for_shield_and_spare_handles_once_before_entering_mine():
+    state = world(oak_log=1, oak_planks=2, stick=3)
+    state["surface_access"] = {"connected_land": True}
+    ledger = {}
+    step, _ = choose_supply_opportunity("S3", state, ledger)
+    assert step.arguments["count"] == 3
+    assert choose_supply_opportunity("S3", state, ledger) is None
+    state["inventory"]["oak_log"] = 3
+    assert choose_supply_opportunity("S3", state, {}) is None
+
+
 def world(**inventory):
     return {"dimension": "overworld", "health": 20, "food": 20, "is_day": True,
             "resource_sites": {}, "inventory_free_slots": 10, "inventory": inventory,
