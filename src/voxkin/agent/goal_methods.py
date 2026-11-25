@@ -1276,6 +1276,8 @@ def choose_s4_preflight_action(
     goal_state.pop("s4_preflight_wait_reason", None)
     goal_state.pop("s4_preflight_block_reason", None)
 
+    if goal_state.get("s4_threat_position") and is_overworld and health > S4_MIN_HEALTH:
+        return True, None
     if needs_diamond_mining and not isinstance(shelter.get("inside"), bool):
         return wait("等待 Bridge 明确观察角色位于庇护所内还是室外")
 

@@ -1710,11 +1710,36 @@ function safeStairOpening(bot, position) {
   });
 }
 
-export async function leaveCoveredMiningSite(ctx, threat, origin, minimum, attempted) {
+export async function leaveCoveredMiningSite(ctx, threat, origin, minimum, attempted, walkOnly = false) {
   const bot = ctx.bot;
   const danger = threat.position.clone();
   const initialHealth = bot.health;
   const distance = (a, b) => Math.hypot(a.x - b.x, a.z - b.z);
+  if (walkOnly && String(bot.game?.dimension).replace(/^minecraft:/, '') === 'overworld' && bot.setControlState && bot.look) {
+    const {points, parents} = await reachableDryGround(ctx, 400, minimum + 8);
+    const separation = origin.distanceTo(danger);
+    const exits = points.filter(p => distance(origin, p.offset(0.5, 0, 0.5)) >= minimum + 0.5
+      && p.distanceTo(danger) > Math.max(11, separation));
+    exits.sort((a, b) => a.distanceTo(origin) - b.distanceTo(origin));
+    for (const exit of exits) {
+      const path = [];
+      for (let p = exit; parents.has(p.toString()); p = parents.get(p.toString())) path.push(p);
+      if (path.length > minimum * 3 || path.some(p => p.offset(0.5, 0, 0.5).distanceTo(danger) < separation - 0.5)) continue;
+      attempted.push({x: exit.x, y: exit.y, z: exit.z});
+      for (const next of path.reverse()) {
+        checkInterrupted(ctx);
+        if (bot.health < initialHealth || bot.health <= 10) throw new Error('沿旧矿道撤离时受伤，转入生存恢复');
+        const nearest = ctx.findHostile(10)?.position;
+        if (nearest && next.offset(0.5, 0, 0.5).distanceTo(nearest) < Math.max(4, bot.entity.position.distanceTo(nearest) - 0.5)) break;
+        if (await walkDryCell(ctx, next, 'overworld') !== 'reached') break;
+      }
+      break;
+    }
+  }
+  if (walkOnly) {
+    if (distance(bot.entity.position, origin) >= minimum && !ctx.nearbyHostiles(10).length) return;
+    throw new Error('已观察的干燥矿道未能通到足够远的安全位置');
+  }
   for (let i = 0; i < minimum + 8; i++) {
     checkInterrupted(ctx);
     const actual = bot.entity.position;

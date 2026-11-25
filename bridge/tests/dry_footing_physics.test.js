@@ -5,8 +5,9 @@ import blockFactory from 'prismarine-block';
 import physicsModule from 'prismarine-physics';
 import { Vec3 } from 'vec3';
 import { walkDryCell } from '../dry_footing.js';
+import { leaveCoveredMiningSite } from '../skills/gather.js';
 
-test('主世界矿道逐格上下台阶，使用 Java 1.21.1 方块和 Prismarine 碰撞', async () => {
+function stairWorld() {
   const data = minecraftData('1.21.1'), Block = blockFactory('1.21.1');
   const controls = {forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false};
   const world = {getBlock(point) {
@@ -26,9 +27,26 @@ test('主世界矿道逐格上下台阶，使用 Java 1.21.1 方块和 Prismarin
   };
   const physics = physicsModule.Physics(data, world);
   const ctx = {bot, sleep: async () => physics.simulatePlayer(new physicsModule.PlayerState(bot, controls), world).apply(bot)};
+  return {ctx, bot, controls};
+}
+
+test('主世界矿道逐格上下台阶，使用 Java 1.21.1 方块和 Prismarine 碰撞', async () => {
+  const {ctx, bot, controls} = stairWorld();
   for (const x of [1, 2, 1, 0]) {
     assert.equal(await walkDryCell(ctx, new Vec3(x, 61 + x, 0), 'overworld'), 'reached');
     assert.ok(bot.entity.onGround);
     assert.ok(Object.values(controls).every(value => !value));
   }
+});
+
+test('上方洞穴有苦力怕，先沿已打通的矿道步行撤离', async () => {
+  const {ctx, bot, controls} = stairWorld();
+  const origin = bot.entity.position.clone();
+  const threat = {position: origin.offset(2, 7, 0)};
+  ctx.findHostile = radius => bot.entity.position.distanceTo(threat.position) < radius ? threat : null;
+  ctx.nearbyHostiles = radius => ctx.findHostile(radius) ? [threat] : [];
+  await leaveCoveredMiningSite(ctx, threat, origin, 12, [], true);
+  assert.ok(bot.entity.position.x < origin.x - 12);
+  assert.equal(bot.entity.position.y, origin.y);
+  assert.ok(Object.values(controls).every(value => !value));
 });

@@ -52,7 +52,7 @@ async function exploreMiningSite(args, ctx) {
       !waterLike(bot.blockAt(bot.entity.position.offset(0, bot.entity.eyeHeight ?? 1.62, 0)))) {
     if (args.covered_escape === true) {
       try {
-        await leaveCoveredMiningSite(ctx, threat, origin, minimum, attempted);
+        await leaveCoveredMiningSite(ctx, threat, origin, minimum, attempted, args.connected_route === true);
       } catch (error) { fail(error.message); }
       check();
       const actual = bot.entity.position;

@@ -138,6 +138,22 @@ def test_s4_retraces_only_a_confirmed_nearby_stair_to_replace_its_pick():
     assert not distant.arguments.get("dry_only")
 
 
+def test_s4_replans_a_supply_ascent_after_a_creeper_stops_mining(tmp_path):
+    state = s4_state(y=68, inventory={"stick": 1}, is_day=True)
+    row = {"action_id": "ascent", "tool": "strip_mine", "status": "failed", "receipt_confirmed": True,
+           "session_id": state["session_id"], "revision": state["revision"] - 1,
+           "expected_condition": {"type": "min_height", "y": 70},
+           "result_data": {"reason": "nearby_hostiles", "observation": state}}
+    supervisor = GoalSupervisor(GOALS["S4"], TaskStore(tmp_path / "task.db"), None, lambda: state)
+    supervisor.state = {}
+    assert supervisor._recover_s4_mining_threat(row)
+    assert choose_s4_preflight_action(state, supervisor.state) == (True, None)
+    retreat = choose_s4_resource_action(state, supervisor.state)
+    assert retreat.verify["type"] == "s4_threat_relocation"
+    assert retreat.arguments["avoid_positions"] == [state["position"]]
+    assert not supervisor._recover_s4_mining_threat({**row, "receipt_confirmed": False})
+
+
 def test_s4_hunts_above_the_observed_local_exit_even_when_the_shelter_is_lower():
     exit_point = {"x": -60, "y": 72, "z": 202}
     state = s4_state(position={"x": -59.5, "y": 66, "z": 202.5}, time=2000, is_day=True,

@@ -481,6 +481,12 @@ class GoalSupervisor:
                             p = state["position"]
                             method_key += f":connected:{math.floor(p['x']/8)}:{math.floor(p['y']/4)}:{math.floor(p['z']/8)}"
                 elif self._method_stage == "S4":
+                    latest = (self.state.get("action_history") or [{}])[-1]
+                    last_position = (latest.get("terminal_observation") or {}).get("position")
+                    if (latest.get("action_id") and latest["action_id"] != self.state.get("s4_last_threat_action")
+                            and self._finite_position(last_position) and self._finite_position(state.get("position"))
+                            and math.dist(tuple(last_position[a] for a in "xyz"), tuple(state["position"][a] for a in "xyz")) <= 3):
+                        self._recover_s4_mining_threat(latest)
                     preflight_ready, preflight_step = choose_s4_preflight_action(state, self.state)
                     if not preflight_ready and preflight_step is None:
                         block_reason = str(self.state.get("s4_preflight_block_reason") or "")
@@ -504,8 +510,10 @@ class GoalSupervisor:
                     step_index = None
                     method_key = s4_method_key(step, state, self.state)
                     if step.verify.get("type") == "s4_threat_relocation" and self._method_failure_count(method_key):
-                        step = replace(step, arguments={**step.arguments, "covered_escape": True})
-                        method_key += ":covered_escape"
+                        walk_key = method_key + ":connected_retreat"
+                        walk = not self._method_failure_count(walk_key)
+                        step = replace(step, arguments={**step.arguments, "covered_escape": True, "connected_route": walk})
+                        method_key = walk_key if walk else method_key + ":covered_escape"
                     flood = self.state.get("s4_flooded_shaft")
                     bypass_type = "s4_water_bypass"
                     hazard = None
@@ -2429,8 +2437,8 @@ class GoalSupervisor:
         return handled
 
     def _recover_s4_mining_threat(self, row: dict) -> bool:
-        if (self._method_stage != "S4" or row.get("tool") != "strip_mine" or row.get("status") not in {"blocked", "failed"}
-                or row.get("receipt_confirmed") is not True or (row.get("expected_condition") or {}).get("type") != "s4_depth_reached"):
+        if (self._method_stage != "S4" or row.get("tool") not in {"strip_mine", "mine_collect"}
+                or row.get("status") not in {"blocked", "failed"} or row.get("receipt_confirmed") is not True):
             return False
         data = row.get("result_data") or {}
         terminal = _fresh_terminal_observation(row, data)
@@ -2439,6 +2447,7 @@ class GoalSupervisor:
                 "格内有敌对生物（" in detail and detail.endswith("），停止采矿"))):
             return False
         self.state["s4_threat_position"] = dict(terminal["position"])
+        self.state["s4_last_threat_action"] = row.get("action_id")
         return True
 
     def _recover_s4_surface_fallback(self, entry: dict, current: dict) -> bool:
@@ -2787,6 +2796,9 @@ class GoalSupervisor:
     def _retry_or_block_method(self, method_key: str, detail: str) -> str:
         failures = self._method_failure_count(method_key)
         latest = (self.state.get("action_history") or [{}])[-1]
+        if latest.get("method_key") == method_key and self._recover_s4_mining_threat(latest):
+            self._save()
+            return "retry"
         if (latest.get("method_key") == method_key and latest.get("receipt_confirmed")
                 and (latest.get("expected_condition") or {}).get("type") == "s3_wood_relocation"
                 and (latest.get("result_data") or {}).get("relocation")):
