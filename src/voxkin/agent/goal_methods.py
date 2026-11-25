@@ -544,6 +544,28 @@ def _s3_needs_surface_route(state: dict[str, Any]) -> bool:
     return math.isfinite(anchor_y) and y < anchor_y - S3_SURFACE_ROUTE_MIN_VERTICAL
 
 
+def _s4_return_stair(state: dict[str, Any], ledger: dict[str, Any]) -> dict | None:
+    if str(state.get("dimension")).removeprefix("minecraft:") != "overworld":
+        return None
+    position = state.get("position") or {}
+    if not all(type(position.get(a)) in (int, float) and math.isfinite(position[a]) for a in "xyz"):
+        return None
+    failures = (ledger.get("counters") or {}).get("method_failures") or {}
+    for stair in reversed(ledger.get("s4_mining_stairs") or []):
+        top, bottom = stair["top"], stair["bottom"]
+        if not 2 < top["y"] - position["y"] <= S4_DESCENT_STEP + 2:
+            continue
+        if math.dist(tuple(bottom[a] for a in "xyz"), tuple(position[a] for a in "xyz")) > 8:
+            continue
+        if not failures.get(_s4_stair_key(top)):
+            return stair
+    return None
+
+
+def _s4_stair_key(target: dict) -> str:
+    return "s4:return_stair:" + ":".join(str(target[a]) for a in "xyz")
+
+
 def _s3_return_to_known_surface(
     state: dict[str, Any], goal_state: dict[str, Any], *, staged_supply_route: bool = False,
 ) -> StepSpec | None:
@@ -564,6 +586,14 @@ def _s3_return_to_known_surface(
             target["y"] = math.floor(position["y"]) + 6
         return _s3_action("分段返回附近已观察到的露天地面", "goto", target,
                           {"type": "position", "target": target, "radius": 2.0}, 90.0)
+    stair = _s4_return_stair(state, goal_state)
+    if stair:
+        if _danger_now(state) or (stair.get("outdoors") and _is_day(state) is not True):
+            goal_state["s3_preflight_wait_reason"] = "在已走过的矿道里等待安全返程时机"
+            return None
+        target = stair["top"]
+        return _s3_action("沿已走过的干燥矿道回到上一段入口", "goto", {**target, "dry_only": True},
+                          {"type": "position", "target": target, "radius": 2.0, "site": "mining_stair"}, 70.0)
     shelter = state.get("shelter") or {}
     anchor = shelter.get("position") or {}
     try:
@@ -1135,7 +1165,7 @@ def choose_s4_preflight_action(
 ) -> tuple[bool, StepSpec | None]:
     inventory = state.get("inventory") or {}
     shelter = state.get("shelter") or {}
-    needs_surface_route = _s3_needs_surface_route(state)
+    needs_surface_route = _s3_needs_surface_route(state) or bool(_s4_return_stair(state, goal_state))
     is_overworld = str(state.get("dimension") or "").strip().lower() in {
         "overworld",
         "minecraft:overworld",
@@ -1469,7 +1499,7 @@ def choose_s4_resource_action(state: dict[str, Any], goal_state: dict[str, Any])
         "strip_mine",
         {
             "shaft": shaft_depth,
-            "length": 1,
+            "length": 0,
             "branches": 0,
             "branchLength": 1,
             "torchInterval": 0,
@@ -1522,6 +1552,15 @@ def record_s4_descent_success(
     if not verified:
         return False
     goal_state["s4_descent_segments"] = int(goal_state.get("s4_descent_segments", 0)) + 1
+    start, end = pending.get("baseline_position") or {}, state.get("position") or {}
+    if (status == "succeeded" and (pending.get("arguments") or {}).get("length") == 0
+            and str(state.get("dimension")).removeprefix("minecraft:") == "overworld"
+            and all(type(p.get(a)) in (int, float) and math.isfinite(p[a]) for p in (start, end) for a in "xyz")
+            and 0 < start["y"] - end["y"] <= S4_DESCENT_STEP + 2):
+        route = goal_state.setdefault("s4_mining_stairs", [])
+        route.append({"top": {a: math.floor(start[a]) for a in "xyz"}, "bottom": {a: math.floor(end[a]) for a in "xyz"},
+                      "outdoors": pending.get("baseline_connected_land") is True})
+        del route[:-64]
     goal_state["s4_diamond_no_progress"] = 0
     goal_state.pop("s4_resource_block_reason", None)
     return True
@@ -1766,6 +1805,8 @@ def s4_method_key(step: StepSpec, state: dict[str, Any], goal_state: dict[str, A
         pos = step.arguments["avoid_positions"][0]
         return f"s4:retreat:{math.floor(pos['x'] / 16)}:{math.floor(pos['y'] / 8)}:{math.floor(pos['z'] / 16)}"
     if step.tool == "goto":
+        if step.verify.get("site") == "mining_stair":
+            return _s4_stair_key(step.verify["target"])
         return "s4:surface_route:shelter_anchor"
     if step.tool == "strip_mine":
         if goal_state.get("s4_safe_route_fallback_pending") is True:

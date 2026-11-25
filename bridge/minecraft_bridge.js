@@ -764,9 +764,12 @@ async function runAction(message, token) {
         break;
       }
       case 'goto':
-        detail = args.nether_safe === true
-          ? await returnToNetherWaypoint(buildSkillContext(null, token, message), vec(args.x, args.y, args.z))
-          : await goTo(Number(args.x), Number(args.y), Number(args.z));
+        if (args.nether_safe === true) {
+          detail = await returnToNetherWaypoint(buildSkillContext(null, token, message), vec(args.x, args.y, args.z));
+        } else {
+          const walk = () => goTo(Number(args.x), Number(args.y), Number(args.z));
+          detail = args.dry_only === true ? await withDryGroundMovement(bot, walk, true) : await walk();
+        }
         break;
       case 'break_block':
         detail = await breakBlock(args);

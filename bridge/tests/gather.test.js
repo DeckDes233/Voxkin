@@ -2,8 +2,18 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Vec3 } from 'vec3';
 
-import { observeNetherPassages, skills, surfaceWoodRoute } from '../skills/gather.js';
+import { directionFromYaw, observeNetherPassages, skills, surfaceWoodRoute } from '../skills/gather.js';
+import { facingFromYaw } from '../skills/nether.js';
 import { scanSurfaceLogs } from '../surface_wood_scan.js';
+import { reachableDryGround } from '../dry_footing.js';
+
+test('采矿和建门方向与 Mineflayer lookAt 的四个方位一致', () => {
+  for (const [x, z, name] of [[0, -1, 'north'], [-1, 0, 'west'], [0, 1, 'south'], [1, 0, 'east']]) {
+    const yaw = Math.atan2(-x, -z);
+    assert.deepEqual(directionFromYaw(yaw), {x, z, name});
+    assert.deepEqual(facingFromYaw(yaw), {x, z});
+  }
+});
 
 test('下界巷道止步回执从脚下实测可开挖长度，遇未知地基就停止', () => {
   const bot = {game: {dimension: 'the_nether'}, entity: {position: new Vec3(0.5, 58, 0.5)}, blockAt(p) {
@@ -311,6 +321,23 @@ test('上行台阶逐层验证站位，头顶有沙砾时不挖', async () => {
   }
   await assert.rejects(skills.strip_mine.handler({rise: 1, direction: 'east'}, blocked), /未找到有支撑/);
   assert.equal(blocked.digs.length, 0);
+});
+
+test('分两段下矿，转身后仍能沿有净空的原台阶步行返回', async () => {
+  const ctx = makeContext();
+  const start = ctx.bot.entity.position.clone();
+  for (const dy of [0, 1]) {
+    const p = start.offset(0, dy, 0);
+    ctx.blocks.set([p.x, p.y, p.z].join(','), {name: 'air', boundingBox: 'empty', position: p});
+  }
+  for (const yaw of [0, Math.PI]) {
+    ctx.bot.entity.yaw = yaw;
+    const result = await skills.strip_mine.handler({shaft: 3, length: 0, torchInterval: 0}, ctx);
+    assert.equal(result.status, 'succeeded');
+  }
+  assert.equal(ctx.bot.entity.position.y, start.y - 6);
+  const {points} = await reachableDryGround(ctx, 150, 12);
+  assert.ok(points.some(p => p.equals(start)));
 });
 
 test('采矿不挖悬空的脚下支撑，结束后还原寻路落差设置', async () => {
@@ -993,7 +1020,7 @@ test('deep_mine descends by a supported stair instead of stepping into a cave op
   }, ctx);
 
   assert.equal(result.status, 'succeeded');
-  assert.deepEqual(ctx.digs.slice(0, 2).map(({ x, y, z }) => [x, y, z]), [[0, 2, 1], [0, 1, 1]]);
+  assert.deepEqual(ctx.digs.slice(0, 2).map(({ x, y, z }) => [x, y, z]), [[0, 2, -1], [0, 1, -1]]);
   assert.equal(ctx.bot.entity.position.y, 0);
 });
 

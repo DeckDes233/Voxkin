@@ -3312,8 +3312,10 @@ class GoalSupervisor:
             "method_key": method_key,
         }
         if ((self.goal.stage in {"S2", "S3", "S4", "S5", "S6"} and step.tool == "explore_mining_site")
-                or step.verify.get("type") in {"s4_water_bypass", "s4_ledge_bypass", "s5_shaft_displacement"}):
+                or step.verify.get("type") in {"s4_water_bypass", "s4_ledge_bypass", "s5_shaft_displacement", "s4_depth_reached"}):
             pending["baseline_position"] = dict(state_before.get("position") or {})
+        if step.verify.get("type") == "s4_depth_reached":
+            pending["baseline_connected_land"] = (state_before.get("surface_access") or {}).get("connected_land") is True
         if self.goal.stage == "S3" and step.tool == "mine_collect" and (step.arguments.get("block") in {"iron_ore", "deepslate_iron_ore"}):
             pending["baseline_raw_iron"] = inventory_count(state_before.get("inventory") or {}, "raw_iron")
         if self.goal.stage == "S3" and step.tool == "mine_collect" and step.arguments.get("block") in {*S3_OVERWORLD_WOOD_LOGS, "wood_log"}:

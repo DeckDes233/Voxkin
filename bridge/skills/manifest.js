@@ -221,6 +221,7 @@ module.exports = {
           description: '目标坐标 Z。',
         },
         {name: 'nether_safe', type: 'boolean', required: false, default: false, description: '只沿已连通的下界干地回到附近路标。'},
+        {name: 'dry_only', type: 'boolean', required: false, default: false, description: '沿已有干地行走，禁止挖掘、跑酷和入水。'},
       ],
       preconditions: '桥接已连接且 bot 已进入世界；目标坐标可寻路。',
       observations: '实时读取 bot.entity.position。',
@@ -2621,7 +2622,7 @@ module.exports = {
           type: 'number',
           required: false,
           default: 32,
-          description: "主巷道长度（格）。",
+          description: "主巷道长度（格）。有 shaft 时传 0 表示只挖可原路返回的台阶。",
         },
         {
           name: 'branches',

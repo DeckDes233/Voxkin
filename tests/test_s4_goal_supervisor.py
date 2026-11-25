@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from voxkin.agent.actions import ActionError
-from voxkin.agent.goal_methods import choose_s4_preflight_action
+from voxkin.agent.goal_methods import choose_s4_preflight_action, record_s4_descent_success, s4_method_key
 from voxkin.agent.goal_supervisor import GoalSupervisor, choose_s4_resource_action
 from voxkin.agent.goals import GOALS, method_for_goal
 from voxkin.agent.tasks import TaskStore
@@ -113,6 +113,29 @@ def test_s4_keeps_mining_in_a_confirmed_dark_shaft_above_the_shelter():
     state["surface_access"].update(sky_light=15, connected_land=True)
     _, step = choose_s4_preflight_action(state, ledger)
     assert step.tool == "mine_collect" and step.arguments["block"].endswith("_log")
+
+
+def test_s4_retraces_only_a_confirmed_nearby_stair_to_replace_its_pick():
+    state = s4_state(y=66, is_day=True, surface_access={"sky_light": 0}, inventory={"crafting_table": 1, "porkchop": 4})
+    start = {"x": -10.5, "y": 78, "z": 169.3}
+    action = {"session_id": state["session_id"], "revision": state["revision"] - 1, "receipt_confirmed": True,
+              "tool": "strip_mine", "method_key": "s4:descend:1:66", "expected_condition": {"type": "s4_depth_reached", "target_y": 66},
+              "arguments": {"shaft": 12, "length": 0}, "baseline_position": start, "baseline_connected_land": True}
+    ledger = {}
+    assert record_s4_descent_success(ledger, action, state, "succeeded")
+    _, step = choose_s4_preflight_action(state, ledger)
+    assert step.arguments == {"x": -11, "y": 78, "z": 169, "dry_only": True}
+    key = s4_method_key(step, state, ledger)
+    state["is_day"] = False
+    assert choose_s4_preflight_action(state, ledger) == (False, None)
+    state["is_day"] = True
+    ledger["counters"] = {"method_failures": {key: 1}}
+    _, fallback = choose_s4_preflight_action(state, ledger)
+    assert not fallback.arguments.get("dry_only")
+    ledger["counters"] = {}
+    state["position"]["x"] += 20
+    _, distant = choose_s4_preflight_action(state, ledger)
+    assert not distant.arguments.get("dry_only")
 
 
 def test_s4_hunts_above_the_observed_local_exit_even_when_the_shelter_is_lower():

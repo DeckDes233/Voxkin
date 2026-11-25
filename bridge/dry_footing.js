@@ -68,19 +68,26 @@ export function exposedMagmaCube(bot, p, cubes) {
     && feet.distanceTo(e.position) < 9.5 && !magmaCubeBehindCover(bot, e, feet));
 }
 
-export async function walkNetherCell(ctx, p) {
+export function walkNetherCell(ctx, p) {
+  return walkDryCell(ctx, p, 'the_nether');
+}
+
+export async function walkDryCell(ctx, p, dimension) {
   const bot = ctx.bot, start = bot.entity.position.floored();
+  const nether = dimension === 'the_nether', health = bot.health;
+  if (!nether && (dimension !== 'overworld' || !dryMiningFooting(bot, start))) return 'unreachable';
   if (Math.abs(start.x - p.x) + Math.abs(start.z - p.z) > 1 || Math.abs(p.y - start.y) > 1) return 'unreachable';
   if (bot.pathfinder?.goal) bot.pathfinder.setGoal(null);
   try {
     for (let tick = 0; tick < 22; tick++) {
       if (ctx.interrupted) return 'cancelled';
       const pos = bot.entity.position;
-      if (!['the_nether', 'minecraft:the_nether'].includes(bot.game?.dimension)) return 'unreachable';
-      const safe = dryMiningFooting(bot, p), hazard = netherRouteExclusion(bot, {position: p});
-      const cliff = besideDrop(bot, p), cube = exposedMagmaCube(bot, p, Object.values(bot.entities || {}));
+      if (String(bot.game?.dimension).replace(/^minecraft:/, '') !== dimension || bot.health < health) return 'unreachable';
+      const safe = dryMiningFooting(bot, p);
+      const hazard = nether ? netherRouteExclusion(bot, {position: p}) : miningRouteExclusion(bot, {position: p});
+      const cliff = nether && besideDrop(bot, p), cube = nether && exposedMagmaCube(bot, p, Object.values(bot.entities || {}));
       if (!safe || hazard || cliff || cube) {
-        ctx.log?.('下界停步', {target: p, footing: safe, hazard, cliff, magma_cube: cube});
+        ctx.log?.('干地停步', {target: p, footing: safe, hazard, cliff, magma_cube: cube});
         return 'unreachable';
       }
       const dx = p.x + 0.5 - pos.x, dz = p.z + 0.5 - pos.z, distance = Math.hypot(dx, dz);
@@ -92,7 +99,7 @@ export async function walkNetherCell(ctx, p) {
       bot.setControlState('forward', distance > 0.18);
       await ctx.sleep(50);
     }
-    ctx.log?.('下界一步未到位', {target: p, actual: bot.entity.position, on_ground: bot.entity.onGround});
+    ctx.log?.('干地一步未到位', {target: p, actual: bot.entity.position, on_ground: bot.entity.onGround});
     return 'unreachable';
   } finally {
     bot.setControlState('forward', false);

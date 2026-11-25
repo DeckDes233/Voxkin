@@ -1,5 +1,6 @@
 // 下界模块：黑曜石下界门、维度坐标换算、堡垒探索、烈焰棒收集。
 import { besideDrop, dryMiningFooting, exposedMagmaCube, followNetherPath, netherRouteExclusion, reachableNetherGround } from '../dry_footing.js';
+import { forwardCell } from './movement.js';
 // 契约见 docs/plans/SKILL_MODULE_CONTRACT.md；对应路线图 M7.1-M7.4。
 //
 // 约束：
@@ -264,18 +265,10 @@ export function isLavaName(name) {
   return text.startsWith('lava_');
 }
 
-// yaw 0 面向 +Z，顺时针增大；返回正交的单位朝向。
+// 与 Mineflayer 移动使用相同的朝向。
 export function facingFromYaw(yaw) {
-  const angle = Number(yaw);
-  const headings = [
-    { x: 0, z: 1 },
-    { x: -1, z: 0 },
-    { x: 0, z: -1 },
-    { x: 1, z: 0 },
-  ];
-  if (!Number.isFinite(angle)) return headings[0];
-  const index = Math.round(angle / (Math.PI / 2));
-  return headings[((index % 4) + 4) % 4];
+  const {dx, dz} = forwardCell(Number(yaw) || 0);
+  return {x: dx, z: dz};
 }
 
 // 数值夹取。

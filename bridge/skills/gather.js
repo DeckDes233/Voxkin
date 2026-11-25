@@ -9,9 +9,10 @@
 //   如果 ctx 没有 craftItem，就只能在返回里说明缺什么。
 
 import { findBlocksWithExploration, resourceCandidates } from '../resource_search.js';
-import { besideDrop, dryMiningFooting, exposedMagmaCube, followDryGround, followNetherPath, miningRouteExclusion, netherRouteExclusion, reachableDryGround, reachableNetherGround, walkNetherCell } from '../dry_footing.js';
+import { besideDrop, dryMiningFooting, exposedMagmaCube, followDryGround, followNetherPath, miningRouteExclusion, netherRouteExclusion, reachableDryGround, reachableNetherGround, walkDryCell, walkNetherCell } from '../dry_footing.js';
 import { surfaceSkyLight, waterLike } from '../water_escape.js';
 import { scanSurfaceLogs } from '../surface_wood_scan.js';
+import { forwardCell } from './movement.js';
 import { setImmediate as yieldToGame } from 'node:timers/promises';
 
 // 掉落在这一格之外的掉落物就算离得太远，捡不到。
@@ -44,7 +45,7 @@ const PASSABLE_NAMES = new Set([
   'tall_grass', 'short_grass', 'dead_bush', 'oak_sign', 'poppy', 'dandelion',
 ]);
 
-// 四个正方向的朝向表，yaw 0 面向 +Z（南），顺时针增大。
+// 候选路线按南、西、北、东枚举。
 const CARDINAL_HEADINGS = [
   { x: 0, z: 1, name: 'south' },
   { x: -1, z: 0, name: 'west' },
@@ -159,12 +160,12 @@ export function dropItemName(registry, blockEntry, fallback) {
   return fallback;
 }
 
-// 朝向换算：Minecraft 的 yaw 0 面向 +Z，顺时针增大。
+// Mineflayer 的 yaw 0 朝北，正 π/2 朝西。
 export function directionFromYaw(yaw) {
   const angle = Number(yaw);
   if (!Number.isFinite(angle)) return null;
-  const index = Math.round(angle / (Math.PI / 2));
-  return CARDINAL_HEADINGS[((index % 4) + 4) % 4];
+  const {dx, dz} = forwardCell(angle);
+  return CARDINAL_HEADINGS.find(h => h.x === dx && h.z === dz);
 }
 
 // 朝向换算：按名字取朝向。
@@ -850,10 +851,13 @@ function dropFailureState(ctx, position) {
 }
 
 // 往前走一步。返回 'reached' | 'unreachable' | 'stopped' | 'cancelled'。
-async function stepForward(ctx, position) {
+async function stepForward(ctx, position, onStair = false) {
   checkInterrupted(ctx);
   if (['the_nether', 'minecraft:the_nether'].includes(ctx.bot.game?.dimension) && ctx.bot.setControlState && ctx.bot.look) {
     return walkNetherCell(ctx, toVec3(ctx.bot, position));
+  }
+  if (onStair && ['overworld', 'minecraft:overworld'].includes(ctx.bot.game?.dimension) && ctx.bot.setControlState && ctx.bot.look) {
+    return walkDryCell(ctx, toVec3(ctx.bot, position), 'overworld');
   }
   if (typeof ctx.walkOnce !== 'function') return 'unreachable';
   const outcome = await ctx.walkOnce(position.x, position.y, position.z, 0, 8000);
@@ -1026,7 +1030,7 @@ async function placeTorch(ctx, cell, state, notes) {
 }
 
 // 沿有支撑的阶梯下降；不跨空腔、流体或未加载区块。
-async function digShaftDown(ctx, depth, state, lowHealth = LOW_HEALTH, targetY = null) {
+async function digShaftDown(ctx, depth, state, lowHealth = LOW_HEALTH, targetY = null, returnable = false) {
   const bot = ctx.bot;
   let preferred = directionFromYaw(bot.entity.yaw) || CARDINAL_HEADINGS[0];
   const triedStairs = new Set();
@@ -1076,14 +1080,27 @@ async function digShaftDown(ctx, depth, state, lowHealth = LOW_HEALTH, targetY =
         candidateEvidence.push(candidate);
         continue;
       }
-      if ([footPosition, headPosition].some(p => !isPassableBlock(blockAtPos(bot, p)) && !safeStairOpening(bot, p))) {
+      const opening = [headPosition, footPosition];
+      if (returnable) {
+        const clearance = offsetPos(headPosition, 0, 1, 0);
+        if (dryMiningFooting(bot, toVec3(bot, clearance))) {
+          candidate.reason = 'up_stair_support';
+          candidateEvidence.push(candidate);
+          continue;
+        }
+        opening.unshift(clearance);
+      }
+      if (opening.some(p => {
+        const block = blockAtPos(bot, p);
+        return !block || waterLike(block) || isHazardBlock(block) || (!isPassableBlock(block) && !safeStairOpening(bot, p));
+      })) {
         failures.push(`${formatPosition(footPosition)} 开口可能引入流体或落沙`);
         candidate.reason = 'unstable_opening';
         candidateEvidence.push(candidate);
         continue;
       }
 
-      for (const position of [headPosition, footPosition]) {
+      for (const position of opening) {
         const block = blockAtPos(bot, position);
         if (isPassableBlock(block)) continue;
         const dug = await digAt(ctx, position);
@@ -1096,13 +1113,18 @@ async function digShaftDown(ctx, depth, state, lowHealth = LOW_HEALTH, targetY =
       }
       const clearFoot = blockAtPos(bot, footPosition);
       const clearHead = blockAtPos(bot, headPosition);
+      if (returnable && !isPassableBlock(blockAtPos(bot, opening[0]))) {
+        candidate.reason = 'return_headroom';
+        candidateEvidence.push(candidate);
+        continue;
+      }
       if (!isPassableBlock(clearFoot) || !isPassableBlock(clearHead)) {
         candidate.reason = candidate.reason || 'corridor_not_clear';
         candidateEvidence.push(candidate);
         continue;
       }
 
-      const walk = await stepForward(ctx, footPosition);
+      const walk = await stepForward(ctx, footPosition, returnable);
       checkInterrupted(ctx);
       if (walk !== 'reached') {
         failures.push(`${formatPosition(footPosition)} 无法安全走到阶梯落点`);
@@ -1777,7 +1799,7 @@ async function climbMiningStairs(ctx, count, preferred, fillGaps, clearByHand) {
         support = blockAtPos(bot, floorAt);
         if (support?.name !== 'cobblestone' || support.boundingBox !== 'block') continue;
       }
-      const outcome = await stepForward(ctx, landing);
+      const outcome = await stepForward(ctx, landing, true);
       const actual = floorPos(bot.entity.position);
       if (actual.x === landing.x && actual.y === landing.y && actual.z === landing.z) {
         if (!dryMiningFooting(bot, bot.entity.position)) throw new Error('上行后无法确认落点仍是干地');
@@ -1813,6 +1835,12 @@ async function stripMine(args, ctx) {
   const notes = [];
   const state = { mined: 0, torches: 0, branches: 0, steps: 0 };
   const start = floorPos(bot.entity.position);
+  if (shaft > 0 && args.length === 0) {
+    await withDryMiningMovement(ctx, () => digShaftDown(ctx, shaft, state, LOW_HEALTH, targetY, true), {surfaceOnly: true});
+    const end = floorPos(bot.entity.position);
+    if (targetY !== null && end.y !== targetY) throw new Error(`下探停在 Y=${end.y}，目标 Y=${targetY}`);
+    return {status: 'succeeded', detail: `已下行 ${start.y - end.y} 层并留出返程净空，落点 ${formatPosition(end)}`};
+  }
 
   // 火把：先用 ctx 的合成能力补货，没有就记下来继续挖。
   const torchPlan = torchInterval > 0 ? Math.floor(length / torchInterval) + 1 : 0;
@@ -2264,7 +2292,7 @@ export const skills = {
     description:
       '挖一条主巷道加若干分支，头顶 2 格与前方 1 格必须通得过，沿途放火把，遇岩浆或水停下并上报坐标。',
     parameters: [
-      { name: 'length', type: 'number', required: false, default: 32, description: '主巷道长度（格）。' },
+      { name: 'length', type: 'number', required: false, default: 32, description: '主巷道长度（格）。有 shaft 时传 0 表示只挖可原路返回的台阶。' },
       { name: 'branches', type: 'number', required: false, default: 2, description: '支巷数量。' },
       { name: 'branchLength', type: 'number', required: false, default: 8, description: '每条支巷的长度（格）。' },
       { name: 'shaft', type: 'number', required: false, default: 0, description: '开始前先挖多深的垂直竖井。' },
