@@ -27,6 +27,7 @@ const SURFACE_HEIGHT_OFFSETS = [0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, 
 const TORCH_INTERVAL = 8;
 // 钻石矿的两种 id，普通钻石矿在深层是 deepslate_diamond_ore。
 const DIAMOND_ORES = ['diamond_ore', 'deepslate_diamond_ore'];
+const PASSAGE_STONE = new Set(['stone', 'cobblestone', 'andesite', 'diorite', 'granite', 'tuff', 'deepslate', 'cobbled_deepslate']);
 const OVERWORLD_LOGS = ['oak', 'spruce', 'birch', 'jungle', 'acacia', 'dark_oak', 'mangrove', 'cherry'].map(name => `${name}_log`);
 // 深层必须躲开的两类洞穴怪。
 const DEEP_DANGER_MOBS = new Set(['enderman', 'ghast']);
@@ -725,6 +726,20 @@ function toolIsBroken(bot) {
   }
 }
 
+// 为钻石矿保留最后一把能采钻的镐。普通围岩可用随身石镐清除。
+function passagePick(bot, block) {
+  if (!PASSAGE_STONE.has(block.name) || !block.canHarvest || !bot.inventory?.items) return null;
+  const items = bot.inventory.items();
+  const reserve = items.filter(i => ['iron_pickaxe', 'diamond_pickaxe', 'netherite_pickaxe'].includes(i.name));
+  if (reserve.length !== 1) return null;
+  const stone = items.find(i => i.name === 'stone_pickaxe' && block.canHarvest(i.type));
+  if (stone) return stone;
+  if (reserve[0].maxDurability - reserve[0].durabilityUsed <= 24) {
+    return items.find(i => i.name === 'wooden_pickaxe' && block.canHarvest(i.type));
+  }
+  return null;
+}
+
 // 挖一个方块。先按方块换工具，再挖。
 // 返回 { ok, reason, message }，失败不抛错，由调用方决定算不算致命。
 async function digAt(ctx, position, options = {}) {
@@ -746,13 +761,18 @@ async function digAt(ctx, position, options = {}) {
     };
   }
   try {
-    await ctx.equipToolFor(block);
+    const pick = passagePick(bot, block);
+    if (pick) {
+      if (bot.heldItem?.slot !== pick.slot) await bot.equip(pick, 'hand');
+    } else {
+      await ctx.equipToolFor(block);
+    }
   } catch (error) {
     checkInterrupted(ctx);
     return { ok: false, reason: 'tool', message: `换工具失败：${error.message}` };
   }
   checkInterrupted(ctx);
-  const passageStone = options.clearByHand && ['stone', 'cobblestone', 'andesite', 'diorite', 'granite', 'tuff', 'deepslate', 'cobbled_deepslate'].includes(block.name);
+  const passageStone = options.clearByHand && PASSAGE_STONE.has(block.name);
   if (!passageStone && typeof block.canHarvest === 'function' && !block.canHarvest(bot.heldItem?.type ?? null)) {
     return { ok: false, reason: 'tool', block, message: '当前工具不能采得该方块的掉落物' };
   }

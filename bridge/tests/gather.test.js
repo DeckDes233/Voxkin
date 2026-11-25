@@ -304,6 +304,25 @@ test('徒手清普通石头能开出逃生台阶并确认高度', async () => {
   assert.ok(ctx.digs.length > 0);
 });
 
+test('用石镐开台阶，把唯一的铁镐留给确实需要铁镐的矿石', async () => {
+  const ctx = makeContext();
+  const iron = {name: 'iron_pickaxe', type: 81, slot: 36, maxDurability: 250, durabilityUsed: 127};
+  const stone = {name: 'stone_pickaxe', type: 80, slot: 37};
+  ctx.bot.heldItem = iron;
+  ctx.bot.inventory = {items: () => [iron, stone]};
+  ctx.bot.equip = async item => { ctx.bot.heldItem = item; };
+  ctx.equipToolFor = async () => { ctx.bot.heldItem = iron; };
+  const read = ctx.bot.blockAt, dig = ctx.bot.dig;
+  ctx.bot.blockAt = p => ({...read(p), canHarvest: type => type === iron.type || type === stone.type});
+  const used = [];
+  ctx.bot.dig = async b => { used.push([b.name, ctx.bot.heldItem.name]); await dig(b); };
+  ctx.blocks.set('1,12,0', {name: 'diamond_ore', position: new Vec3(1, 12, 0), boundingBox: 'block'});
+  assert.equal((await skills.strip_mine.handler({rise: 1, direction: 'east'}, ctx)).status, 'succeeded');
+  assert.ok(used.some(([name, tool]) => name === 'diamond_ore' && tool === 'iron_pickaxe'));
+  assert.ok(used.some(([name]) => name === 'stone'));
+  assert.ok(used.every(([name, tool]) => name !== 'stone' || tool === 'stone_pickaxe'));
+});
+
 test('上行台阶逐层验证站位，头顶有沙砾时不挖', async () => {
   const ctx = makeContext();
   const result = await skills.strip_mine.handler({rise: 3, direction: 'east'}, ctx);
