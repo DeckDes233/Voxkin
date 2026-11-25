@@ -592,6 +592,22 @@ test('end skills stop before interacting when cancelled', async () => {
   assert.equal(attacks, 0);
 });
 
+test('投出的眼停在头顶上方时，角色不以自己的朝向代替轨迹', async () => {
+  const bot = {
+    game: {dimension: 'overworld'}, entity: {position: makePosition(10, 64, 20), yaw: 0}, entities: {}, health: 20,
+    inventory: {items: () => [{name: 'ender_eye', count: 1}]}, findBlocks: () => [], blockAt: () => null,
+    async equip() {}, async look() {}, async deactivateItem() {},
+    async activateItem() { this.entities[1] = {id: 1, name: 'eye_of_ender', position: makePosition(10, 71, 20)}; },
+  };
+  let moves = 0;
+  const result = await withFakeClock(async ({sleep}) => skills.throw_eye.handler({count: 1, advance: 64}, {
+    bot, countItem: () => Object.keys(bot.entities).length ? 0 : 1, sleep,
+    async walkOnce() { moves++; return 'unreachable'; },
+  }));
+  assert.equal(result.data.stronghold_search.phase, 'blocked');
+  assert.equal(moves, 0);
+});
+
 test('throw_eye stores overhead evidence and measured inventory change without claiming a frame', async () => {
   const bot = {
     game: { dimension: 'minecraft:overworld' },

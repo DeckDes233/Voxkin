@@ -201,11 +201,6 @@ function copyPosition(position) {
   };
 }
 
-function directionFromYaw(yaw) {
-  const angle = Number(yaw) || 0;
-  return { dx: -Math.sin(angle), dz: Math.cos(angle) };
-}
-
 function entityName(entity) {
   return String((entity && entity.name) || '').toLowerCase();
 }
@@ -796,7 +791,6 @@ async function throwEye(args, ctx) {
 
     const origin = copyPosition(bot.entity.position);
     const yaw = Number(bot.entity.yaw) || 0;
-    const fallback = directionFromYaw(yaw);
     const knownIds = new Set(eyeEntities(ctx).map((entity) => entity.id));
 
     await bot.equip(eye, 'hand');
@@ -809,18 +803,17 @@ async function throwEye(args, ctx) {
 
     const observed = await trackEye(ctx, knownIds, 4800);
     throwIfInterrupted(ctx, '寻找要塞');
-    let direction = fallback;
+    let direction = null;
     let eyeDistance = null;
     if (observed) {
       eyeDistance = Math.hypot(observed.position.x - origin.x, observed.position.z - origin.z);
-      const fromFlight = normalizeVector(observed.position.x - origin.x, observed.position.z - origin.z);
-      if (fromFlight) direction = fromFlight;
+      direction = normalizeVector(observed.position.x - origin.x, observed.position.z - origin.z);
     } else {
       notes.push('未观察到飞行实体，停止按方向移动');
     }
 
-    lastDirection = observed ? direction : null;
-    if (observed) throwRecords.push({
+    lastDirection = direction;
+    if (direction) throwRecords.push({
       x: origin.x,
       z: origin.z,
       dx: direction.dx,
@@ -840,7 +833,7 @@ async function throwEye(args, ctx) {
     }
 
     lastFrameScan = scanFramesFresh(ctx, frameRadius);
-    if (observed && lastFrameScan.fresh && lastFrameScan.stable) {
+    if ((direction || overheadEvidence) && lastFrameScan.fresh && lastFrameScan.stable) {
       const checkpoint = makeSearch(overheadEvidence ? 'descend' : throws < maxThrows ? 'bearing' : 'blocked', lastFrameScan);
       checkpoint.throw_limit = maxThrows;
       if (!overheadEvidence) {
@@ -856,8 +849,7 @@ async function throwEye(args, ctx) {
     if (lastFrameScan.frames.length > 0) {
       return {
         detail:
-          `第 ${throws} 次投掷后，在 ${frameRadius} 格内发现 ${lastFrameScan.frames.length} 个末地门框架，` +
-          `方向 (${direction.dx.toFixed(2)}, ${direction.dz.toFixed(2)})，可以开始激活末地门`,
+          `第 ${throws} 次投掷后，在 ${frameRadius} 格内发现 ${lastFrameScan.frames.length} 个末地门框架，可以开始激活末地门`,
         status: 'succeeded',
         data: { stronghold_search: { ...makeSearch('frames_found', lastFrameScan), phase: 'frames_found' } },
       };
@@ -885,7 +877,7 @@ async function throwEye(args, ctx) {
     }
 
     const estimate = estimatedPosition();
-    if (!observed) break;
+    if (!direction) break;
     if (advance > 0 && estimate && estimate.distance <= advance + frameRadius) {
       const moved = await moveToward(ctx, estimate.x, estimate.z, 4);
       throwIfInterrupted(ctx, '寻找要塞');
