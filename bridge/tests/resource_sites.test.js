@@ -3,6 +3,20 @@ import test from 'node:test';
 import { Vec3 } from 'vec3';
 import { inspectResourceSites } from '../resource_sites.js';
 
+test('有树苗才观察附近种植位置，排除营地和低顶', () => {
+  const origin = new Vec3(0, 64, 0);
+  let low = false;
+  const bot = {entity: {position: origin}, game: {dimension: 'overworld'}, time: {isDay: true},
+    inventory: {items: () => [{name: 'oak_sapling'}]}, blockAt(p) {
+      const solid = p.y < 64 || low && p.y === 67;
+      return {name: solid ? 'grass_block' : 'air', boundingBox: solid ? 'block' : 'empty', skyLight: 15};
+    }};
+  assert.deepEqual(inspectResourceSites(bot).oak_planting_site, {x: 2, y: 64, z: 0});
+  assert.equal(inspectResourceSites(bot, {position: origin}).oak_planting_site, undefined);
+  low = true;
+  assert.equal(inspectResourceSites(bot).oak_planting_site, undefined);
+});
+
 test('burst observations reuse only positions and refresh on movement, new sessions and direct skill reads', () => {
   const position = new Vec3(1, 64, 0);
   const block = { name: 'hay_block', position };

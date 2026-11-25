@@ -2,6 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { FUEL_BURN, selectFuel } from '../fuel.js';
 
+test('只在明确指定时消耗木镐作为一件物品的燃料', () => {
+  const items = [{name: 'wooden_pickaxe', count: 1}];
+  assert.equal(selectFuel(items), null);
+  assert.equal(selectFuel(items, [1], 'wooden_pickaxe'), items[0]);
+  assert.equal(selectFuel(items, [2], 'wooden_pickaxe'), null);
+});
+
 test('fuel selection skips insufficient coal and uses enough spruce across rounds', () => {
   const items = [{ name: 'coal', count: 1 }, { name: 'spruce_planks', count: 7 }];
   assert.equal(selectFuel(items, [8, 1]).name, 'spruce_planks');

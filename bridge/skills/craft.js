@@ -31,6 +31,7 @@ export const SMELT_MAP = {
 };
 
 import { FUEL_BURN, selectFuel } from '../fuel.js';
+import { forwardCell } from './movement.js';
 export { FUEL_BURN } from '../fuel.js';
 
 // 熔炼一轮最多烧几个。熔炉每 10 秒烧一个，8 个约 80 秒，
@@ -663,12 +664,8 @@ function torchSpots(ctx, need, spacing) {
   const base = bot.entity.position;
   const feetY = Math.floor(base.y);
   const yaw = Number(bot.entity.yaw) || 0;
-  const forwardX = -Math.sin(yaw);
-  const forwardZ = Math.cos(yaw);
-  const axis =
-    Math.abs(forwardX) >= Math.abs(forwardZ)
-      ? { x: Math.sign(forwardX) || 1, z: 0 }
-      : { x: 0, z: Math.sign(forwardZ) || 1 };
+  const {dx, dz} = forwardCell(yaw);
+  const axis = {x: dx, z: dz};
   const sides =
     axis.x !== 0 ? [{ x: 0, z: 1 }, { x: 0, z: -1 }] : [{ x: 1, z: 0 }, { x: -1, z: 0 }];
   const spots = [];

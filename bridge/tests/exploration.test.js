@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Vec3 } from 'vec3';
 import { dryMiningFooting, miningSiteCandidates, miningRouteExclusion, skills } from '../skills/exploration.js';
+import { crossSurfaceWater, findSurfaceCrossing } from '../surface_crossing.js';
 
 test('换区前脱离逼近的敌人，并从原起点核对实际位移', async () => {
   const ctx = context();
@@ -31,6 +32,74 @@ function context() {
   ctx.walkOnce = async (x, y, z) => { ctx.bot.entity.position = new Vec3(x, y, z); return 'reached'; };
   return ctx;
 }
+
+test('换矿区可沿连通的干燥走廊分段走出，自始至终核实位移', async () => {
+  const ctx = context();
+  const origin = ctx.bot.entity.position.floored();
+  ctx.bot.blockAt = p => p.y < origin.y && p.z === origin.z && p.x >= origin.x && p.x < origin.x + 28
+    ? {name: 'stone', boundingBox: 'block'} : {name: 'air', boundingBox: 'empty'};
+  const steps = [];
+  ctx.walkOnce = async (x,y,z) => {
+    assert.ok(ctx.bot.entity.position.floored().distanceTo(new Vec3(x,y,z)) <= 3);
+    ctx.bot.entity.position = new Vec3(x+0.5,y,z+0.5);
+    steps.push(x);
+    return 'reached';
+  };
+  const {data} = await skills.explore_mining_site.handler({min_distance: 16, connected_route: true}, ctx);
+  assert.ok(steps.length >= 6 && data.relocation.destination.x - data.relocation.origin.x >= 16);
+});
+
+test('补木换区沿连通的干地优先走向已观察的树干', async () => {
+  const ctx = context(), toward = {x: -40, y: 64, z: 0};
+  const result = await skills.explore_mining_site.handler({min_distance: 16, connected_route: true, toward}, ctx);
+  assert.equal(result.status, 'succeeded');
+  assert.ok(result.data.relocation.destination.x < -16);
+});
+
+test('补木渡水只选择有完整水面和干岸的路线，取消后立即停止划水', async () => {
+  const ctx = context(), bot = ctx.bot, start = bot.entity.position.floored(), toward = new Vec3(32, 64, 0);
+  Object.assign(bot, {food: 19, game: {dimension: 'overworld'}, time: {isDay: true}});
+  let covered = false;
+  bot.blockAt = p => {
+    if (p.z !== 0) return null;
+    if (p.x > 0 && p.x < 21 && p.y === 63) return p.x === 8 ? {name: 'kelp', boundingBox: 'empty'} : {name: 'water', metadata: 0};
+    if (p.y < 64 || (covered && p.x === 10 && p.y === 65)) return {name: 'stone', boundingBox: 'block'};
+    return {name: 'air', boundingBox: 'empty', skyLight: 15};
+  };
+  const ground = {here: start, points: [], parents: new Map()};
+  const route = await findSurfaceCrossing(ctx, ground, toward, 16, []);
+  assert.deepEqual(route.bank, new Vec3(21, 64, 0));
+  const controls = {};
+  bot.look = async () => {};
+  bot.setControlState = (key, on) => { controls[key] = on; };
+  ctx.sleep = async () => { ctx.interrupted = true; };
+  await assert.rejects(crossSurfaceWater(ctx, ground, route, () => {
+    if (ctx.interrupted) throw new Error('取消');
+  }), /取消/);
+  assert.equal(controls.forward, false);
+  assert.equal(controls.jump, false);
+  ctx.interrupted = false;
+  covered = true;
+  assert.equal(await findSurfaceCrossing(ctx, ground, toward, 16, []), null);
+});
+
+test('撤退通道背离实际敌怪，仍用角色位移和敌怪距离验收', async () => {
+  const ctx = context();
+  const threat = { position: new Vec3(0.5, 64, 3.5) };
+  ctx.findHostile = radius => ctx.bot.entity.position.distanceTo(threat.position) < radius ? threat : null;
+  ctx.nearbyHostiles = radius => ctx.findHostile(radius) ? [threat] : [];
+  const { data } = await skills.explore_mining_site.handler({min_distance: 12, covered_escape: true}, ctx);
+  assert.ok(data.relocation.destination.z <= -11.5);
+  assert.equal(ctx.nearbyHostiles(10).length, 0);
+});
+
+test('敌怪撤离方向没有地面支撑时保留起点', async () => {
+  const ctx = context(), original = ctx.bot.blockAt;
+  ctx.findHostile = () => ({position: new Vec3(0.5, 64, 3.5)});
+  ctx.bot.blockAt = p => p.y === 63 ? {name: 'air', boundingBox: 'empty'} : original(p);
+  await assert.rejects(skills.explore_mining_site.handler({min_distance: 12, covered_escape: true}, ctx), /可安全开挖/);
+  assert.deepEqual(ctx.bot.entity.position, new Vec3(0.5, 64, 0.5));
+});
 
 test('换矿点必须真实位移并到达干燥站位，退出时恢复寻路参数', async () => {
   const ctx = context(), before = { ...ctx.bot.pathfinder.movements };
@@ -64,6 +133,15 @@ test('候选排除未加载区块、水、含水方块与危险地面', () => {
   assert.equal(dryMiningFooting(ctx.bot, ctx.bot.entity.position), false);
   ctx.bot.blockAt = () => null;
   assert.deepEqual(miningSiteCandidates(ctx.bot, ctx.bot.entity.position, 16, []), []);
+});
+
+test('斜向下坡绕不过干地限制，水面上的空气也排除', () => {
+  const ctx = context();
+  const dryBlock = ctx.bot.blockAt;
+  ctx.bot.blockAt = p => p.x === 1 && p.z === 1 && p.y === 63
+    ? {name: 'water', boundingBox: 'empty'} : dryBlock(p);
+  assert.equal(miningRouteExclusion(ctx.bot, {position: new Vec3(1, 64, 1)}), 100);
+  assert.equal(miningRouteExclusion(ctx.bot, {position: new Vec3(0, 64, 0)}), 0);
 });
 
 test('途中取消停止尝试且不泄漏临时寻路参数', async () => {

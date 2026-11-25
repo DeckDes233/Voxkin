@@ -75,6 +75,7 @@ from voxkin.agent.goal_methods import (
     _danger_now,
     _fresh_terminal_observation,
     _fresh_terminal_state,
+    _hunt_closing,
     _is_day,
     _position_y,
     _s3_action,
@@ -97,6 +98,7 @@ from voxkin.agent.goal_methods import (
     choose_early_survival_action,
     choose_s3_preflight_action,
     choose_s3_resource_action,
+    start_s3_ore_region,
     choose_s4_preflight_action,
     choose_s4_resource_action,
     mark_s4_known_no_safe_stair,
@@ -150,6 +152,13 @@ class GoalSupervisor:
         self.state: dict[str, Any] = {}
         self._stop_requested = False
         self._cached_state: dict[str, Any] = {}
+
+    @property
+    def _method_stage(self) -> str:
+        # S5 丢镐时复用 S4 的采钻与对账逻辑；验收、任务号和总预算始终属于原目标。
+        if self.goal.stage == "S5" and self.state.get("s5_rebuild_pickaxe"):
+            return "S4"
+        return self.goal.stage
 
     def stop(self, reason: str = "user_stop") -> None:
         persisted = self.store.load_goal_state(self.task_id) if self.task_id is not None else None
@@ -240,7 +249,10 @@ class GoalSupervisor:
                         break
             if self._migrate_known_s3_stripmine_terminal(saved["unresolved_action"]):
                 saved = self.state
-            elif self._late_action_recovery(unresolved, current):
+            elif (self._recover_s4_known_stair_stop(unresolved, current)
+                  or self._recover_s4_surface_fallback(unresolved, current)
+                  or self._recover_s4_interrupted_shaft(unresolved, current)
+                  or self._late_action_recovery(unresolved, current)):
                 self.state.pop("unresolved_action")
                 self.state["pending_action"] = None
                 self.state["status"] = "active"
@@ -346,6 +358,10 @@ class GoalSupervisor:
                     return self._result(False, str(self.state.get("status") or "blocked"), str(self.state.get("block_reason") or "世界未就绪"))
                 self._record_observation(state)
                 context = self._condition_context(state)
+                if self.state.get("s5_rebuild_pickaxe") and any(
+                    inventory_count(state.get("inventory") or {}, item) for item in ("diamond_pickaxe", "netherite_pickaxe")
+                ):
+                    self.state.pop("s5_rebuild_pickaxe")
                 completed_events = self._completed_events()
                 complete, reason = evaluate_condition(
                     self.goal.acceptance,
@@ -447,16 +463,30 @@ class GoalSupervisor:
                                       else "s3:surface_route:shelter_anchor")
                     elif step.tool == "mine_collect" and resource == "wood_log" and step.arguments.get("within_reach"):
                         method_key = "s3:surface_fuel_wood"
+                    elif step.tool == "mine_collect" and resource == "coal_ore" and step.arguments.get("local_vein"):
+                        method_key = "s3:nearby_coal"
                     elif step.tool == "mine_collect" and resource in {*S3_OVERWORLD_WOOD_LOGS, "wood_log"}:
                         context = _s3_wood_search_context(state) or "unknown"
                         method_key = f"s3:wood_search:{context}:{resource}"
                     else:
                         method_key = f"s3:{step.tool}:{resource}"
-                    if step.tool == "strip_mine":
+                    if step.tool == "strip_mine" and step.verify.get("site") == "mining_exit":
+                        p = state["position"]
+                        method_key = f"s3:ore_relocate:climb:{math.floor(p['x']/8)}:{math.floor(p['y'])}:{math.floor(p['z']/8)}"
+                    elif step.tool == "strip_mine":
                         method_key = f"s3:ore_expose:region{int(self.state.get('s3_ore_regions', 0))}:{int(self.state.get('s3_ore_expose_used', 0)) + 1}"
                     elif step.tool == "explore_mining_site" and step.verify.get("type") == "s3_mining_relocation":
                         method_key = f"s3:ore_relocate:{int(self.state.get('s3_ore_regions', 0))}"
-                elif self.goal.stage == "S4":
+                        if step.arguments.get("connected_route"):
+                            p = state["position"]
+                            method_key += f":connected:{math.floor(p['x']/8)}:{math.floor(p['y']/4)}:{math.floor(p['z']/8)}"
+                elif self._method_stage == "S4":
+                    latest = (self.state.get("action_history") or [{}])[-1]
+                    last_position = (latest.get("terminal_observation") or {}).get("position")
+                    if (latest.get("action_id") and latest["action_id"] != self.state.get("s4_last_threat_action")
+                            and self._finite_position(last_position) and self._finite_position(state.get("position"))
+                            and math.dist(tuple(last_position[a] for a in "xyz"), tuple(state["position"][a] for a in "xyz")) <= 3):
+                        self._recover_s4_mining_threat(latest)
                     preflight_ready, preflight_step = choose_s4_preflight_action(state, self.state)
                     if not preflight_ready and preflight_step is None:
                         block_reason = str(self.state.get("s4_preflight_block_reason") or "")
@@ -479,8 +509,42 @@ class GoalSupervisor:
                         )
                     step_index = None
                     method_key = s4_method_key(step, state, self.state)
+                    if step.verify.get("type") == "s4_threat_relocation" and self._method_failure_count(method_key):
+                        walk_key = method_key + ":connected_retreat"
+                        walk = not self._method_failure_count(walk_key)
+                        step = replace(step, arguments={**step.arguments, "covered_escape": True, "connected_route": walk})
+                        method_key = walk_key if walk else method_key + ":covered_escape"
+                    flood = self.state.get("s4_flooded_shaft")
+                    bypass_type = "s4_water_bypass"
+                    hazard = None
+                    if flood and step.tool == "strip_mine" and step.arguments.get("shaft"):
+                        step = StepSpec("离开进水的阶梯，再从干地重新下探", "explore_mining_site",
+                                        {"min_distance": 12, "avoid_positions": [flood["position"]]},
+                                        {"type": "s4_water_relocation", "min_distance": 12},
+                                        retries=1, timeout_s=160, effect_class="replan")
+                        method_key = f"s4:leave_flood:{flood['action_id']}"
+                        hazard = flood["position"]
+                    elif step.verify.get("type") == "s4_surface_relocation" and (state.get("surface_access") or {}).get("sky_light") == 0:
+                        hazard = step.arguments["avoid_positions"][-1]
+                        bypass_type = "s4_ledge_bypass"
+                    if hazard and self._method_failure_count(method_key):
+                        for direction in ("east", "west", "north", "south"):
+                            bypass_key = f"{method_key}:tunnel:{direction}"
+                            if bypass_type == "s4_ledge_bypass":
+                                bypass_key += f":{hazard['x']}:{hazard['z']}"
+                            if self._method_failure_count(bypass_key):
+                                continue
+                            step = StepSpec("从干燥侧壁开出新矿道并复核水平位移", "strip_mine",
+                                            {"direction": direction, "length": 8, "branches": 0, "torchInterval": 0},
+                                            {"type": bypass_type, "hazard": hazard},
+                                            retries=1, timeout_s=160, effect_class="replan")
+                            method_key = bypass_key
+                            break
                 elif self.goal.stage == "S5":
                     step, step_index = choose_s5_action(state, self.state)
+                    if step is None and self.state.get("s5_rebuild_pickaxe"):
+                        self._save()
+                        continue
                     step, step_index = prepare_late_action(step, step_index, state, self.state)
                     if step is None:
                         if self.state.get("late_game_wait_reason"):
@@ -495,6 +559,9 @@ class GoalSupervisor:
                         position = state["position"]
                         # 只在实到同一 Minecraft 区块时共用局部失败次数；任务总预算覆盖跨区侦察。
                         method_key += f":chunk:{math.floor(position['x'] / 16)}:{math.floor(position['z'] / 16)}"
+                        step, method_key = self._fortress_portal_exit(step, state, method_key)
+                        if step.tool != "raid_fortress":
+                            step_index = None
                     if step.tool == "collect_obsidian":
                         step, method_key = self._s5_obsidian_site(step, state, method_key)
                         if step.tool != "collect_obsidian":
@@ -603,16 +670,28 @@ class GoalSupervisor:
                             arguments={**step.arguments, "portal_hint": portal_hint},
                         )
 
-                if self.goal.stage in {"S3", "S4"} and step.tool == "sleep_safe":
+                if self._method_stage in {"S3", "S4"} and step.tool == "sleep_safe":
                     method_key = f"wood_sleep:day{state.get('day')}"
-                if (self.goal.stage in {"S3", "S4"} and step.tool == "mine_collect"
+                if step.tool == "hunt_animal" and self._method_stage in {"S3", "S4"} and self._method_failure_count(method_key):
+                    # 旧版曾把黄昏未开始的搜索记满次数。只有全部失败回执均来自关窗时段，才准入白天的新路线。
+                    failures = [entry for entry in self.state.get("action_history", [])
+                                if entry.get("method_key") == method_key and entry.get("receipt_confirmed")
+                                and entry.get("status") in {"failed", "blocked"}]
+                    if (len(failures) >= self._method_failure_count(method_key) and not _hunt_closing(state)
+                            and all(_hunt_closing(e.get("terminal_observation") or {}) for e in failures)):
+                        method_key += ":daylight"
+                if (self.goal.stage in {"S3", "S4", "S5", "S6"} and step.tool == "mine_collect"
                         and step.arguments.get("block") == "wood_log" and not step.arguments.get("within_reach")):
                     step = replace(step, arguments={**step.arguments, "surface_wood": True})
+                    if self.goal.stage in {"S5", "S6"}:
+                        method_key += f":{_s3_wood_search_context(state) or 'unknown'}"
+                        step_index = None
                     access = state.get("surface_access") or {}
                     exit_point = access.get("exit")
                     position = state.get("position")
                     if (self._finite_position(exit_point) and self._finite_position(position)
-                            and self._finite_number(access.get("sky_light")) and access["sky_light"] < 8
+                            and (access.get("connected_land") is not True or (
+                                self._finite_number(access.get("sky_light")) and access["sky_light"] < 12))
                             and exit_point["y"] - position["y"] >= 2 and state.get("is_day") is True
                             and self._method_failure_count(f"{method_key}:exit") < 2):
                         method_key += ":exit"
@@ -621,6 +700,41 @@ class GoalSupervisor:
                                         retries=1, timeout_s=90, effect_class="replan")
                     elif self._method_failure_count(method_key) and self._finite_position(position):
                         step, method_key = self._expand_wood_search(step, state, method_key)
+                if self._method_stage in {"S3", "S4"} and step.tool == "goto" and self._method_failure_count(method_key):
+                    exit_point = (state.get("surface_access") or {}).get("exit")
+                    position = state.get("position")
+                    if step.verify.get("site") == "supply_ascent":
+                        exit_point = step.arguments
+                    if (self._finite_position(exit_point) and self._finite_position(position)
+                            and self._finite_position(step.arguments) and step.arguments["y"] > position["y"]
+                            and 2 <= exit_point["y"] - position["y"] <= 24
+                            and math.hypot(exit_point["x"] - position["x"], exit_point["z"] - position["z"]) <= 9
+                            and str(state.get("dimension")).removeprefix("minecraft:") == "overworld"
+                            and not _s3_relocation_emergency(state)):
+                        step, method_key = self._surface_ascent(state, method_key, exit_point)
+                if (self._method_stage in {"S3", "S4"} and step.tool == "strip_mine" and step.arguments.get("rise")
+                        and self._method_failure_count(method_key) and self._can_climb_for_supply(state)):
+                    water_y = (state.get("surface_access") or {}).get("shallow_exit_y")
+                    if self._finite_number(water_y) and 2 <= water_y - math.floor(state["position"]["y"]) <= 5:
+                        step = StepSpec("从已观察的浅水出口上浮并靠岸", "swim_out", {"shallow_exit": True},
+                                        {"type": "min_height", "y": water_y}, retries=1, timeout_s=55, effect_class="replan")
+                        method_key += ":shore"
+                if (self.goal.stage in {"S3", "S4", "S5", "S6"} and (state.get("surface_access") or {}).get("in_water") is True
+                        and step.tool in {"strip_mine", "goto", "mine_collect", "explore_mining_site", "collect_obsidian", "safe_descend"}):
+                    open_water = state["surface_access"].get("open_water") is True
+                    step = StepSpec("先游到干地，再继续补给或采矿", "swim_out", {"shallow_exit": open_water},
+                                    {"type": "result_event", "event": "connected_bank_reached" if open_water else "dry_bank_reached"},
+                                    retries=1, timeout_s=55, effect_class="replan")
+                    method_key = f"{self.goal.stage.lower()}:swim_to_bank:{_s3_wood_search_context(state)}"
+                    ceiling = state["surface_access"].get("bank_ceiling")
+                    if self._finite_position(ceiling):
+                        method_key += f":headroom:{ceiling['x']}:{ceiling['y']}:{ceiling['z']}"
+                    if open_water:
+                        method_key += ":connected"
+                    if self.state.get("s4_flooded_shaft") and not open_water:
+                        step = replace(step, arguments={"block_flow": True})
+                        method_key += ":upstream"
+                    step_index = None
                 step = batch_resource_step(self.goal.stage, step, state)
                 outcome = await self._execute_step(step, method_key, step_index)
                 if outcome == "preempted":
@@ -908,7 +1022,7 @@ class GoalSupervisor:
         status: str,
         data: dict[str, Any],
     ) -> tuple[bool, str]:
-        if self.goal.stage == "S5" and condition.get("type") == "s5_shaft_displacement":
+        if (self._method_stage, condition.get("type")) in {("S4", "s4_water_bypass"), ("S4", "s4_ledge_bypass"), ("S5", "s5_shaft_displacement")}:
             observation = _fresh_terminal_observation(pending, data)
             origin = pending.get("baseline_position")
             end = (observation or {}).get("position")
@@ -916,11 +1030,18 @@ class GoalSupervisor:
                     or pending.get("receipt_confirmed") is not True or not _fresh_terminal_state(pending, status, state)):
                 return False, "换竖井缺少新鲜位置回执"
             distance = math.hypot(end["x"] - origin["x"], end["z"] - origin["z"])
+            if self._method_stage == "S4":
+                hazard = condition.get("hazard") or {}
+                if (not self._finite_position(hazard) or math.hypot(end["x"] - hazard["x"], end["z"] - hazard["z"]) < 7
+                        or (observation.get("surface_access") or {}).get("in_water")):
+                    return False, "尚未在离进水点足够远的干地确认新矿道"
             return status == "succeeded" and distance >= 4, f"已观察到水平位移 {distance:.1f} 格"
-        if (self.goal.stage, condition.get("type")) in {
+        if (self._method_stage, condition.get("type")) in {
             ("S3", "s3_mining_relocation"), ("S3", "s3_wood_relocation"), ("S2", "s2_wool_relocation"),
-            ("S4", "s3_wood_relocation"),
-            ("S5", "s5_obsidian_relocation"),
+            ("S4", "s3_wood_relocation"), ("S5", "s3_wood_relocation"), ("S6", "s3_wood_relocation"),
+            ("S4", "s4_water_relocation"), ("S4", "s4_surface_relocation"), ("S4", "s4_threat_relocation"),
+            ("S5", "s5_obsidian_relocation"), ("S5", "s5_portal_relocation"),
+            ("S5", "late_threat_relocation"), ("S6", "late_threat_relocation"),
         }:
             observation = _fresh_terminal_observation(pending, data)
             if status != "succeeded" or pending.get("receipt_confirmed") is not True or observation is None or not _fresh_terminal_state(pending, status, state):
@@ -945,7 +1066,7 @@ class GoalSupervisor:
             except (TypeError, ValueError, KeyError):
                 return False, "换矿区坐标无效"
             return True, "已在新鲜观察中确认换矿区"
-        if self.goal.stage == "S4" and condition.get("type") == "s4_depth_reached":
+        if self._method_stage == "S4" and condition.get("type") == "s4_depth_reached":
             if status not in {"succeeded", "blocked", "failed"}:
                 return False, f"S4 下探只接受 confirmed terminal receipt，当前状态={status}"
             observation = self._s4_fresh_terminal_observation(pending, status, state, data)
@@ -1095,7 +1216,7 @@ class GoalSupervisor:
         state: dict[str, Any],
         data: dict[str, Any],
     ) -> None:
-        if self.goal.stage != "S4" or not str(pending.get("action_id") or ""):
+        if self._method_stage != "S4" or not str(pending.get("action_id") or ""):
             return
         observation = self._s4_fresh_terminal_observation(pending, status, state, data)
         if observation is None:
@@ -1118,7 +1239,7 @@ class GoalSupervisor:
         status: str,
         data: dict[str, Any],
     ) -> tuple[bool, bool]:
-        if self.goal.stage != "S4":
+        if self._method_stage != "S4":
             return False, False
         if self._s4_action_event_seen(pending, "safe_stop"):
             return True, False
@@ -1168,7 +1289,7 @@ class GoalSupervisor:
 
     def _late_action_recovery(self, action: dict, current: dict) -> str:
         if (self.goal.stage == "S5" and action.get("tool") == "make_nether_portal"
-                and action.get("receipt_confirmed") is True and action.get("status") == "preempted"
+                and action.get("receipt_confirmed") is True and action.get("status") in {"preempted", "failed", "blocked"}
                 and str(current.get("dimension")).removeprefix("minecraft:") == "overworld" and current.get("alive")):
             site = (action.get("result_data") or {}).get("portal_site") or {}
             origin = site.get("origin") if isinstance(site, dict) else None
@@ -1176,6 +1297,22 @@ class GoalSupervisor:
                     and site.get("axis") in ("x", "z") and site.get("dimension") == "minecraft:overworld"):
                 self.state["s5_portal_site"] = {"origin": dict(origin), "axis": site["axis"], "dimension": site["dimension"]}
                 return "resume_observed_nether_portal_site"
+            if action.get("status") in {"failed", "blocked"} and not site:
+                search = (action.get("result_data") or {}).get("portal_search") or {}
+                stop = search.get("position") if search.get("outcome") == "no_site_before_build" else None
+                if not search and action.get("action_id") and str(action.get("result_detail") or "").endswith("附近没有足够大的空地放下下界门框"):
+                    # 旧桥接首次选址失败发生在放置前。双门或续建指令不能据此推断未施工。
+                    receipt = next((a for a in reversed(self.state.get("action_history", []))
+                                    if a.get("action_id") == action["action_id"] and a.get("tool") == "make_nether_portal"
+                                    and a.get("receipt_confirmed") is True), {})
+                    if receipt.get("arguments") == {}:
+                        stop = (receipt.get("terminal_observation") or {}).get("position")
+                if self._finite_position(stop):
+                    avoided = self.state.setdefault("s5_portal_search_stops", [])
+                    if stop not in avoided:
+                        avoided.append(dict(stop))
+                        del avoided[:-24]
+                    return "move_from_unsuitable_portal_site"
         if self._portal_preflight_stopped(action) or self._portal_insertion_reconciled(action, current):
             return "portal_room_approach"
         if self.goal.stage != "S6" or action.get("tool") != "fight_dragon" or action.get("receipt_confirmed") is not True:
@@ -1388,7 +1525,7 @@ class GoalSupervisor:
                 and pending.get("receipt_confirmed") is True):
             self.state["s3_relocation_surface_return_used"] = True
         wood = (pending.get("expected_condition") or {}).get("type") == "s3_wood_relocation"
-        if pending.get("tool") == "explore_mining_site" and (self.goal.stage == "S3" or (self.goal.stage == "S4" and wood)):
+        if pending.get("tool") == "explore_mining_site" and (self.goal.stage == "S3" or (self._method_stage == "S4" and wood)):
             if not wood:
                 self.state["s3_relocation_failed"] = True
             attempted = (data.get("relocation") or {}).get("attempted_positions") or data.get("attempted_positions") or []
@@ -1829,7 +1966,7 @@ class GoalSupervisor:
                     return consumed == "continue"
             expected = pending.get("expected_condition") or {"type": "always"}
             if (
-                self.goal.stage == "S4"
+                self._method_stage == "S4"
                 and result.status == "succeeded"
                 and pending.get("tool") == "strip_mine"
                 and expected.get("type") == "s4_depth_reached"
@@ -1862,7 +1999,7 @@ class GoalSupervisor:
                     self.store.set_status(self.task_id, "cancelled")
                     return False
                 return self._resolve_interrupted_action(pending, "cancelled", state, result.data)
-            if result.status == "partial" and self.goal.stage == "S4" and pending.get("tool") == "strip_mine":
+            if result.status == "partial" and self._method_stage == "S4" and pending.get("tool") == "strip_mine":
                 current = dict(self.state_provider() or state)
                 return self._resolve_interrupted_action(pending, "partial", current, result.data)
             if result.status in {"failed", "blocked"}:
@@ -2050,6 +2187,16 @@ class GoalSupervisor:
 
     def _advance_after_success(self, pending: dict[str, Any], data: dict[str, Any]) -> None:
         self._record_s5_portal_transition(pending, data)
+        if (pending.get("expected_condition") or {}).get("type") == "s4_threat_relocation":
+            self.state.pop("s4_threat_position", None)
+        if self._method_stage == "S4" and (pending.get("expected_condition") or {}).get("type") in {"s4_surface_relocation", "s4_ledge_bypass"}:
+            sites = (pending.get("arguments") or {}).get("avoid_positions") or [
+                *(self.state.get("s4_surface_stops") or []), pending["expected_condition"]["hazard"]]
+            self.state["s4_surface_stops"] = sites[-12:]
+            self.state["s4_safe_route_fallback_pending"] = False
+            self.state["s4_diamond_no_progress"] = 0
+        if self._method_stage == "S4" and (pending.get("expected_condition") or {}).get("type") in {"s4_water_relocation", "s4_water_bypass"}:
+            self.state.pop("s4_flooded_shaft", None)
         if (pending.get("expected_condition") or {}).get("type") == "s5_obsidian_relocation":
             self.state["s5_obsidian_region"] = int(self.state.get("s5_obsidian_region", 0)) + 1
         if self.goal.stage == "S3" and pending.get("tool") == "mine_collect" and (pending.get("arguments") or {}).get("block") == "coal_ore":
@@ -2060,14 +2207,7 @@ class GoalSupervisor:
             self.state["s3_relocation_surface_return_used"] = True
         if (self.goal.stage == "S3" and pending.get("tool") == "explore_mining_site"
                 and (pending.get("expected_condition") or {}).get("type") != "s3_wood_relocation"):
-            self.state["s3_ore_regions"] = int(self.state.get("s3_ore_regions", 0)) + 1
-            self.state.pop("s3_relocation_failed", None)
-            self.state.pop("s3_relocation_surface_return_used", None)
-            self.state.pop("s3_low_oxygen_relocation_required", None)
-            self.state["s3_ore_expose_used"] = 0
-            self.state["s3_ore_no_progress"] = 0
-            self.state.pop("last_s3_mining_failure", None)
-            self.state.pop("s3_resource_block_reason", None)
+            start_s3_ore_region(self.state)
         if self.goal.stage == "S3" and str(pending.get("method_key") or "").startswith("s3:ore_expose:"):
             self.state["s3_ore_expose_used"] = max(int(self.state.get("s3_ore_expose_used", 0)), int(str(pending["method_key"]).rsplit(":", 1)[-1]))
             self.state["s3_ore_no_progress"] = 0
@@ -2189,20 +2329,305 @@ class GoalSupervisor:
             if not isinstance(method_failures, dict):
                 counters["method_failures"] = {}
 
+    @staticmethod
+    def _can_climb_for_supply(state: dict) -> bool:
+        return (state.get("is_day") is True and str(state.get("dimension")).removeprefix("minecraft:") == "overworld"
+                and not _s3_relocation_emergency(state)
+                and any(inventory_count(state.get("inventory") or {}, p) for p in S3_MINING_PICKAXES))
+
+    def _surface_ascent(self, state: dict, route_key: str, target: dict | None = None) -> tuple[StepSpec, str]:
+        position = state["position"]
+        start_y = math.floor(position["y"])
+        args = {"rise": 6}
+        target = target or (state.get("surface_access") or {}).get("exit")
+        if self._finite_position(target) and target["y"] > position["y"]:
+            args["rise"] = min(6, max(1, math.floor(target["y"]) - start_y))
+            dx, dz = target["x"] - position["x"], target["z"] - position["z"]
+            if max(abs(dx), abs(dz)) >= 1:
+                args["direction"] = ("east" if dx > 0 else "west") if abs(dx) > abs(dz) else ("south" if dz > 0 else "north")
+        key = f"{route_key}:ascent:{start_y}"
+        if not any(inventory_count(state.get("inventory") or {}, item) for item in (*S3_MINING_PICKAXES, "wooden_pickaxe", "golden_pickaxe")):
+            args.update(rise=min(2, args["rise"]), clear_by_hand=True)
+            key += ":hand"
+        return (StepSpec("沿安全台阶分段返回地表", "strip_mine", args,
+                         {"type": "min_height", "y": start_y + args["rise"]}, retries=1, timeout_s=160,
+                         effect_class="replan"), key)
+
     def _expand_wood_search(self, step: StepSpec, state: dict, local_key: str) -> tuple[StepSpec, str]:
         wide_key = f"{local_key}:wide"
         if not self._method_failure_count(wide_key):
             return replace(step, arguments={**step.arguments, "range": 128}), wide_key
         position = state["position"]
+        access = state.get("surface_access") or {}
+        trunks = []
+        for entry in self.state.get("action_history", []):
+            if (entry.get("tool") != "mine_collect" or not entry.get("receipt_confirmed")
+                    or not (entry.get("arguments") or {}).get("surface_wood")
+                    or (entry.get("terminal_observation") or {}).get("dimension") != state.get("dimension")):
+                continue
+            trunk = (entry.get("result_data") or {}).get("surface_trunk")
+            if self._finite_position(trunk) and math.hypot(trunk["x"] - position["x"], trunk["z"] - position["z"]) <= 128:
+                trunks.append(trunk)
+        nearest = min(trunks, key=lambda p: math.hypot(p["x"] - position["x"], p["z"] - position["z"]), default=None)
+        sky = access.get("sky_light")
+        exit_point = access.get("exit")
+        confined = (self._finite_position(exit_point) and access.get("connected_land") is not True
+                    and 2 <= exit_point["y"] - position["y"] <= 24)
+        relocation_key = f"{local_key}:relocate"
+        connected_key = f"{relocation_key}:connected"
+        survey = {}
+        seen_site = False
+        for entry in reversed(self.state.get("action_history", [])):
+            key = str(entry.get("method_key") or "")
+            if (key != connected_key and not key.startswith(connected_key + ":site:")) or not entry.get("receipt_confirmed"):
+                continue
+            measured = (entry.get("result_data") or {}).get("relocation") or {}
+            start = measured.get("origin")
+            if entry.get("status") != "blocked" or not self._finite_position(start):
+                continue
+            seen_site = True
+            if abs(position["y"] - start["y"]) < 3 and math.hypot(position["x"] - start["x"], position["z"] - start["z"]) < 8:
+                survey = measured
+                connected_key = key
+                break
+        if seen_site and not survey:
+            # 角色已上到另一层或走出旧岸边，旧地面的半径与次数不能描述此处的通路。
+            connected_key += ":site:" + ":".join(str(math.floor(position[axis])) for axis in "xyz")
+        pocket = self._finite_number(survey.get("dry_ground_extent")) and survey["dry_ground_extent"] < 16
+        if (self._method_failure_count(relocation_key) and ((self._finite_number(sky) and sky < 12) or confined or pocket)
+                and str(state.get("dimension")).removeprefix("minecraft:") == "overworld" and not _s3_relocation_emergency(state)):
+            ascent, ascent_key = self._surface_ascent(state, local_key)
+            if nearest and pocket and "direction" not in ascent.arguments:
+                dx, dz = nearest["x"] - position["x"], nearest["z"] - position["z"]
+                if max(abs(dx), abs(dz)) >= 1:
+                    direction = ("east" if dx > 0 else "west") if abs(dx) > abs(dz) else ("south" if dz > 0 else "north")
+                    ascent = replace(ascent, arguments={**ascent.arguments, "direction": direction})
+            if (self._can_climb_for_supply(state) or ascent.arguments.get("clear_by_hand")) and not self._method_failure_count(ascent_key):
+                return ascent, ascent_key
         avoid = self.state.setdefault("s3_wood_avoid_positions", [])
         if not any(math.hypot(p["x"] - position["x"], p["z"] - position["z"]) < 8 for p in avoid):
             avoid.append({axis: position[axis] for axis in "xyz"})
         del avoid[:-128]
-        relocation = StepSpec("离开已搜索的林木区域，寻找新的干燥落脚点", "explore_mining_site",
-                              {"min_distance": 40, "avoid_positions": list(avoid)},
-                              {"type": "s3_wood_relocation", "min_distance": 40},
+        connected = bool(self._method_failure_count(relocation_key) and access.get("connected_land"))
+        minimum = 16 if connected else 40
+        arguments = {"min_distance": minimum, "avoid_positions": list(avoid)}
+        if connected:
+            arguments["connected_route"] = True
+            if nearest:
+                arguments["toward"] = nearest
+        relocation = StepSpec("离开已搜索的林木区域，寻找新的干燥落脚点", "explore_mining_site", arguments,
+                              {"type": "s3_wood_relocation", "min_distance": minimum},
                               retries=1, timeout_s=180, effect_class="replan")
-        return relocation, f"{local_key}:relocate"
+        return relocation, connected_key if connected else relocation_key
+
+    def _recover_s4_known_stair_stop(self, entry: dict, current: dict) -> bool:
+        if (self._method_stage != "S4" or entry.get("tool") != "strip_mine" or entry.get("receipt_confirmed") is not True
+                or entry.get("status") not in {"failed", "blocked"} or current.get("alive") is not True
+                or current.get("ready") is not True or str(current.get("dimension")).removeprefix("minecraft:") != "overworld"):
+            return False
+        row = next((r for r in reversed(self.state.get("action_history") or [])
+                    if entry.get("action_id") and r.get("action_id") == entry["action_id"]), {})
+        if row.get("status") != entry["status"] or (row.get("expected_condition") or {}).get("type") != "s4_depth_reached":
+            return False
+        if self._recover_s4_mining_threat(row):
+            return True
+        handled, new = self._record_s4_safe_stop(row, row["status"], row.get("result_data") or {})
+        if new:
+            self._mark_attempt(row["method_key"])
+        return handled
+
+    def _recover_s4_mining_threat(self, row: dict) -> bool:
+        retreat = row.get("tool") == "explore_mining_site" and (row.get("expected_condition") or {}).get("type") == "s4_threat_relocation"
+        if (self._method_stage != "S4" or (row.get("tool") not in {"strip_mine", "mine_collect"} and not retreat)
+                or row.get("status") not in {"blocked", "failed"} or row.get("receipt_confirmed") is not True):
+            return False
+        data = row.get("result_data") or {}
+        terminal = _fresh_terminal_observation(row, data)
+        detail = str(row.get("result_detail") or "")
+        if not terminal or not (data.get("reason") == "nearby_hostiles" or (
+                "格内有敌对生物（" in detail and detail.endswith("），停止采矿")) or (
+                retreat and detail.endswith("附近有敌对生物，先处理生存恢复"))):
+            return False
+        if retreat:
+            start = (data.get("relocation") or {}).get("origin")
+            end = terminal["position"]
+            if not self._finite_position(start) or math.hypot(end["x"] - start["x"], end["z"] - start["z"]) < 8:
+                return False
+        self.state["s4_threat_position"] = dict(terminal["position"])
+        self.state["s4_last_threat_action"] = row.get("action_id")
+        return True
+
+    def _recover_s4_surface_fallback(self, entry: dict, current: dict) -> bool:
+        if (self._method_stage != "S4" or entry.get("tool") != "strip_mine" or entry.get("status") != "failed"
+                or entry.get("receipt_confirmed") is not True or not current.get("ready") or not current.get("alive")
+                or not self.state.get("s4_safe_route_fallback_pending")):
+            return False
+        history = next((row for row in reversed(self.state.get("action_history") or [])
+                        if entry.get("action_id") and row.get("action_id") == entry["action_id"]), {})
+        if (history.get("method_key") != "s4:ore_horizontal_fallback" or history.get("status") != "failed"
+                or history.get("receipt_confirmed") is not True or not _fresh_terminal_observation(history, history.get("result_data") or {})):
+            return False
+        # 旧横巷已有失败终态。只放行有新地形证据的换矿区动作，不重放开挖。
+        next_step = choose_s4_resource_action(current, self.state)
+        return next_step is not None and next_step.verify.get("type") == "s4_surface_relocation"
+
+    def _recover_s4_interrupted_shaft(self, entry: dict, current: dict) -> bool:
+        if (self._method_stage != "S4" or entry.get("tool") != "strip_mine" or entry.get("status") != "preempted"
+                or entry.get("receipt_confirmed") is not True or current.get("alive") is not True
+                or current.get("ready") is not True or str(current.get("dimension")).removeprefix("minecraft:") != "overworld"):
+            return False
+        action_id = entry.get("action_id")
+        history = next((row for row in reversed(self.state.get("action_history") or [])
+                        if action_id and row.get("action_id") == action_id), {})
+        data = history.get("result_data") or {}
+        safety = data.get("safety_interruption") or {}
+        if (history.get("receipt_confirmed") is not True or history.get("status") != "preempted"
+                or (history.get("expected_condition") or {}).get("type") != "s4_depth_reached"
+                or not _fresh_terminal_observation(history, data) or data.get("preempt_cause") != "safety_priority"
+                or not safety.get("safety_action_id")
+                or not self._finite_position(safety.get("position"))):
+            return False
+        if safety.get("event") == "low_oxygen":
+            self.state["s4_flooded_shaft"] = {"action_id": action_id, "position": dict(safety["position"])}
+            return True
+        # 怪物抢占结束后从实际高度重新选矿道；原段不计作完成。
+        return safety.get("event") in {"hostile_nearby", "damage", "low_health"} and self._finite_position(current.get("position"))
+
+    def _fortress_portal_exit(self, step: StepSpec, state: dict, key: str) -> tuple[StepSpec, str]:
+        position = state["position"]
+        history = self.state.get("action_history") or []
+        # 本区可步行地形已走遍，按实到过的位置向外开巷。每次开挖仍由桥接逐格检查。
+        scout = next((a for a in reversed(history) if a.get("tool") == "raid_fortress"
+                      and a.get("receipt_confirmed") and a.get("status") in {"failed", "blocked"}), {})
+        route = ((scout.get("result_data") or {}).get("fortress_evidence") or {}).get("route") or {}
+        origin = route.get("origin")
+        scoped_key = str(scout.get("method_key") or "")
+        observed_survey = self._finite_position(origin) and bool(step.arguments.get("surveyed"))
+        x, y, z = (math.floor(position[a]) for a in "xyz")
+        gallery = f"{key}:gallery:{x // 8}:{y // 4}:{z // 8}"
+        latest = next((a for a in reversed(history) if a.get("receipt_confirmed")
+                       and a.get("status") != "rejected_before_start"), {})
+        passages = (latest.get("result_data") or {}).get("nether_passages") or {}
+        lengths = None
+        if (latest.get("tool") == "strip_mine" and state.get("session_id")
+                and state["session_id"] == (latest.get("terminal_observation") or {}).get("session_id")
+                and passages.get("origin") == {"x": x, "y": y, "z": z} and isinstance(passages.get("lengths"), dict)):
+            lengths = passages["lengths"]
+        revisiting = observed_survey and self._method_failure_count(gallery) >= 2
+        local_origins = [(((a.get("result_data") or {}).get("fortress_evidence") or {}).get("route") or {}).get("origin")
+                         for a in history[-32:] if a.get("tool") == "raid_fortress" and a.get("status") == "blocked" and a.get("receipt_confirmed")]
+        nearby_heights = [p["y"] for p in local_origins if self._finite_position(p)
+                          and math.hypot(x - p["x"], z - p["z"]) <= 24]
+        same_level = observed_survey and sum(abs(y - h) < 4 for h in nearby_heights) >= 4
+        stationary = (scoped_key.startswith(key + ":") and (scoped_key.endswith(":follow_cells") or ":gallery:" in scoped_key)
+                      and not route.get("visited") and self._finite_position(origin))
+        if ((revisiting or stationary or same_level)
+                and any(inventory_count(state.get("inventory") or {}, p) for p in S3_MINING_PICKAXES)
+                and not _s3_relocation_emergency(state)):
+            if not (revisiting or same_level) and math.dist((x, y, z), tuple(origin[a] for a in "xyz")) >= 4:
+                return step, gallery
+            ascent_key = f"{gallery}:ascend"
+            if state.get("nether_mining_hostiles") == [] and any(
+                a.get("method_key") == ascent_key and a.get("receipt_confirmed")
+                and (a.get("result_data") or {}).get("reason") == "nearby_hostiles" for a in history
+            ):
+                ascent_key += ":threat_cleared"
+            if (same_level and y < 72 and not any(abs(y + 6 - h) < 3 for h in nearby_heights)
+                    and not self._method_failure_count(ascent_key)):
+                return (StepSpec("当前高度已反复侦察，开安全上行台阶到未走过的岩层", "strip_mine", {"rise": 6},
+                                 {"type": "min_height", "y": y + 6, "dimension": "the_nether"},
+                                 retries=1, timeout_s=140, effect_class="replan"), ascent_key)
+            descent_key = f"{gallery}:descend"
+            shelf = next((a.get("result_data") or {} for a in reversed(history)
+                          if a.get("method_key") == descent_key and a.get("receipt_confirmed")
+                          and (a.get("result_data") or {}).get("reason") == "no_safe_stair"), {})
+            column_key = f"{gallery}:column:{x}:{z}"
+            if (y >= 72 and len(shelf.get("candidates") or []) == 4
+                    and all(c.get("reason") == "unsupported" for c in shelf["candidates"])
+                    and not self._method_failure_count(column_key)
+                    and any(inventory_count(state.get("inventory") or {}, item) >= 8 for item in
+                            ("cobblestone", "dirt", "stone", "deepslate", "netherrack", "cobbled_deepslate"))):
+                return (StepSpec("核对玄武岩台地下方落脚点，逐层垫方块下降", "safe_descend",
+                                 {"targetY": y - 8, "maxLayers": 8, "fill": True, "detour": False},
+                                 {"type": "max_height", "y": y - 8, "dimension": "the_nether"},
+                                 retries=1, timeout_s=130, effect_class="replan"), column_key)
+            if ((revisiting or same_level) and y >= 72 and not any(abs(y - 6 - h) < 3 for h in nearby_heights)
+                    and not self._method_failure_count(descent_key)):
+                return (StepSpec("从反复走过的高台开六级安全台阶，换一层侦察要塞", "strip_mine",
+                                 {"shaft": 6, "length": 1, "branches": 0, "torchInterval": 0},
+                                 {"type": "max_height", "y": y - 6, "dimension": "the_nether"},
+                                 retries=1, timeout_s=140, effect_class="replan"), descent_key)
+            surveyed = [p for p in step.arguments.get("surveyed", []) if isinstance(p, dict)
+                        and self._finite_number(p.get("x")) and self._finite_number(p.get("z"))]
+            directions = [("east", 1, 0), ("south", 0, 1), ("west", -1, 0), ("north", 0, -1)]
+            length = 24 if revisiting else 12
+            def frontier_score(direction):
+                _, dx, dz = direction
+                end_x, end_z = x + length * dx, z + length * dz
+                distances = [math.hypot(end_x - p["x"], end_z - p["z"]) for p in surveyed]
+                return min(distances) + distances[0] if distances else 0
+            directions.sort(key=frontier_score, reverse=True)
+            for heading, dx, dz in directions:
+                dig_key = f"{key}:passage:{x}:{y}:{z}:{heading}"
+                if self._method_failure_count(dig_key):
+                    continue
+                span = length
+                if lengths is not None:
+                    safe = lengths.get(heading, 0)
+                    if type(safe) is not int or not 1 <= safe <= 4:
+                        continue
+                    if safe < 4:
+                        span = safe
+                target = {"x": x + span * dx + 0.5, "y": y, "z": z + span * dz + 0.5}
+                return (StepSpec("沿有支撑的下界岩层开巷，到新位置侦察要塞", "strip_mine",
+                                 {"direction": heading, "length": span, "branches": 0, "torchInterval": 0},
+                                 {"type": "position", "target": target, "radius": 0.45 if span < 4 else 2},
+                                 retries=1, timeout_s=140, effect_class="replan"), dig_key)
+        if not observed_survey and not self._method_failure_count(key):
+            return step, key
+        for action in reversed(self.state.get("action_history") or []):
+            if action.get("method_key") != key or action.get("status") not in {"failed", "blocked"}:
+                continue
+            route = ((action.get("result_data") or {}).get("fortress_evidence") or {}).get("route") or {}
+            origin = route.get("origin")
+            if route.get("attempted_waypoints") != 0 or not self._finite_position(origin):
+                break
+            position = state["position"]
+            y = math.floor(position["y"])
+            if abs(y - origin["y"]) >= 4:
+                return step, f"{key}:layer:{y // 4}"
+            bank = state.get("nether_portal_bank")
+            if (bank in {"north", "south", "west", "east"} and not _s3_relocation_emergency(state)
+                    and any(inventory_count(state.get("inventory") or {}, p) for p in S3_MINING_PICKAXES)):
+                return (StepSpec("从下界门旁的实心岩坡分段上行", "strip_mine", {"rise": 4, "direction": bank},
+                                 {"type": "min_height", "y": y + 4}, retries=1, timeout_s=150, effect_class="replan"),
+                        f"{key}:bank:{bank}:{y}")
+            break
+        if observed_survey and (lengths is not None or self._method_failure_count(gallery) >= self.goal.budget.max_attempts_per_method):
+            # 穷尽当前落脚点后，沿已走过的下界干地回到另一个路口，再从那里向外找。
+            tried = {a.get("method_key") for a in history if a.get("status") != "rejected_before_start"}
+            candidates = []
+            for entry in reversed(history):
+                if entry.get("tool") != "raid_fortress" or not entry.get("receipt_confirmed"):
+                    continue
+                route = ((entry.get("result_data") or {}).get("fortress_evidence") or {}).get("route") or {}
+                if str(route.get("dimension")).removeprefix("minecraft:") != "the_nether":
+                    continue
+                for p in route.get("visited") or []:
+                    if self._finite_position(p) and abs(y - p["y"]) <= 4:
+                        distance = math.hypot(x - p["x"], z - p["z"])
+                        if 8 <= distance <= 24:
+                            candidates.append((abs(distance - 14), p))
+            for _, p in sorted(candidates, key=lambda candidate: candidate[0]):
+                target = {a: math.floor(p[a]) for a in "xyz"}
+                move_key = f"{gallery}:regroup:{target['x']}:{target['y']}:{target['z']}"
+                if move_key not in tried:
+                    return (StepSpec("沿实走过的安全路线回到另一个下界路口", "goto", {**target, "nether_safe": True},
+                                     {"type": "position", "target": target, "radius": 2, "dimension": "the_nether"},
+                                     timeout_s=90, effect_class="replan"), move_key)
+        if observed_survey:
+            return step, gallery
+        return step, key
 
     def _s5_obsidian_site(self, step: StepSpec, state: dict, key: str) -> tuple[StepSpec, str]:
         region = int(self.state.get("s5_obsidian_region", 0))
@@ -2227,15 +2652,24 @@ class GoalSupervisor:
                 math.hypot(float(position["x"]) - p["x"], float(position["z"]) - p["z"]) < 12 for p in sites)):
             y = math.floor(float(position["y"]))
             descent_key = f"s5:lava_descent:{region}:{y}"
+            # 分段下探可能在新高度才遇到含水层。用实际停点识别同一障碍，保留起点的原始回执。
+            wet_stop = next(((row.get("terminal_observation") or {}).get("position")
+                             for row in reversed(self.state.get("action_history", []))
+                             if row.get("receipt_confirmed") and row.get("status") in {"failed", "blocked"}
+                             and str(row.get("method_key") or "").startswith(f"s5:lava_descent:{region}:")
+                             and "竖井连通水层" in str(row.get("result_detail") or "")), None)
+            obstructed = self._method_failure_count(descent_key) or (
+                self._finite_position(wet_stop) and abs(position["y"] - wet_stop["y"]) < 3
+                and math.hypot(position["x"] - wet_stop["x"], position["z"] - wet_stop["z"]) < 4)
             if (not leaving_aquifer and exhausted_lava and abs(y - float(exhausted_lava["y"])) < 5 and y > -54
-                    and inventory_count(state.get("inventory") or {}, "water_bucket") and not self._method_failure_count(descent_key)):
+                    and inventory_count(state.get("inventory") or {}, "water_bucket") and not obstructed):
                 target = max(-54, y - 8)
                 descend = StepSpec("带水桶分段下探，在新高度重新寻找岩浆", "safe_descend",
                                    {"targetY": target, "maxLayers": y - target, "fill": True, "detour": False},
                                    {"type": "position", "target": {**position, "y": target}, "radius": 1.5},
                                    retries=1, timeout_s=110, effect_class="replan")
                 return descend, descent_key
-            if not leaving_aquifer and exhausted_lava and inventory_count(state.get("inventory") or {}, "water_bucket") and self._method_failure_count(descent_key):
+            if not leaving_aquifer and exhausted_lava and inventory_count(state.get("inventory") or {}, "water_bucket") and obstructed:
                 for heading in ("east", "north", "west", "south"):
                     bypass_key = f"s5:lava_bypass:{region}:{math.floor(y / 8)}:{heading}"
                     if self._method_failure_count(bypass_key):
@@ -2278,8 +2712,11 @@ class GoalSupervisor:
                                   {"type": "s5_obsidian_relocation", "min_distance": 32},
                                   retries=1, timeout_s=160, effect_class="replan")
             return relocation, f"{relocation_key}:{math.floor(y / 8)}" if leaving_aquifer else relocation_key
-        if region and self._finite_position(position) and inventory_count(state.get("inventory") or {}, "water_bucket"):
-            return step, f"{key}:region{region}:layer{math.floor(float(position['y']) / 8)}"
+        if self._finite_position(position):
+            # 重生后可能带着空桶在完全不同的矿区，正在找水和已经带水找岩浆也需要单独对账。
+            search = "lava" if inventory_count(state.get("inventory") or {}, "water_bucket") else "water"
+            x, y, z = (math.floor(position[a] / d) for a, d in (("x", 32), ("y", 8), ("z", 32)))
+            return step, f"{key}:region{region}:{search}:{x}:{y}:{z}"
         return step, f"{key}:region{region}" if region else key
 
     def _method_failure_count(self, method_key: str) -> int:
@@ -2365,6 +2802,18 @@ class GoalSupervisor:
 
     def _retry_or_block_method(self, method_key: str, detail: str) -> str:
         failures = self._method_failure_count(method_key)
+        latest = (self.state.get("action_history") or [{}])[-1]
+        if latest.get("method_key") == method_key and self._recover_s4_mining_threat(latest):
+            self._save()
+            return "retry"
+        if (latest.get("method_key") == method_key and latest.get("receipt_confirmed")
+                and (latest.get("expected_condition") or {}).get("type") == "s3_wood_relocation"
+                and (latest.get("result_data") or {}).get("relocation")):
+            # 换位回执可能首次证明角色困在窄岸。先选脱险方法，原方法仍受派发前次数上限约束。
+            self.state["status"] = "active"
+            self.state["block_reason"] = detail
+            self._save()
+            return "retry"
         if self.goal.stage == "S5" and method_key.startswith("s5:raid_fortress:default:chunk:"):
             # 侦察可能在最后一次尝试中走进相邻区块。下一轮按实到区块在派发前检查预算。
             self.state["status"] = "active"
@@ -2728,7 +3177,7 @@ class GoalSupervisor:
             "terminal_observation": terminal_observation,
         }
         action_history = self.state.setdefault("action_history", [])
-        already_in_history = self.goal.stage == "S4" and any(
+        already_in_history = self._method_stage == "S4" and any(
             isinstance(entry, dict) and str(entry.get("action_id") or "") == action_id
             for entry in action_history
         )
@@ -2758,7 +3207,7 @@ class GoalSupervisor:
                 self.store.set_status(self.task_id, "active")
             return True
 
-        if s3_water or self._effect_class(tool, str(pending.get("effect_class") or "")) == "replan":
+        if s3_water or self._recover_s4_interrupted_shaft(history_item, state) or self._recover_s4_mining_threat(history_item) or self._effect_class(tool, str(pending.get("effect_class") or "")) == "replan":
             recovery.update({"needs_reconcile": False, "reason": f"{status}_replanned_from_observation"})
             self.state["status"] = "active"
             self.state["block_reason"] = ""
@@ -2881,14 +3330,16 @@ class GoalSupervisor:
             "status": "running",
             "method_key": method_key,
         }
-        if ((self.goal.stage in {"S2", "S3", "S4", "S5"} and step.tool == "explore_mining_site")
-                or step.verify.get("type") == "s5_shaft_displacement"):
+        if ((self.goal.stage in {"S2", "S3", "S4", "S5", "S6"} and step.tool == "explore_mining_site")
+                or step.verify.get("type") in {"s4_water_bypass", "s4_ledge_bypass", "s5_shaft_displacement", "s4_depth_reached"}):
             pending["baseline_position"] = dict(state_before.get("position") or {})
+        if step.verify.get("type") == "s4_depth_reached":
+            pending["baseline_connected_land"] = (state_before.get("surface_access") or {}).get("connected_land") is True
         if self.goal.stage == "S3" and step.tool == "mine_collect" and (step.arguments.get("block") in {"iron_ore", "deepslate_iron_ore"}):
             pending["baseline_raw_iron"] = inventory_count(state_before.get("inventory") or {}, "raw_iron")
         if self.goal.stage == "S3" and step.tool == "mine_collect" and step.arguments.get("block") in {*S3_OVERWORLD_WOOD_LOGS, "wood_log"}:
             pending["wood_search_context"] = _s3_wood_search_context(state_before)
-        if self.goal.stage == "S4" and step.tool == "mine_collect":
+        if self._method_stage == "S4" and step.tool == "mine_collect":
             block = str(step.arguments.get("block") or "")
             if block == "diamond_ore":
                 pending["baseline_diamond_count"] = inventory_count(
@@ -3064,7 +3515,7 @@ class GoalSupervisor:
             return self._retry_or_block_method(method_key, self.state["block_reason"])
 
         if (
-            self.goal.stage == "S4"
+            self._method_stage == "S4"
             and status == "succeeded"
             and step.tool == "strip_mine"
             and step.verify.get("type") == "s4_depth_reached"
@@ -3140,10 +3591,14 @@ class GoalSupervisor:
         if kind == "inside_shelter":
             ok = (state.get("shelter") or {}).get("inside") is True
             return ok, "角色已进入庇护所" if ok else "角色尚未进入庇护所"
+        if kind == "sealed_camp":
+            shelter = state.get("shelter") or {}
+            ok = shelter.get("sealed") is True and shelter.get("inside") is True
+            return ok, "已在封闭营地内" if ok else "尚未确认角色在封闭营地内"
         if kind == "outside_shelter":
             ok = (state.get("shelter") or {}).get("inside") is not True
             return ok, "角色已离开庇护所" if ok else "角色仍在庇护所内"
-        if self.goal.stage == "S4" and kind == "s4_depth_reached":
+        if self._method_stage == "S4" and kind == "s4_depth_reached":
             return verify_s4_depth_reached(condition, state)
         if self.goal.stage == "S2":
             if kind == "shelter":

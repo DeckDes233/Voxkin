@@ -1,5 +1,6 @@
 // 下界模块：黑曜石下界门、维度坐标换算、堡垒探索、烈焰棒收集。
-import { besideDrop, dryMiningFooting, netherRouteExclusion } from '../dry_footing.js';
+import { besideDrop, dryMiningFooting, exposedMagmaCube, followNetherPath, netherRouteExclusion, reachableNetherGround } from '../dry_footing.js';
+import { forwardCell } from './movement.js';
 // 契约见 docs/plans/SKILL_MODULE_CONTRACT.md；对应路线图 M7.1-M7.4。
 //
 // 约束：
@@ -264,18 +265,10 @@ export function isLavaName(name) {
   return text.startsWith('lava_');
 }
 
-// yaw 0 面向 +Z，顺时针增大；返回正交的单位朝向。
+// 与 Mineflayer 移动使用相同的朝向。
 export function facingFromYaw(yaw) {
-  const angle = Number(yaw);
-  const headings = [
-    { x: 0, z: 1 },
-    { x: -1, z: 0 },
-    { x: 0, z: -1 },
-    { x: 1, z: 0 },
-  ];
-  if (!Number.isFinite(angle)) return headings[0];
-  const index = Math.round(angle / (Math.PI / 2));
-  return headings[((index % 4) + 4) % 4];
+  const {dx, dz} = forwardCell(Number(yaw) || 0);
+  return {x: dx, z: dz};
 }
 
 // 数值夹取。
@@ -401,6 +394,24 @@ function frameGroundOk(ctx, frame) {
   return true;
 }
 
+function portalNeighbors(frame, target) {
+  return [-1, 1].map(d => ({
+    x: target.x + (frame.axis === 'z' ? d : 0), y: target.y,
+    z: target.z + (frame.axis === 'x' ? d : 0),
+  }));
+}
+
+function portalWater(block) {
+  return block?.name === 'water' || block?.name === 'bubble_column' || block?.getProperties?.().waterlogged === true;
+}
+
+function dryPortalSite(ctx, frame) {
+  return frame.interior.every(p => [p, ...portalNeighbors(frame, p)].every(q => {
+    const block = blockAt(ctx, q.x, q.y, q.z);
+    return block && !portalWater(block) && !isLavaName(block.name);
+  }));
+}
+
 // 选建门位置：bot 前方 2 格，门宽轴与朝向垂直。
 function choosePortalSite(ctx, axis, depthOffset = 2) {
   const bot = botOf(ctx);
@@ -410,9 +421,9 @@ function choosePortalSite(ctx, axis, depthOffset = 2) {
   const frontX = axis === 'z' ? Math.sign(heading.x) || 1 : 0;
   const frontZ = axis === 'x' ? Math.sign(heading.z) || 1 : 0;
 
-  const candidates = [depthOffset, depthOffset + 1, depthOffset - 1, depthOffset + 2];
+  const candidates = [depthOffset, depthOffset + 1, depthOffset - 1, depthOffset + 2,
+    -depthOffset, -depthOffset - 1, -depthOffset - 2, depthOffset + 3, -depthOffset - 3];
   for (const offset of candidates) {
-    if (offset <= 0) continue;
     const depthX = Math.floor(base.x + frontX * offset);
     const depthZ = Math.floor(base.z + frontZ * offset);
     const groundY = findGroundLevel(ctx, depthX, depthZ, base.y);
@@ -423,10 +434,35 @@ function choosePortalSite(ctx, axis, depthOffset = 2) {
         : { x: depthX, y: groundY + 1, z: Math.floor(base.z) };
     const frame = portalFrame(origin, axis);
     if (!frame) continue;
-    if (!frameGroundOk(ctx, frame)) continue;
+    if (!frameGroundOk(ctx, frame) || !dryPortalSite(ctx, frame)) continue;
     return { origin, axis, groundY, frame };
   }
-  throw new Error('附近没有足够大的空地放下下界门框');
+  return null;
+}
+
+// 旧门框进水时，先封住两侧入水口，再填掉门内水源和流动水。
+async function drainPortal(ctx, frame) {
+  const wet = frame.interior.filter(p => portalWater(blockAt(ctx, p.x, p.y, p.z)));
+  if (!wet.length) return;
+  const plug = async p => {
+    throwIfInterrupted(ctx, '下界门排水');
+    const material = ['cobblestone', 'cobbled_deepslate', 'dirt', 'andesite', 'diorite', 'granite', 'netherrack']
+      .find(name => ctx.countItem(name) > 0);
+    if (!material) throw new Error('下界门排水需要垫块');
+    await ctx.placeBlock({block: material, ...p});
+  };
+  for (const p of frame.interior.flatMap(target => portalNeighbors(frame, target))) {
+    const face = blockAt(ctx, p.x, p.y, p.z);
+    if (!face || isLavaName(face.name)) throw new Error('下界门旁有岩浆或未知方块，无法安全排水');
+    if (portalWater(face)) await plug(p);
+  }
+  // 上层的源方块也可能向下补水，全部填完后再统一清空。
+  for (const p of frame.interior) {
+    if (portalWater(blockAt(ctx, p.x, p.y, p.z))) await plug(p);
+  }
+  await clearPortalSpace(ctx, frame);
+  await sleepMs(ctx, 500);
+  if (frame.interior.some(p => portalWater(blockAt(ctx, p.x, p.y, p.z)))) throw new Error('下界门内仍有水');
 }
 
 // 清出门内 2×3 与门框位置的空间。
@@ -567,6 +603,13 @@ async function makeNetherPortal(args, ctx) {
     site = {origin, axis: saved.axis, frame: portalFrame(origin, saved.axis)};
   } else {
     site = choosePortalSite(ctx, axis, 2);
+    if (!site && !['x', 'z'].includes(asked)) site = choosePortalSite(ctx, axis === 'x' ? 'z' : 'x', 2);
+    if (!site) {
+      const p = botOf(ctx).entity.position;
+      throw withActionData(new Error('附近没有足够大的空地放下下界门框'), {
+        portal_search: {outcome: 'no_site_before_build', position: {x: p.x, y: p.y, z: p.z}},
+      });
+    }
   }
   const frameBlocks = site.frame.frame.map(p => blockAt(ctx, p.x, p.y, p.z));
   if (frameBlocks.some(b => !b) || !frameGroundOk(ctx, site.frame)) throw new Error('门址的方块或地基无法确认');
@@ -584,6 +627,7 @@ async function makeNetherPortal(args, ctx) {
   const placed = alreadyLit ? PORTAL_FRAME_OBSIDIAN : await placeObsidianFrame(ctx, site.frame);
 
   if (!portalLit(ctx, site.frame)) {
+    await drainPortal(ctx, site.frame);
     const lit = await lightPortal(ctx, site.frame);
     if (!lit) {
       throw new Error('打火石点了火，但门框里没有出现下界门，附近没有生成门');
@@ -615,6 +659,7 @@ async function makeNetherPortal(args, ctx) {
   // 往返用的第二个门。
   if (wantSecond) {
     const second = choosePortalSite(ctx, axis, 9);
+    if (!second) throw new Error('首座下界门已经建成，附近没有足够空间放置第二座');
     const secondCleared = await clearPortalSpace(ctx, second.frame);
     const secondPlaced = await placeObsidianFrame(ctx, second.frame);
     if (!portalLit(ctx, second.frame)) {
@@ -1128,6 +1173,39 @@ function nextSurveyPoint(ctx, route) {
   return candidates[0]?.stand;
 }
 
+// 路标走不通时，从脚下按可步行的相邻列向外搜，把崖壁另一侧的孤立平台排除。
+export async function connectedSurvey(ctx, route) {
+  const {here, points, parents} = await reachableNetherGround(ctx);
+  const candidates = [];
+  for (const p of points) {
+    if (route.walkMisses.some(m => here.distanceTo(m.from) < 4 && p.distanceTo(m.to) < 2)) continue;
+    const clearance = Math.min(...route.surveyed.map(v => Math.hypot(p.x - v.x, p.z - v.z)));
+    const outward = route.anchor ? Math.hypot(p.x - route.anchor.x, p.z - route.anchor.z)
+      - Math.hypot(here.x - route.anchor.x, here.z - route.anchor.z) : 0;
+    if (clearance >= 4) candidates.push({p, clearance, score: clearance + 1.2 * outward});
+    else candidates.push({p, clearance, score: clearance - 40});
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  return {parents, target: candidates[0]?.clearance >= 4 ? candidates[0].p : null,
+    launches: [here, ...candidates.slice(0, 24).map(c => c.p)]};
+}
+
+async function walkSurveyRoute(ctx, route, reachable, target) {
+  const from = botOf(ctx).entity.position.floored();
+  const outcome = route.followCells && reachable
+    ? await followNetherPath(ctx, reachable.parents, target)
+    : await ctx.walkOnce(target.x, target.y, target.z, 0, 12000);
+  throwIfInterrupted(ctx, '探索下界堡垒');
+  if (outcome === 'reached' && botOf(ctx).entity.position.floored().equals(target)) {
+    route.walkFailures = 0;
+    return true;
+  }
+  route.walkMisses.push({from, to: {x: target.x, y: target.y, z: target.z}});
+  route.walkFailures++;
+  route.followCells = Boolean(reachable);
+  return false;
+}
+
 async function fallbackStep(ctx, route) {
   throwIfInterrupted(ctx, '探索下界堡垒');
   if (currentDimension(ctx) !== route.dimension) {
@@ -1136,14 +1214,22 @@ async function fallbackStep(ctx, route) {
   if (route.attemptedWaypoints >= route.budgetWaypoints || route.nextWaypoint >= route.waypoints.length) {
     return false;
   }
-  const target = route.surveyed ? nextSurveyPoint(ctx, route) : route.waypoints[route.nextWaypoint];
-  if (route.surveyed && (!target || route.walkFailures >= 2) && ctx.runSkill && route.passages < 2) {
-    const passage = surveyPassage(botOf(ctx), route);
+  const reachable = route.connected ? await connectedSurvey(ctx, route) : null;
+  const target = reachable ? reachable.target : route.surveyed ? nextSurveyPoint(ctx, route) : route.waypoints[route.nextWaypoint];
+  if (route.surveyed && (!target || route.walkFailures >= 2) && ctx.runSkill && route.passageFailures < 2) {
+    const bot = botOf(ctx);
+    const passages = (reachable?.launches ?? [bot.entity.position.floored()]).map(start => surveyPassage(bot, route, start))
+      .filter(Boolean).sort((a, b) => b.clearance - a.clearance);
+    const passage = passages[0];
     if (passage) {
-      route.passages++;
       route.attemptedWaypoints++;
-      route.surveyed.push(passage.end);
+      // 成功抵达后可在剩余路标预算内继续向外；打不开的岩壁本轮只试一次。
+      route.triedPassages.add(`${positionKey(passage.start)}:${passage.direction}`);
+      route.passageFailures++;
       try {
+        if (!bot.entity.position.floored().equals(passage.start)) {
+          if (!await walkSurveyRoute(ctx, route, reachable, passage.start)) return false;
+        }
         await ctx.runSkill('strip_mine', { direction: passage.direction, length: 6, branches: 0, torchInterval: 0 });
       } catch (error) {
         throwIfInterrupted(ctx, '探索下界堡垒');
@@ -1154,6 +1240,8 @@ async function fallbackStep(ctx, route) {
       const p = botOf(ctx).entity.position;
       if (Math.hypot(p.x - passage.end.x - 0.5, p.z - passage.end.z - 0.5) <= 1.5) {
         route.confirmed.push({x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z)});
+        route.surveyed.push(route.confirmed.at(-1));
+        route.passageFailures = 0;
         route.walkFailures = 0;
         return true;
       }
@@ -1167,18 +1255,10 @@ async function fallbackStep(ctx, route) {
   route.attemptedWaypoints += 1;
   try {
     if (route.surveyed) {
-      route.surveyed.push({x: target.x, z: target.z});
-      const departure = botOf(ctx).entity.position.floored();
-      const outcome = await ctx.walkOnce(target.x, target.y, target.z, 0, 12000);
-      throwIfInterrupted(ctx, '探索下界堡垒');
-      if (outcome !== 'reached') {
-        if (outcome === 'unreachable') route.walkMisses.push({from: departure, to: {x: target.x, y: target.y, z: target.z}});
-        route.walkFailures++;
-        return false;
-      }
-      route.walkFailures = 0;
+      if (!await walkSurveyRoute(ctx, route, reachable, target)) return false;
       const p = botOf(ctx).entity.position;
       route.confirmed.push({x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z)});
+      route.surveyed.push(route.confirmed.at(-1));
       ctx.reportProgress?.('fortress_survey', '已到新落脚点，继续扫描堡垒', null, {position: route.confirmed.at(-1)});
     } else {
       await ctx.travelTo(target.x, target.y, target.z, 3);
@@ -1197,14 +1277,17 @@ async function fallbackStep(ctx, route) {
 
 // 普通寻路被围住时，只开掘已加载、下方有支撑且侧面没有岩浆的短通道。
 const PASSAGE_ROCK = new Set(['netherrack', 'blackstone', 'basalt', 'smooth_basalt', 'nether_quartz_ore', 'nether_gold_ore']);
-export function surveyPassage(bot, route) {
-  const start = bot.entity.position.floored(), choices = [];
+export function surveyPassage(bot, route, start = bot.entity.position.floored()) {
+  const choices = [];
+  const cubes = Object.values(bot.entities || {}).filter(e => e?.name === 'magma_cube');
   for (const [direction, dx, dz] of [['east', 1, 0], ['west', -1, 0], ['south', 0, 1], ['north', 0, -1]]) {
+    if (route.triedPassages?.has(`${positionKey(start)}:${direction}`)) continue;
     let hasRock = false, safe = true;
     for (let step = 1; step <= 6 && safe; step++) {
       const p = start.offset(dx * step, 0, dz * step);
       const floor = bot.blockAt(p.offset(0, -1, 0), false);
-      if (floor?.boundingBox !== 'block' || netherRouteExclusion(bot, {position: p}) || besideDrop(bot, p)) { safe = false; break; }
+      if (floor?.boundingBox !== 'block' || netherRouteExclusion(bot, {position: p}) || besideDrop(bot, p)
+          || exposedMagmaCube(bot, p, cubes)) { safe = false; break; }
       for (let y = 0; y <= 2; y++) {
         const cell = bot.blockAt(p.offset(0, y, 0), false);
         if (PASSAGE_ROCK.has(cell?.name)) hasRock = true;
@@ -1217,7 +1300,12 @@ export function surveyPassage(bot, route) {
     }
     const end = start.offset(dx * 6, 0, dz * 6);
     const clearance = Math.min(...route.surveyed.map(v => Math.hypot(v.x - end.x, v.z - end.z)));
-    if (safe && hasRock && clearance >= 4) choices.push({direction, end, clearance});
+    if (safe && hasRock && (clearance >= 4 || PASSAGE_ROCK.has(bot.blockAt(end, false)?.name))) {
+      const here = bot.entity.position;
+      const outward = route.anchor ? Math.hypot(end.x - route.anchor.x, end.z - route.anchor.z)
+        - Math.hypot(here.x - route.anchor.x, here.z - route.anchor.z) : 0;
+      choices.push({direction, start, end, clearance: clearance + outward});
+    }
   }
   return choices.sort((a, b) => b.clearance - a.clearance)[0];
 }
@@ -1237,8 +1325,7 @@ async function raidFortress(args, ctx) {
       hazards = Object.values(bot.entities).filter(e => e?.name === 'magma_cube' && e.isValid !== false && e.position);
       nextScan = Date.now() + 400;
     }
-    return hazards.some(e => Math.abs(e.position.y - block.position.y) < 5 &&
-      Math.hypot(e.position.x - block.position.x - 0.5, e.position.z - block.position.z - 0.5) < 6) ? 1000 : 0;
+    return exposedMagmaCube(bot, block.position, hazards) ? 1000 : 0;
   };
   const avoidCliffs = block => !block?.position || besideDrop(bot, block.position) ? 1000 : 0;
   Object.assign(movements, { allowParkour: false, allowSprinting: false, allow1by1towers: false, canDig: false,
@@ -1261,14 +1348,18 @@ async function searchFortress(args, ctx) {
   const wantBlazes = clampNumber(args.blazes, 1, 8, 1);
   const route = makeFortressRoute(botOf(ctx).entity.position, dimension, radius);
   if (args.scout_only === true && botOf(ctx).pathfinder?.movements && ctx.walkOnce) {
-    route.surveyed = (Array.isArray(args.surveyed) ? args.surveyed : []).filter(p => p && Number.isFinite(p.x) && Number.isFinite(p.z)).slice(-24);
+    route.surveyed = (Array.isArray(args.surveyed) ? args.surveyed : []).filter(p => p && Number.isFinite(p.x) && Number.isFinite(p.z)).slice(0, 128);
+    route.anchor = route.surveyed[0];
     route.surveyed.push(route.origin);
+    route.connected = Array.isArray(args.surveyed) && args.surveyed.length > 0;
     route.confirmed = [];
     const point = p => p && [p.x, p.y, p.z].every(Number.isFinite);
     route.walkMisses = (Array.isArray(args.walk_misses) ? args.walk_misses : []).slice(-16)
       .filter(m => m && point(m.from) && point(m.to));
+    route.followCells = route.connected && route.walkMisses.length > 0;
     route.walkFailures = 0;
-    route.passages = 0;
+    route.triedPassages = new Set();
+    route.passageFailures = 0;
   }
   const deadline = Date.now() + timeoutMs;
 

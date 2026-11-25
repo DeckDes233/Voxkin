@@ -1,3 +1,6 @@
+import {dryMiningFooting} from './dry_footing.js';
+import {surfaceSkyLight} from './water_escape.js';
+
 const observedSites = new WeakMap();
 
 function candidatePositions(bot, origin, sessionId) {
@@ -25,6 +28,36 @@ export function inspectResourceSites(bot, shelter = null, sessionId = null) {
     return result;
   }
   const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+  const items = bot.inventory?.items?.() ?? [];
+  const carryingBucket = items.some(item => item.name === 'bucket');
+  if (bot.time?.isDay && items.some(item => item.name === 'oak_sapling') && dryMiningFooting(bot, origin)) {
+    const feet = origin.floored();
+    for (const [dx, dz] of [[2, 0], [-2, 0], [0, 2], [0, -2]]) {
+      const at = feet.offset(dx, 0, dz);
+      const soil = bot.blockAt(at.offset(0, -1, 0));
+      if (!['dirt', 'grass_block'].includes(soil?.name) || (bot.canSeeBlock && !bot.canSeeBlock(soil))
+          || bot.blockAt(at)?.name !== 'air' || !(surfaceSkyLight(bot, at.offset(0, 1, 0)) >= 12)
+          || (shelter?.position && distance(at, shelter.position) < 8)) continue;
+      if ([1, 2, 3, 4, 5].every(h => bot.blockAt(at.offset(0, h, 0))?.name === 'air')) {
+        result.oak_planting_site = {x: at.x, y: at.y, z: at.z};
+        break;
+      }
+    }
+  }
+  if (carryingBucket && origin.floored && bot.world?.raycast && dryMiningFooting(bot, origin)) {
+    const feet = origin.floored(), eye = origin.offset(0, bot.entity.eyeHeight ?? 1.62, 0);
+    for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+      for (const dy of [-1, 0]) {
+        const p = feet.offset(dx, dy, dz), water = bot.blockAt(p);
+        if (water?.name !== 'water' || Number(water.getProperties?.().level ?? water.metadata) !== 0) continue;
+        const ray = p.offset(0.5, 0.85, 0.5).minus(eye), length = ray.norm();
+        if (!length || bot.world.raycast(eye, ray.scaled(1 / length), length)) continue;
+        result.water_source = {x: p.x, y: p.y, z: p.z};
+        break;
+      }
+      if (result.water_source) break;
+    }
+  }
   const entities = Object.values(bot.entities || {}).filter(e => e?.position && e.isValid !== false);
   const anchors = entities.filter(e => e.name === 'villager' && distance(e.position, origin) <= 48).map(e => e.position);
   const protectedSite = p => shelter?.position && Math.hypot(p.x - shelter.position.x, p.z - shelter.position.z) <= 8;

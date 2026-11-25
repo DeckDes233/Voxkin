@@ -235,6 +235,11 @@ def _is_day(state: dict[str, Any]) -> bool | None:
     return value < 12541 or value > 23458
 
 
+def _hunt_closing(state: dict) -> bool:
+    tick = state.get("time")
+    return isinstance(tick, (float, int)) and tick % 24000 > 10000
+
+
 def _danger_now(state: dict[str, Any]) -> bool:
     executor = state.get("executor") or {}
     if executor.get("safety_active") is True:
@@ -472,7 +477,11 @@ def _s3_wood_search_context(state: dict[str, Any]) -> str:
         return ""
     if not all(math.isfinite(value) for value in (x, y, z)):
         return ""
-    return f"{dimension}:{math.floor(x / 32)}:{math.floor(y / 8)}:{math.floor(z / 32)}"
+    region = f"{dimension}:{math.floor(x / 32)}:{math.floor(y / 8)}:{math.floor(z / 32)}"
+    access = state.get("surface_access") or {}
+    if access.get("connected_land") is True:
+        return f"{region}:land"
+    return f"{region}:surface" if dimension == "overworld" and access.get("sky_light") == 15 and not access.get("exit") else region
 
 
 def _s3_no_resource_wood_logs(goal_state: dict[str, Any], context: str) -> set[str]:
@@ -503,6 +512,17 @@ def _s3_no_resource_wood_logs(goal_state: dict[str, Any], context: str) -> set[s
     return unavailable
 
 
+def _local_surface_exit(state: dict[str, Any]) -> dict | None:
+    position = state.get("position") or {}
+    target = (state.get("surface_access") or {}).get("exit")
+    if (isinstance(target, dict) and all(isinstance(p.get(a), (int, float)) and math.isfinite(p[a])
+                                         for p in (position, target) for a in "xyz")
+            and 0 < target["y"] - position["y"] <= 24
+            and math.hypot(target["x"] - position["x"], target["z"] - position["z"]) <= 8):
+        return target
+    return None
+
+
 def _s3_needs_surface_route(state: dict[str, Any]) -> bool:
     position = state.get("position") or {}
     try:
@@ -511,6 +531,10 @@ def _s3_needs_surface_route(state: dict[str, Any]) -> bool:
         return False
     if not math.isfinite(y):
         return False
+    surface = state.get("surface_access") or {}
+    nearby = _local_surface_exit(state)
+    if nearby and nearby["y"] - y >= 2 and surface.get("connected_land") is not True:
+        return True
     shelter = state.get("shelter") or {}
     anchor = shelter.get("position") or {}
     try:
@@ -518,6 +542,28 @@ def _s3_needs_surface_route(state: dict[str, Any]) -> bool:
     except (KeyError, TypeError, ValueError):
         return y < 60.0
     return math.isfinite(anchor_y) and y < anchor_y - S3_SURFACE_ROUTE_MIN_VERTICAL
+
+
+def _s4_return_stair(state: dict[str, Any], ledger: dict[str, Any]) -> dict | None:
+    if str(state.get("dimension")).removeprefix("minecraft:") != "overworld":
+        return None
+    position = state.get("position") or {}
+    if not all(type(position.get(a)) in (int, float) and math.isfinite(position[a]) for a in "xyz"):
+        return None
+    failures = (ledger.get("counters") or {}).get("method_failures") or {}
+    for stair in reversed(ledger.get("s4_mining_stairs") or []):
+        top, bottom = stair["top"], stair["bottom"]
+        if not 2 < top["y"] - position["y"] <= S4_DESCENT_STEP + 2:
+            continue
+        if math.dist(tuple(bottom[a] for a in "xyz"), tuple(position[a] for a in "xyz")) > 8:
+            continue
+        if not failures.get(_s4_stair_key(top)):
+            return stair
+    return None
+
+
+def _s4_stair_key(target: dict) -> str:
+    return "s4:return_stair:" + ":".join(str(target[a]) for a in "xyz")
 
 
 def _s3_return_to_known_surface(
@@ -528,12 +574,8 @@ def _s3_return_to_known_surface(
         goal_state["s3_preflight_terminal_reason"] = "当前不在主世界，不能使用主世界庇护所锚点规划返地表路线"
         return None
     position = state.get("position") or {}
-    surface = state.get("surface_access") or {}
-    nearby_exit = surface.get("exit")
-    if (isinstance(nearby_exit, dict) and all(isinstance(p.get(a), (int, float)) and math.isfinite(p[a])
-                                               for p in (position, nearby_exit) for a in "xyz")
-            and 0 < nearby_exit["y"] - position["y"] <= 24
-            and math.hypot(nearby_exit["x"] - position["x"], nearby_exit["z"] - position["z"]) <= 8):
+    nearby_exit = _local_surface_exit(state)
+    if nearby_exit:
         target = dict(nearby_exit)
         if _danger_now(state) or (_is_day(state) is not True and target["y"] - position["y"] <= 8):
             goal_state["s3_preflight_wait_reason"] = "在出口下方等到白天且附近安全后再外出"
@@ -544,6 +586,14 @@ def _s3_return_to_known_surface(
             target["y"] = math.floor(position["y"]) + 6
         return _s3_action("分段返回附近已观察到的露天地面", "goto", target,
                           {"type": "position", "target": target, "radius": 2.0}, 90.0)
+    stair = _s4_return_stair(state, goal_state)
+    if stair:
+        if _danger_now(state) or (stair.get("outdoors") and _is_day(state) is not True):
+            goal_state["s3_preflight_wait_reason"] = "在已走过的矿道里等待安全返程时机"
+            return None
+        target = stair["top"]
+        return _s3_action("沿已走过的干燥矿道回到上一段入口", "goto", {**target, "dry_only": True},
+                          {"type": "position", "target": target, "radius": 2.0, "site": "mining_stair"}, 70.0)
     shelter = state.get("shelter") or {}
     anchor = shelter.get("position") or {}
     try:
@@ -572,7 +622,7 @@ def _s3_return_to_known_surface(
         climb = min(8, math.floor(vertical) - 10) if vertical > 16 else min(4, math.floor(vertical))
         waypoint["y"] = math.floor(current["y"]) + climb
         return _s3_action("分段向已知庇护所上行补给", "goto", waypoint,
-                          {"type": "position", "target": waypoint, "radius": 3.0}, 90.0)
+                          {"type": "position", "target": waypoint, "radius": 3.0, "site": "supply_ascent"}, 90.0)
     if _is_day(state) is not True:
         goal_state["s3_preflight_wait_reason"] = "等待白天再沿已知庇护所路线外出补给" if staged_supply_route else "夜间留在当前位置，白天再沿已知庇护所路线返回采木"
         return None
@@ -599,7 +649,7 @@ def _s3_ensure_planks(
         return None
     if step.tool == "mine_collect":
         if _s3_needs_surface_route(state):
-            return _s3_return_to_known_surface(state, goal_state)
+            return _s3_return_to_known_surface(state, goal_state, staged_supply_route=goal_state.get("stage") in {"S4", "S5", "S6"})
         if _is_day(state) is not True:
             day = state.get("day")
             sleep_failures = (goal_state.get("counters") or {}).get("method_failures") or {}
@@ -699,9 +749,15 @@ def choose_s3_preflight_action(
 
     if food < S3_SAFE_FOOD and food_stock > 0:
         return eat()
-    if food_stock < S3_FOOD_RESERVE:
-        if _is_day(state) is not True:
-            return wait("夜间不外出寻找食物，等待白天后补足储备")
+    has_table = inventory_count(inventory, "crafting_table") > 0 or _nearby_crafting_table(state)
+    ingots = inventory_count(inventory, "iron_ingot")
+    iron_gap = max(0, _s3_iron_ingot_requirement(inventory) - ingots)
+    raw = inventory_count(inventory, "raw_iron")
+    can_process_iron = (has_table and raw >= iron_gap and food >= S3_SAFE_FOOD
+                        and (not iron_gap or inventory_count(inventory, "furnace") or inventory_count(inventory, "cobblestone") >= 8))
+    if food_stock < S3_FOOD_RESERVE and not can_process_iron:
+        if _is_day(state) is not True or _hunt_closing(state):
+            return wait("等待白天有足够时间寻找食物，再补足储备")
         goal_state.pop("s3_preflight_wait_reason", None)
         return False, _s3_action(
             "在安全的白天从附近动物补足下矿食物储备",
@@ -711,8 +767,6 @@ def choose_s3_preflight_action(
             250.0,
         )
     goal_state.pop("s3_preflight_wait_reason", None)
-    has_table = inventory_count(inventory, "crafting_table") > 0 or _nearby_crafting_table(state)
-    ingots = inventory_count(inventory, "iron_ingot")
     has_mining_pickaxe = any(inventory_count(inventory, item) > 0 for item in S3_MINING_PICKAXES)
     if has_table:
         if not has_mining_pickaxe and ingots >= 3 and inventory_count(inventory, "stick") < 2:
@@ -729,9 +783,7 @@ def choose_s3_preflight_action(
                 continue
             return False, _s3_gear_step(item)
 
-    iron_gap = max(0, _s3_iron_ingot_requirement(inventory) - ingots)
     has_any_pickaxe = any(inventory_count(inventory, item) > 0 for item in S3_ANY_PICKAXES)
-    raw = inventory_count(inventory, "raw_iron")
     if (iron_gap and raw >= iron_gap and inventory_count(inventory, "furnace") and has_any_pickaxe
             and (has_table or not ingots or early_planks(inventory, 4, "工作台") is not None)):
         # 现有熔炉无需工作台。先做可执行的生产步骤，缺木只推迟用木的配方。
@@ -864,6 +916,15 @@ def _s3_relocate(state: dict[str, Any], goal_state: dict[str, Any]) -> StepSpec 
         y = float(position["y"])
     except (KeyError, TypeError, ValueError):
         y = math.inf
+    surface = state.get("surface_access") or {}
+    exit_y = (surface.get("exit") or {}).get("y")
+    if (goal_state.get("s3_relocation_failed") and not surface.get("in_water") and not surface.get("connected_land")
+            and isinstance(exit_y, (int, float)) and 1 <= exit_y - y <= 16
+            and not _danger_now(state) and (state.get("health") or 0) > 10):
+        rise = min(4, math.ceil(exit_y - y))
+        return StepSpec("沿干燥台阶接近已观察到的地表出口", "strip_mine", {"rise": rise},
+                        {"type": "min_height", "y": math.floor(y) + rise, "site": "mining_exit"},
+                        retries=1, timeout_s=100, effect_class="replan")
     if (goal_state.get("s3_relocation_failed") and not goal_state.get("s3_relocation_surface_return_used")
             and _s3_needs_surface_route(state)):
         surface = _s3_return_to_known_surface(state, goal_state)
@@ -881,10 +942,47 @@ def _s3_relocate(state: dict[str, Any], goal_state: dict[str, Any]) -> StepSpec 
     else:
         goal_state["s3_resource_block_reason"] = "缺少有效位置，无法安全换矿区"
         return None
-    return StepSpec("离开已耗尽的探矿区域并寻找安全新矿区", "explore_mining_site",
-                    {"avoid_positions": avoid[-128:], "min_distance": 16},
+    arguments = {"avoid_positions": avoid[-128:], "min_distance": 16}
+    if goal_state.get("s3_relocation_failed") and (state.get("surface_access") or {}).get("connected_land"):
+        last = next((a for a in reversed(goal_state.get("action_history", []))
+                     if a.get("receipt_confirmed") and a.get("status") != "rejected_before_start"), {})
+        route = (last.get("result_data") or {}).get("relocation") or {}
+        start = route.get("origin") or {}
+        if (last.get("tool") == "explore_mining_site" and last.get("status") == "blocked"
+                and (last.get("arguments") or {}).get("connected_route") and route.get("attempted_positions") == []
+                and all(isinstance(start.get(a), (int, float)) for a in "xyz")
+                and math.dist(tuple(origin[a] for a in "xyz"), tuple(start[a] for a in "xyz")) < 3
+                and not _danger_now(state) and (state.get("health") or 0) > 10):
+            return StepSpec("干地出口不够远，从矮壁开两级台阶再换矿区", "strip_mine", {"rise": 2},
+                            {"type": "min_height", "y": math.floor(y) + 2, "site": "mining_exit"},
+                            retries=1, timeout_s=100, effect_class="replan")
+        arguments["connected_route"] = True
+    return StepSpec("离开已耗尽的探矿区域并寻找安全新矿区", "explore_mining_site", arguments,
                     {"type": "s3_mining_relocation", "min_distance": 16},
                     retries=1, timeout_s=180.0, effect_class="replan")
+
+
+def start_s3_ore_region(goal_state: dict[str, Any]) -> None:
+    goal_state["s3_ore_regions"] = int(goal_state.get("s3_ore_regions", 0)) + 1
+    goal_state["s3_ore_expose_used"] = 0
+    goal_state["s3_ore_no_progress"] = 0
+    for key in ("s3_relocation_failed", "s3_relocation_surface_return_used", "s3_low_oxygen_relocation_required",
+                "last_s3_mining_failure", "s3_resource_block_reason"):
+        goal_state.pop(key, None)
+
+
+def _s3_new_mining_area_after_reconnect(state: dict, ledger: dict) -> bool:
+    before = ((ledger.get("last_s3_mining_failure") or {}).get("data") or {}).get("observation") or {}
+    if not (state.get("ready") and state.get("alive") and state.get("session_id") and before.get("session_id")
+            and before["session_id"] != state["session_id"] and not _danger_now(state)):
+        return False
+    if any(str(obs.get("dimension")).removeprefix("minecraft:") != "overworld" for obs in (before, state)):
+        return False
+    a, b = before.get("position") or {}, state.get("position") or {}
+    if not all(isinstance(pos.get(axis), (int, float)) and math.isfinite(pos[axis]) for pos in (a, b) for axis in ("x", "z")):
+        return False
+    # 两个半径 64 格的采铁区域已完全分离，重生后的新位置可以直接试采。
+    return math.hypot(a["x"] - b["x"], a["z"] - b["z"]) > 128
 
 
 def choose_s3_resource_action(state: dict[str, Any], goal_state: dict[str, Any]) -> StepSpec | None:
@@ -904,6 +1002,8 @@ def choose_s3_resource_action(state: dict[str, Any], goal_state: dict[str, Any])
             except (KeyError, TypeError, ValueError):
                 y = math.inf
             ore_block = "deepslate_iron_ore" if y < 0 else "iron_ore"
+            if goal_state.get("s3_ore_no_progress") and _s3_new_mining_area_after_reconnect(state, goal_state):
+                start_s3_ore_region(goal_state)
             no_progress = int(goal_state.get("s3_ore_no_progress", 0))
             if no_progress > 0:
                 exposed = int(goal_state.get("s3_ore_expose_used", 0))
@@ -977,6 +1077,16 @@ def choose_s3_resource_action(state: dict[str, Any], goal_state: dict[str, Any])
                      **({"within_reach": True} if _is_day(state) is not True else {})},
                     {"type": "inventory", "items": {"coal": coal + 1}}, 250.0,
                 )
+            surface = state.get("surface_access") or {}
+            if (goal_state.get("s3_coal_search_attempted") and _is_day(state) is False
+                    and state.get("collection_within_reach") is True and _s3_needs_surface_route(state)
+                    and not surface.get("in_water") and not _danger_now(state)
+                    and (state.get("health") or 0) >= 16 and (state.get("food") or 0) >= 14
+                    and any(inventory_count(inventory, p) for p in S3_MINING_PICKAXES)
+                    and not ((goal_state.get("counters") or {}).get("attempts") or {}).get("s3:nearby_coal")):
+                return _s3_action("井下缺燃料，沿干燥、有支撑的短通道采近处煤矿", "mine_collect",
+                                  {"block": "coal_ore", "count": coal + 1, "range": 12, "local_vein": True},
+                                  {"type": "inventory", "items": {"coal": coal + 1}}, 100.0)
             fuel_inventory = {name: count for name, count in inventory.items() if not name.startswith(("crimson_", "warped_"))}
             return _s3_ensure_planks(fuel_inventory, reserve + math.ceil(batch_count / 1.5), "熔炼燃料", state, goal_state)
         batch_count = min(batch_count, capacity)
@@ -1055,7 +1165,7 @@ def choose_s4_preflight_action(
 ) -> tuple[bool, StepSpec | None]:
     inventory = state.get("inventory") or {}
     shelter = state.get("shelter") or {}
-    needs_surface_route = _s3_needs_surface_route(state)
+    needs_surface_route = _s3_needs_surface_route(state) or bool(_s4_return_stair(state, goal_state))
     is_overworld = str(state.get("dimension") or "").strip().lower() in {
         "overworld",
         "minecraft:overworld",
@@ -1105,7 +1215,7 @@ def choose_s4_preflight_action(
     def return_to_surface() -> StepSpec | None:
         goal_state.pop("s3_preflight_wait_reason", None)
         goal_state.pop("s3_preflight_terminal_reason", None)
-        route = _s3_return_to_known_surface(state, goal_state)
+        route = _s3_return_to_known_surface(state, goal_state, staged_supply_route=True)
         if route is None:
             propagate_wood_wait_or_block()
         return route
@@ -1147,7 +1257,7 @@ def choose_s4_preflight_action(
                     {"type": "outside_shelter"},
                     120.0,
                 )
-        if tool == "hunt_animal" and (_is_day(state) is not True or _danger_now(state)):
+        if tool == "hunt_animal" and (_is_day(state) is not True or _hunt_closing(state) or _danger_now(state)):
             goal_state["s4_preflight_wait_reason"] = "等待白天且附近安全后再狩猎补给"
             return None
         return step
@@ -1166,6 +1276,8 @@ def choose_s4_preflight_action(
     goal_state.pop("s4_preflight_wait_reason", None)
     goal_state.pop("s4_preflight_block_reason", None)
 
+    if goal_state.get("s4_threat_position") and is_overworld and health > S4_MIN_HEALTH:
+        return True, None
     if needs_diamond_mining and not isinstance(shelter.get("inside"), bool):
         return wait("等待 Bridge 明确观察角色位于庇护所内还是室外")
 
@@ -1186,7 +1298,7 @@ def choose_s4_preflight_action(
                 if route is not None:
                     return False, safe_gathering_step(route)
                 return False, None
-            if _is_day(state) is not True or _danger_now(state):
+            if _is_day(state) is not True or _hunt_closing(state) or _danger_now(state):
                 return wait("下矿前食物储备不足，等待可安全补充食物的户外时机")
             # hunt_animal 的 count 是可狩猎生肉总数；把熟食和其它食物折算进储备，避免多猎。
             hunt_meat_stock = sum(inventory_count(inventory, item) for item in S4_HUNT_MEAT_ITEMS)
@@ -1242,6 +1354,30 @@ def choose_s4_preflight_action(
         )
 
     stick_target = 2 + (2 if needs_iron_pickaxe else 0)
+    surface_access = state.get("surface_access") or {}
+    in_mining_tunnel = (goal_state.get("s4_descent_segments") and surface_access.get("sky_light") == 0
+                        and surface_access.get("connected_land") is not True)
+    if (needs_surface_route or in_mining_tunnel) and needs_diamond_mining:
+        # 刚离开庇护所且尚未深挖时可就近补柄。深井或已经下探后优先修复当前采矿工具。
+        feet = state.get("position") or {}
+        anchor = shelter.get("position") or {}
+        near_shelter = (all(isinstance(p.get(a), (int, float)) and math.isfinite(p[a])
+                            for p in (feet, anchor) for a in "xyz")
+                        and isinstance(shelter.get("size"), int) and shelter["size"] >= 4
+                        and 0 < anchor["y"] - feet["y"] <= 24
+                        and math.hypot(anchor["x"] - feet["x"], anchor["z"] - feet["z"]) <= 24)
+        early_resupply = (near_shelter and _is_day(state) and not _danger_now(state)
+                          and health > S4_MIN_HEALTH and food >= S3_SAFE_FOOD
+                          and not goal_state.get("s4_descent_segments")
+                          and (goal_state.get("counters") or {}).get("actions", 0) < 6)
+        if needs_iron_pickaxe or not early_resupply:
+            stick_target = 2 if needs_iron_pickaxe else 0
+    elif needs_diamond_mining and surface_access.get("connected_land") is True:
+        # 在可步行的地表用手边木料多做几根备用镐柄。
+        boards = max((inventory_count(inventory, planks) + 4 * inventory_count(inventory, log)
+                      for planks, log in S3_OVERWORLD_WOOD_SOURCES), default=0)
+        makeable = inventory_count(inventory, "stick") + boards // 2 * 4
+        stick_target = max(stick_target, min(8, makeable))
     goal_state.pop("s3_preflight_wait_reason", None)
     goal_state.pop("s3_preflight_terminal_reason", None)
     stick_step = _s3_ensure_sticks(inventory, stick_target, "S4 工具", state, goal_state)
@@ -1308,7 +1444,18 @@ def choose_s4_resource_action(state: dict[str, Any], goal_state: dict[str, Any])
         goal_state["s4_resource_block_reason"] = "S4 钻石采矿只允许在主世界执行"
         return None
 
+    threat = goal_state.get("s4_threat_position")
+    if threat:
+        return _s3_action("撤离有近身敌怪的矿点，到干燥新位置继续", "explore_mining_site",
+                          {"min_distance": 12, "avoid_positions": [threat]},
+                          {"type": "s4_threat_relocation", "min_distance": 12}, 150)
     if goal_state.get("s4_safe_route_fallback_pending") is True:
+        failure = (goal_state.get("s4_last_descent_failure") or {}).get("data") or {}
+        if _s4_lacks_stair_support(failure):
+            avoid = [*(goal_state.get("s4_surface_stops") or []), failure["position"]]
+            return _s3_action("离开缺少阶梯支撑的矿点，再从干地开矿", "explore_mining_site",
+                              {"min_distance": 12, "avoid_positions": avoid[-12:]},
+                              {"type": "s4_surface_relocation", "min_distance": 12}, 150)
         if goal_state.get("s4_safe_route_fallback_used") is True:
             goal_state["s4_resource_block_reason"] = "S4 唯一一次安全水平替代路线已使用，需人工检查新鲜观察"
             return None
@@ -1354,7 +1501,7 @@ def choose_s4_resource_action(state: dict[str, Any], goal_state: dict[str, Any])
         "strip_mine",
         {
             "shaft": shaft_depth,
-            "length": 1,
+            "length": 0,
             "branches": 0,
             "branchLength": 1,
             "torchInterval": 0,
@@ -1407,9 +1554,26 @@ def record_s4_descent_success(
     if not verified:
         return False
     goal_state["s4_descent_segments"] = int(goal_state.get("s4_descent_segments", 0)) + 1
+    start, end = pending.get("baseline_position") or {}, state.get("position") or {}
+    if (status == "succeeded" and (pending.get("arguments") or {}).get("length") == 0
+            and str(state.get("dimension")).removeprefix("minecraft:") == "overworld"
+            and all(type(p.get(a)) in (int, float) and math.isfinite(p[a]) for p in (start, end) for a in "xyz")
+            and 0 < start["y"] - end["y"] <= S4_DESCENT_STEP + 2):
+        route = goal_state.setdefault("s4_mining_stairs", [])
+        route.append({"top": {a: math.floor(start[a]) for a in "xyz"}, "bottom": {a: math.floor(end[a]) for a in "xyz"},
+                      "outdoors": pending.get("baseline_connected_land") is True})
+        del route[:-64]
     goal_state["s4_diamond_no_progress"] = 0
     goal_state.pop("s4_resource_block_reason", None)
     return True
+
+
+def _s4_lacks_stair_support(data: dict) -> bool:
+    position = data.get("position")
+    candidates = data.get("candidates") or []
+    return (isinstance(position, dict) and all(isinstance(position.get(axis), (int, float)) for axis in "xyz")
+            and len(candidates) == 4
+            and all(c.get("loaded") and c.get("reason") == "unsupported" for c in candidates))
 
 
 def mark_s4_known_no_safe_stair(
@@ -1430,9 +1594,10 @@ def mark_s4_known_no_safe_stair(
     admission = data.get("admission") or pending.get("admission")
     if isinstance(admission, dict) and admission.get("started") is False:
         return False
-    if int(goal_state.get("s4_safe_stair_stops", 0)) >= S4_MAX_SAFE_ROUTE_FALLBACKS:
-        return False
-    goal_state["s4_safe_stair_stops"] = int(goal_state.get("s4_safe_stair_stops", 0)) + 1
+    if not _s4_lacks_stair_support(data):
+        if int(goal_state.get("s4_safe_stair_stops", 0)) >= S4_MAX_SAFE_ROUTE_FALLBACKS:
+            return False
+        goal_state["s4_safe_stair_stops"] = int(goal_state.get("s4_safe_stair_stops", 0)) + 1
     goal_state["s4_safe_route_fallback_pending"] = True
     goal_state["s4_diamond_no_progress"] = 1
     goal_state["s4_last_descent_failure"] = {
@@ -1638,7 +1803,12 @@ def _s4_ensure_mining_pickaxe(
 
 def s4_method_key(step: StepSpec, state: dict[str, Any], goal_state: dict[str, Any]) -> str:
     inventory = state.get("inventory") or {}
+    if step.verify.get("type") == "s4_threat_relocation":
+        pos = step.arguments["avoid_positions"][0]
+        return f"s4:retreat:{math.floor(pos['x'] / 16)}:{math.floor(pos['y'] / 8)}:{math.floor(pos['z'] / 16)}"
     if step.tool == "goto":
+        if step.verify.get("site") == "mining_stair":
+            return _s4_stair_key(step.verify["target"])
         return "s4:surface_route:shelter_anchor"
     if step.tool == "strip_mine":
         if goal_state.get("s4_safe_route_fallback_pending") is True:

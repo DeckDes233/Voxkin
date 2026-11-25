@@ -3,6 +3,19 @@ import pytest
 from voxkin.agent.goal_methods import choose_s3_preflight_action, choose_s3_resource_action
 
 
+def test_s3_leaves_a_confirmed_small_pocket_by_a_short_stair():
+    state = _s3_state({"stone_pickaxe": 1})
+    state["surface_access"] = {"connected_land": True, "sky_light": 15}
+    entry = {"tool": "explore_mining_site", "arguments": {"connected_route": True},
+             "status": "blocked", "receipt_confirmed": True, "result_data": {
+                 "relocation": {"origin": dict(state["position"]), "attempted_positions": []}}}
+    ledger = {"s3_low_oxygen_relocation_required": True, "s3_relocation_failed": True, "action_history": [entry]}
+    step = choose_s3_resource_action(state, ledger)
+    assert step.tool == "strip_mine" and step.arguments == {"rise": 2}
+    entry["result_data"]["relocation"]["attempted_positions"].append(dict(state["position"]))
+    assert choose_s3_resource_action(state, ledger).arguments["connected_route"]
+
+
 def _s3_state(inventory: dict[str, int]) -> dict:
     return {
         "dimension": "overworld",
@@ -81,6 +94,11 @@ def test_s3_night_shift_can_use_the_saved_mine_inventory_without_returning_to_su
     ledger["s3_coal_search_attempted"] = True
     assert choose() is None
     assert "夜间" in ledger["s3_preflight_wait_reason"]
+    state["inventory"]["iron_pickaxe"] = 1
+    assert choose().arguments == {"block": "coal_ore", "count": 1, "range": 12, "local_vein": True}
+    ledger["counters"] = {"attempts": {"s3:nearby_coal": 1}}
+    assert choose() is None
+    del state["inventory"]["iron_pickaxe"]
     state["inventory"]["coal"] = 1
     assert choose().arguments == {"item": "raw_iron", "count": 8, "output": "iron_ingot", "fuel": "coal"}
     state["inventory"].update(raw_iron=4, iron_ingot=8, coal=0)

@@ -2,6 +2,8 @@
 // 契约见 docs/plans/SKILL_MODULE_CONTRACT.md，ctx 由 minecraft_bridge.js 的 buildSkillContext() 提供。
 // 本模块只使用 ctx 上的能力，不 import 任何运行时依赖；ctx 里没有的可选能力一律 typeof 判断后再调用。
 
+import { shaftFlowBarrier, shallowSurfaceExit, waterLike } from '../water_escape.js';
+
 /* ============================ 纯逻辑：可以单独测试 ============================ */
 
 // 食物优先级：熟肉 > 生肉 > 面包 > 任何其它有 food 值的物品。
@@ -1606,6 +1608,14 @@ export const skills = {
   swim_out: {
     description: '落水自救：先恢复呼吸，再寻找并确认安全干地。',
     parameters: [
+      { name: 'block_flow', type: 'boolean', required: false, default: false, description: '已确认矿道进水时，尝试在触及范围内用圆石封住单宽上游。' },
+      {
+        name: 'shallow_exit',
+        type: 'boolean',
+        required: false,
+        default: false,
+        description: '在干洞中复核浅水深度和近岸后，打开一格顶板上浮。',
+      },
       {
         name: 'radius',
         type: 'number',
@@ -1624,10 +1634,61 @@ export const skills = {
     handler: async (args, ctx) => {
       if (typeof ctx.swimToShore !== 'function') throw new Error('水中自救不可用');
       const timeoutMs = clampNumber(args.timeout, 25, 5, 120) * 1000;
-      if (!await ctx.swimToShore('主动水中自救', timeoutMs, clampNumber(args.radius, 12, 3, 32))) {
+      if (args.block_flow === true) {
+        const bot = ctx.bot;
+        const cells = shaftFlowBarrier(bot);
+        if (cells.length && ctx.countItem('cobblestone') >= cells.length) {
+          for (const p of cells) {
+            const here = bot.entity.position;
+            if (ctx.interrupted || here.distanceTo(p) >= 3.8 || (bot.oxygenLevel != null && bot.oxygenLevel < 12)
+                || (Math.floor(here.x) === p.x && Math.floor(here.z) === p.z)) break;
+            try {
+              await ctx.placeBlock({block: 'cobblestone', x: p.x, y: p.y, z: p.z});
+            } catch {
+              if (ctx.interrupted) throw new Error('封水被打断');
+              break;
+            }
+            if (bot.blockAt(p)?.name !== 'cobblestone') break;
+          }
+        }
+      }
+      if (args.shallow_exit === true && !waterLike(ctx.bot.blockAt(ctx.bot.entity.position))) {
+        const bot = ctx.bot;
+        const plan = shallowSurfaceExit(bot);
+        if (!plan || ctx.interrupted || ctx.findHostile?.(10)) throw new Error('无法确认安全浅水出口和近岸');
+        // 初次登录可能没有默认满氧的元数据包，使用服务端世界刻核对持续的干地呼吸。
+        const startTick = bot.time.age;
+        const started = Date.now();
+        while (bot.oxygenLevel !== 20) {
+          if (ctx.interrupted || !shallowSurfaceExit(bot) || ctx.findHostile?.(10) || Date.now() - started > 12000) {
+            throw new Error('未确认有充足的空气上浮');
+          }
+          if (bot.oxygenLevel == null && Number.isFinite(startTick) && bot.time.age - startTick >= 100) break;
+          await ctx.sleep(100);
+        }
+        const tool = bot.pathfinder?.bestHarvestTool(plan.roof);
+        if (tool) await bot.equip(tool, 'hand');
+        const fresh = shallowSurfaceExit(bot);
+        if (!fresh || ctx.interrupted || !fresh.roof.position.equals(plan.roof.position)
+            || fresh.surfaceY !== plan.surfaceY) throw new Error('浅水出口发生变化');
+        await bot.dig(fresh.roof);
+        const deadline = Date.now() + 8000;
+        try {
+          while (!ctx.interrupted && bot.entity && bot.health > 0 && Date.now() < deadline
+                 && bot.entity.position.y < plan.surfaceY - 0.5) {
+            bot.setControlState('jump', true);
+            await ctx.sleep(100);
+          }
+        } finally {
+          bot.setControlState('jump', false);
+        }
+        if (ctx.interrupted || !bot.entity || bot.health <= 0) throw new Error('浅水上行被打断');
+      }
+      if (!await ctx.swimToShore('主动水中自救', timeoutMs, clampNumber(args.radius, 12, 3, 32), args.shallow_exit === true)) {
         throw new Error('水中自救超时，未确认抵达安全岸边');
       }
-      return { detail: '已确认抵达安全岸边', status: 'succeeded' };
+      return { detail: '已确认抵达安全岸边', status: 'succeeded',
+        data: {events: [args.shallow_exit === true ? 'connected_bank_reached' : 'dry_bank_reached']} };
     },
   },
 };

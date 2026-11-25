@@ -1,4 +1,5 @@
 import { inspectResourceSites } from './resource_sites.js';
+import { onConnectedBank, shallowSurfaceExit, shoreHeadroomBlock, surfaceSkyLight, waterLike } from './water_escape.js';
 
 const portalRooms = new WeakMap();
 
@@ -43,19 +44,36 @@ function observeSurfaceAccess(bot, makeVec) {
   const position = bot?.entity?.position;
   if (!position || !['overworld', 'minecraft:overworld'].includes(bot.game?.dimension) || !bot.blockAt) return null;
   const x = Math.floor(position.x), y = Math.floor(position.y), z = Math.floor(position.z);
-  const sky = bot.blockAt(makeVec(x, y + 1, z), false)?.skyLight;
+  const sky = surfaceSkyLight(bot, makeVec(x, y + 1, z));
   if (!Number.isFinite(sky)) return null;
   const access = { sky_light: sky, exit: null };
+  if (waterLike(bot.blockAt(makeVec(x, y, z), false))) {
+    access.in_water = true;
+    const roof = shoreHeadroomBlock(bot);
+    if (roof) access.bank_ceiling = {x: roof.position.x, y: roof.position.y, z: roof.position.z};
+    access.open_water = [1, 2, 3, 4].some(dy => {
+      const cell = bot.blockAt(makeVec(x, y + dy, z), false);
+      return cell?.name === 'air' && surfaceSkyLight(bot, makeVec(x, y + dy, z)) >= 14;
+    });
+  }
   if (sky >= 12) {
+    if (onConnectedBank(bot)) access.connected_land = true;
     const walls = [[1, 0], [-1, 0], [0, 1], [0, -1]]
       .filter(([dx, dz]) => bot.blockAt(makeVec(x + dx, y + 2, z + dz), false)?.boundingBox === 'block');
     if (walls.length < 3) return access;
   }
-  // 检查头顶和相邻四列，只认实际读到的日照干地；相同海拔的封闭洞穴不能当作地表。
-  for (const [dx, dz] of [[0, 0], [4, 0], [-4, 0], [0, 4], [0, -4]]) {
+  const columns = [[0, 0], [4, 0], [-4, 0], [0, 4], [0, -4]];
+  // 水底的亮度可能接近地表，额外检查近岸的干燥落脚点。
+  if (sky > 0 && Array.from({length: 8}, (_, i) => i + 2).some(dy =>
+    ['water', 'bubble_column'].includes(bot.blockAt(makeVec(x, y + dy, z), false)?.name))) {
+    columns.push([8, 0], [-8, 0], [0, 8], [0, -8], [5, 5], [-5, 5], [5, -5], [-5, -5]);
+    const shallow = shallowSurfaceExit(bot);
+    if (shallow) access.shallow_exit_y = shallow.surfaceY;
+  }
+  for (const [dx, dz] of columns) {
     for (let height = y + 1; height <= y + 24; height++) {
       const feet = bot.blockAt(makeVec(x + dx, height, z + dz), false);
-      if (!(feet?.skyLight >= 14) || !['air', 'short_grass', 'tall_grass'].includes(feet.name)) continue;
+      if (!['air', 'short_grass', 'tall_grass'].includes(feet?.name) || !(surfaceSkyLight(bot, makeVec(x + dx, height, z + dz)) >= 14)) continue;
       const ground = bot.blockAt(makeVec(x + dx, height - 1, z + dz), false);
       const head = bot.blockAt(makeVec(x + dx, height + 1, z + dz), false);
       if (ground?.boundingBox !== 'block' || !['air', 'short_grass', 'tall_grass'].includes(head?.name)) continue;
@@ -65,6 +83,18 @@ function observeSurfaceAccess(bot, makeVec) {
     }
   }
   return access;
+}
+
+function observePortalBank(bot, makeVec) {
+  const p = bot?.entity?.position;
+  if (!p || !bot.blockAt || !['the_nether', 'minecraft:the_nether'].includes(bot.game?.dimension)) return null;
+  const x = Math.floor(p.x), y = Math.floor(p.y), z = Math.floor(p.z);
+  if (bot.blockAt(makeVec(x, y, z), false)?.name !== 'nether_portal') return null;
+  const rock = /^(?:netherrack|blackstone|basalt|smooth_basalt)$/;
+  for (const [heading, dx, dz] of [['north', 0, -1], ['south', 0, 1], ['west', -1, 0], ['east', 1, 0]]) {
+    if ([1, 2].every(i => rock.test(bot.blockAt(makeVec(x + dx * i, y + i - 1, z + dz * i), false)?.name))) return heading;
+  }
+  return null;
 }
 
 function inspectShelterDetails(bot, remembered, makeVec = (x, y, z) => ({ x, y, z })) {
@@ -167,6 +197,7 @@ export function createObservation(bot, options) {
     executor,
     shelter,
     nearbyOwnedCraftingTable = false,
+    nearbyFoodAnimal = false,
     nearbyCraftingTable = false,
     makeVec = (x, y, z) => ({ x, y, z }),
   } = options;
@@ -212,8 +243,11 @@ export function createObservation(bot, options) {
     inventory,
     off_hand: offHand?.name || '',
     nearby_owned_crafting_table: Boolean(nearbyOwnedCraftingTable),
+    nearby_food_animal: Boolean(nearbyFoodAnimal),
     nearby_crafting_table: Boolean(nearbyCraftingTable || nearbyOwnedCraftingTable),
     surface_access: observeSurfaceAccess(bot, makeVec),
+    nether_portal_bank: observePortalBank(bot, makeVec),
+    ...(Array.isArray(options.netherMiningHostiles) ? {nether_mining_hostiles: options.netherMiningHostiles} : {}),
     end_portal_room: observePortalRoom(bot),
     end_dragon: observeDragon(bot),
     inventory_free_slots: typeof bot?.inventory?.emptySlotCount === 'function' ? bot.inventory.emptySlotCount() : null,

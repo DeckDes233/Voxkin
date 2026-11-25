@@ -3,11 +3,37 @@ from __future__ import annotations
 import pytest
 
 from voxkin.agent.actions import ActionError
-from voxkin.agent.goal_methods import choose_s4_preflight_action
+from voxkin.agent.goal_methods import choose_s4_preflight_action, record_s4_descent_success, s4_method_key
 from voxkin.agent.goal_supervisor import GoalSupervisor, choose_s4_resource_action
 from voxkin.agent.goals import GOALS, method_for_goal
 from voxkin.agent.tasks import TaskStore
 from voxkin.bridge.protocol import ActionResult, ActionStatusResult
+
+
+def test_s4_relocates_from_unsupported_surface_before_digging_again():
+    state = s4_state(y=74, surface_access={"sky_light": 15})
+    stop = {"x": -73, "y": 74, "z": 217}
+    evidence = {"position": stop, "candidates": [{"loaded": True, "reason": "unsupported"} for _ in range(4)]}
+    ledger = {"s4_safe_route_fallback_pending": True, "s4_last_descent_failure": {"data": evidence}}
+    step = choose_s4_resource_action(state, ledger)
+    assert step.tool == "explore_mining_site" and step.arguments["avoid_positions"] == [stop]
+    assert step.verify == {"type": "s4_surface_relocation", "min_distance": 12}
+    evidence["candidates"][0]["reason"] = "hazard"
+    assert choose_s4_resource_action(state, ledger).tool == "strip_mine"
+
+
+def test_old_failed_surface_tunnel_only_resumes_after_confirmed_terminal_observation(tmp_path):
+    state = s4_state(y=74, surface_access={"sky_light": 15})
+    supervisor = GoalSupervisor(GOALS["S4"], TaskStore(tmp_path / "tasks.db"), None, lambda: state)
+    entry = {"action_id": "old-tunnel", "tool": "strip_mine", "status": "failed", "receipt_confirmed": True}
+    history = {**entry, "method_key": "s4:ore_horizontal_fallback", "session_id": state["session_id"],
+               "revision": state["revision"] - 1, "result_data": {"observation": state}}
+    supervisor.state = {"action_history": [history], "s4_safe_route_fallback_pending": True,
+                        "s4_last_descent_failure": {"data": {"position": state["position"],
+                        "candidates": [{"loaded": True, "reason": "unsupported"} for _ in range(4)]}}}
+    assert supervisor._recover_s4_surface_fallback(entry, state)
+    history["revision"] = state["revision"]
+    assert not supervisor._recover_s4_surface_fallback(entry, state)
 
 
 def s4_state(*, y: float = 59.9, revision: int = 20, **updates) -> dict:
@@ -39,6 +65,33 @@ def s4_state(*, y: float = 59.9, revision: int = 20, **updates) -> dict:
     return state
 
 
+def test_s4_uses_last_two_sticks_underground_for_a_replacement_iron_pickaxe():
+    state = s4_state(y=-12, inventory={"crafting_table": 1, "stick": 2, "iron_ingot": 3, "porkchop": 4})
+    _, step = choose_s4_preflight_action(state, {})
+    assert step.tool == "craft" and step.arguments["item"] == "iron_pickaxe"
+
+
+def test_s4_waits_when_the_hunting_window_is_closed_but_the_sky_is_still_light():
+    state = s4_state(y=65, time=12342, is_day=True, inventory={"mutton": 1, "iron_pickaxe": 1}, shelter={"inside": False})
+    ledger = {}
+    assert choose_s4_preflight_action(state, ledger) == (False, None)
+    assert ledger["s4_preflight_wait_reason"]
+    state["time"] = 1400
+    _, step = choose_s4_preflight_action(state, ledger)
+    assert step.tool == "hunt_animal"
+
+
+def test_s4_collects_handles_near_home_before_first_descent():
+    state = s4_state(y=47, is_day=True, inventory={"crafting_table": 1, "iron_pickaxe": 1, "porkchop": 4})
+    ledger = {"stage": "S4", "s4_food_reserve_ready": True}
+    ready, step = choose_s4_preflight_action(state, ledger)
+    assert not ready and step.tool == "goto" and step.arguments["y"] > 47
+    for changes in ({"s4_descent_segments": 1}, {"counters": {"actions": 6}}):
+        assert choose_s4_preflight_action(state, {**ledger, **changes}) == (True, None)
+    state["position"]["y"] = -12
+    assert choose_s4_preflight_action(state, ledger) == (True, None)
+
+
 def test_s4_uses_the_observed_exit_before_a_distant_shelter():
     state = s4_state(position={"x": 118.5, "y": 42, "z": 12.5}, is_day=False,
                      shelter={"inside": False, "size": 4, "position": {"x": 9, "y": 69, "z": 152}},
@@ -50,6 +103,84 @@ def test_s4_uses_the_observed_exit_before_a_distant_shelter():
     state["position"]["y"] = 55
     ready, step = choose_s4_preflight_action(state, ledger)
     assert not ready and step is None and ledger.get("s4_preflight_wait_reason")
+
+
+def test_s4_keeps_mining_in_a_confirmed_dark_shaft_above_the_shelter():
+    state = s4_state(y=66, is_day=True, surface_access={"sky_light": 0, "exit": None})
+    state["inventory"]["stick"] = 1
+    ledger = {"s4_food_reserve_ready": True, "s4_descent_segments": 2}
+    assert choose_s4_preflight_action(state, ledger) == (True, None)
+    state["surface_access"].update(sky_light=15, connected_land=True)
+    _, step = choose_s4_preflight_action(state, ledger)
+    assert step.tool == "mine_collect" and step.arguments["block"].endswith("_log")
+
+
+def test_s4_retraces_only_a_confirmed_nearby_stair_to_replace_its_pick():
+    state = s4_state(y=66, is_day=True, surface_access={"sky_light": 0}, inventory={"crafting_table": 1, "porkchop": 4})
+    start = {"x": -10.5, "y": 78, "z": 169.3}
+    action = {"session_id": state["session_id"], "revision": state["revision"] - 1, "receipt_confirmed": True,
+              "tool": "strip_mine", "method_key": "s4:descend:1:66", "expected_condition": {"type": "s4_depth_reached", "target_y": 66},
+              "arguments": {"shaft": 12, "length": 0}, "baseline_position": start, "baseline_connected_land": True}
+    ledger = {}
+    assert record_s4_descent_success(ledger, action, state, "succeeded")
+    _, step = choose_s4_preflight_action(state, ledger)
+    assert step.arguments == {"x": -11, "y": 78, "z": 169, "dry_only": True}
+    key = s4_method_key(step, state, ledger)
+    state["is_day"] = False
+    assert choose_s4_preflight_action(state, ledger) == (False, None)
+    state["is_day"] = True
+    ledger["counters"] = {"method_failures": {key: 1}}
+    _, fallback = choose_s4_preflight_action(state, ledger)
+    assert not fallback.arguments.get("dry_only")
+    ledger["counters"] = {}
+    state["position"]["x"] += 20
+    _, distant = choose_s4_preflight_action(state, ledger)
+    assert not distant.arguments.get("dry_only")
+
+
+def test_s4_replans_a_supply_ascent_after_a_creeper_stops_mining(tmp_path):
+    state = s4_state(y=68, inventory={"stick": 1}, is_day=True)
+    row = {"action_id": "ascent", "tool": "strip_mine", "status": "failed", "receipt_confirmed": True,
+           "session_id": state["session_id"], "revision": state["revision"] - 1,
+           "expected_condition": {"type": "min_height", "y": 70},
+           "result_data": {"reason": "nearby_hostiles", "observation": state}}
+    supervisor = GoalSupervisor(GOALS["S4"], TaskStore(tmp_path / "task.db"), None, lambda: state)
+    supervisor.state = {}
+    assert supervisor._recover_s4_mining_threat(row)
+    assert choose_s4_preflight_action(state, supervisor.state) == (True, None)
+    retreat = choose_s4_resource_action(state, supervisor.state)
+    assert retreat.verify["type"] == "s4_threat_relocation"
+    assert retreat.arguments["avoid_positions"] == [state["position"]]
+    assert not supervisor._recover_s4_mining_threat({**row, "receipt_confirmed": False})
+
+
+def test_s4_rebinds_a_retreat_only_after_moving_to_a_new_threat(tmp_path):
+    state = s4_state(y=65)
+    end = state["position"]
+    origin = {**end, "x": end["x"] - 12}
+    supervisor = GoalSupervisor(GOALS["S4"], TaskStore(tmp_path / "task.db"), None, lambda: state)
+    supervisor.state = {"s4_threat_position": origin}
+    data = {"observation": state, "relocation": {"origin": origin}}
+    row = {"action_id": "second-creeper", "tool": "explore_mining_site", "status": "blocked",
+           "session_id": state["session_id"], "revision": state["revision"] - 1, "receipt_confirmed": True,
+           "expected_condition": {"type": "s4_threat_relocation"}, "result_data": data,
+           "result_detail": "动作 explore_mining_site 执行失败: 附近有敌对生物，先处理生存恢复"}
+    assert supervisor._recover_s4_mining_threat(row)
+    assert supervisor.state["s4_threat_position"] == end
+    row["result_detail"] = ""
+    data["reason"] = "nearby_hostiles"
+    assert supervisor._recover_s4_mining_threat(row)
+    data["relocation"]["origin"] = {**end, "z": end["z"] - 1}
+    assert not supervisor._recover_s4_mining_threat(row)
+
+
+def test_s4_hunts_above_the_observed_local_exit_even_when_the_shelter_is_lower():
+    exit_point = {"x": -60, "y": 72, "z": 202}
+    state = s4_state(position={"x": -59.5, "y": 66, "z": 202.5}, time=2000, is_day=True,
+                     shelter={"position": {"x": 34, "y": 63, "z": 76}, "size": 4, "inside": False},
+                     inventory={"iron_pickaxe": 1, "mutton": 1}, surface_access={"sky_light": 0, "exit": exit_point})
+    _, step = choose_s4_preflight_action(state, {})
+    assert step.tool == "goto" and step.arguments == exit_point
 
 
 def observation(state: dict) -> dict:

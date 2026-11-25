@@ -13,18 +13,18 @@ A persistent `GoalSupervisor` selects actions using inventory, environment and d
 
 In Studio, the Chinese command “背包里有什么” asks what Voxkin is carrying. In headless Paper tests, Voxkin returned its inventory during both mining and Nether scouting. The mining action went on to finish, and the scout continued pathfinding under the same action ID. A local rule handles this query. Automated tests cover microphone capture during replies and spoken interruptions. [Scheduling and interruptions](docs/ARCHITECTURE.md#任务语音与动作控制)
 
-The latest headless Paper run began with an empty inventory and passed S1–S4 across checkpoint restarts, preserving deaths and task history. In S5, Voxkin mined ten obsidian before a creeper interrupted portal construction. In a separate copy it resumed a partially built frame and entered the Nether. An independent S6 run checked resupply with no eyes of ender. [S1–S6 survival test](docs/evidence/NATURAL_S1_S6_20261124.md) · [Earlier End combat tests](docs/evidence/HEADLESS_S4_S6_20261123.md)
+Three of five empty-inventory runs on November 25 passed S0–S4 in sequence. All three used the 120-action S5 budget. In the furthest run, Voxkin mined ten obsidian, drained and lit its portal, and scouted the Nether. A fourth run was interrupted after S3. The remaining run escaped a flooded mine, later drowned, and passed S3 after rebuilding its tools and iron equipment. Gathering the required rods and pearls, killing the dragon and returning home still need an end-to-end survival pass. [November 25 survival runs](docs/evidence/NATURAL_S0_S6_20261125.md) · [Earlier End combat tests](docs/evidence/HEADLESS_S4_S6_20261123.md)
 
 | Area | Evidence boundary |
 | --- | --- |
 | Conversation, TTS/STT and game bridge | Implemented; engines and models require local configuration. [Benchmarks](docs/BENCHMARK_RESULTS.md) distinguish real APIs from the local test LLM |
 | S0–S2 | Fresh-world passes recorded; recent S2 passes cover daytime preparation, not actual overnight sleep or three-night survival |
-| S3 | In a fresh world, Voxkin started with an empty inventory, passed S1–S3 in sequence, mined and smelted its own iron, and crafted the iron pickaxe, iron sword, shield and bucket. Recovery from low oxygen during iron mining still needs a live test. [Survival rerun](docs/evidence/SURVIVAL_RERUN_20261123.md) |
+| S3 | Voxkin mined and smelted iron and crafted an iron pickaxe, iron sword, shield and bucket. A later run demonstrated escape from low oxygen while mining and an 18.3-block move over dry ground. [Survival runs](docs/evidence/NATURAL_S0_S6_20261125.md) |
 | S4 | The same empty-inventory survival run passed S4 after a host restart. Voxkin found an overland route to wood, replaced a broken iron pickaxe underground, mined four diamonds and crafted a diamond pickaxe. [Headless Paper rerun](docs/evidence/SURVIVAL_RERUN_20261123.md) |
-| S5 | The survival run obtained a water bucket and flint and steel, escaped a flooded shaft, and reached a new area to search for lava. In a separate lava-pool test Voxkin mined ten obsidian, built a portal and entered the Nether. Fortress supplies and the return trip remain open |
+| S5 | An empty-inventory run reached the Nether through a portal built with naturally mined obsidian. Fortress supplies and the return trip remain open. |
 | S6 | In an earlier test the server located a stronghold and supplied a nearby starting point and equipment. Voxkin threw eyes, filled the frames, entered the End and destroyed crystals. That version could also read frames through walls. Combat saves confirm damage to the dragon. Finding the portal from a natural start, killing the dragon and returning home remain open. [Portal and combat rerun](docs/evidence/SURVIVAL_RERUN_20261123.md) |
 | Village supplies and iron-golem harvesting | Implemented and covered by offline tests. Live acceptance remains open |
-| Skills | 67 skills, 66 model tools exposed by Core (excluding `chat`); see [catalog](docs/SKILLS.md) |
+| Skills | 68 skills. Core exposes 67 model tools. The bridge handles in-game chat. [Skill catalog](docs/SKILLS.md) |
 | Fabric audio mod | Builds; real-client playback and spatial audio remain unverified |
 | Full unattended completion | Not achieved; Windows native-crash issues remain unresolved |
 

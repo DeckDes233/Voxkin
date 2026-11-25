@@ -1,8 +1,43 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { skills, surveyPassage } from '../skills/nether.js';
+import { connectedSurvey, skills, surveyPassage } from '../skills/nether.js';
+import { skills as movementSkills } from '../skills/movement.js';
 import { Vec3 } from 'vec3';
+import { returnToNetherWaypoint } from '../dry_footing.js';
+
+test('下界薄台下方的岩浆和未知地形都保留脚下支撑，有实地才逐格垫脚', async () => {
+  for (const ground of ['lava', null, 'basalt']) {
+    const bot = {game: {dimension: 'the_nether'}, entity: {position: new Vec3(0.5, 86, 0.5), yaw: 0}};
+    const placed = new Set();
+    bot.blockAt = p => {
+      const name = placed.has(p.toString()) ? 'cobblestone' : p.y === 85 ? 'basalt' : p.y === 75 ? ground : 'air';
+      return name && {name, position: p, boundingBox: ['air', 'lava'].includes(name) ? 'empty' : 'block'};
+    };
+    const ctx = {bot, countItem: () => 5, sleep: async () => {},
+      placeBlock: async p => placed.add(new Vec3(p.x, p.y, p.z).toString()),
+      breakBlock: async () => { assert.equal(placed.size, 1); bot.entity.position.y = 85; }};
+    const act = movementSkills.safe_descend.handler({targetY: 85, maxLayers: 1, fill: true, detour: false}, ctx);
+    if (ground === 'basalt') assert.equal((await act).status, 'succeeded');
+    else {
+      await assert.rejects(act, /安全实地/);
+      assert.equal(placed.size, 0);
+      assert.equal(bot.entity.position.y, 86);
+    }
+  }
+});
+
+test('要塞侦察沿可步行地面选点，排除隔着深沟的远处平台', async () => {
+  const origin = new Vec3(0, 80, 0);
+  const bot = {game: {dimension: 'the_nether'}, entity: {position: origin}, blockAt(p) {
+    const floor = p.y <= 79 && (p.x >= -2 && p.x <= 2 && p.z >= -1 && p.z <= 10 || p.x >= 7);
+    return floor ? {name: 'basalt', boundingBox: 'block'} : {name: 'air', boundingBox: 'empty'};
+  }};
+  const {target, launches} = await connectedSurvey({bot}, {surveyed: [origin], walkMisses: []});
+  assert.ok(target.z >= 8 && Math.abs(target.x) <= 1);
+  assert.ok(launches.every(p => p.x < 7));
+  await assert.rejects(returnToNetherWaypoint({bot}, new Vec3(9, 80, 0)), /安全步行路径/);
+});
 
 test('a bounded fortress tunnel needs solid support and a dry wall along the entire passage', () => {
   const origin = new Vec3(0, 90, 0);
@@ -17,6 +52,19 @@ test('a bounded fortress tunnel needs solid support and a dry wall along the ent
   assert.equal(surveyPassage(bot, route), undefined);
   bot.blockAt = p => p.x === 5 && p.z === 0 && p.y < 90 ? null : baseline(p);
   assert.equal(surveyPassage(bot, route), undefined);
+});
+
+test('要塞侦察在已有隧道上从前端开巷', () => {
+  const here = new Vec3(0, 58, -115);
+  const rear = here.offset(0, 0, 15);
+  const anchor = {x: 0, z: 0};
+  const rock = {name: 'netherrack', boundingBox: 'block'};
+  const air = {name: 'air', boundingBox: 'empty'};
+  const bot = {game: {dimension: 'the_nether'}, entity: {position: here}, blockAt(p) {
+    return p.y < 58 || p.x > 0 && p.x <= 6 && [here.z, rear.z].includes(p.z) && p.y <= 60 ? rock : air;
+  }};
+  const route = {anchor, surveyed: [anchor, here, rear]};
+  assert.ok(surveyPassage(bot, route, here).clearance > surveyPassage(bot, route, rear).clearance);
 });
 
 class Position {

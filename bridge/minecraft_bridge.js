@@ -1,5 +1,5 @@
 import { escapeWater, reachShore, waterLike, breathable, avoidWaterScaffolding, allowedDuringWaterEscape } from './water_escape.js';
-import { besideDrop, dryMiningFooting, leaveMagmaBlock, miningRouteExclusion, netherRouteExclusion } from './dry_footing.js';
+import { besideDrop, dryMiningFooting, leaveMagmaBlock, miningRouteExclusion, netherRouteExclusion, returnToNetherWaypoint, withDryGroundMovement } from './dry_footing.js';
 import { crystalAimPoint } from './skills/combat.js';
 import { FUEL_BURN, selectFuel } from './fuel.js';
 // 沃心 Minecraft 桥接进程：mineflayer 负责游戏内身份，WebSocket 负责与 Voxkin Core 通信。
@@ -21,6 +21,7 @@ import { ExecutionController } from './execution_controller.js';
 import { LocalReflexScheduler, canRunLocalSafety, shouldInterruptForHunger } from './local_reflex.js';
 import { buildActionResult, mergeActionErrorData, validateActionState } from './action_response.js';
 import { createObservation } from './world_observation.js';
+import { HUNTABLE, nearbyFoodAnimal } from './skills/combat.js';
 import { inspectResourceSites } from './resource_sites.js';
 import { syncWindowWithLease, writeWindowClickWithLease } from './window_sync.js';
 import { placeBedAt } from './bed_placement.js';
@@ -32,7 +33,7 @@ import { pickCraftingRecipe } from './recipe_selection.js';
 import { approachEntity } from './entity_approach.js';
 import { stopPathfinderAndClearGoal, gotoWithTimeout } from './pathfinder_control.js';
 import { BLOCK_NAMES } from './skills/labels.js';
-import { inspectSupportedPlacementTargets } from './placement.js';
+import { dryStationAlcove, inspectSupportedPlacementTargets } from './placement.js';
 import { inspectPositionTerrain } from './world_readiness.js';
 import { installBridgeSessionLifecycle } from './session_lifecycle.js';
 import {
@@ -40,10 +41,13 @@ import {
   bestMeleeWeapon,
   chooseRetreatDestination,
   combatEquipment,
+  creeperBehindRock,
   evaluateEncounterStep,
   HOSTILE_MOBS,
   isAutomaticCombatTarget,
+  magmaCubeBehindCover,
   retreatSafetyScore,
+  zombieBehindFloor,
 } from './combat_encounter.js';
 import {
   acknowledgeLifecycleEvent as removeLifecycleEvent,
@@ -638,7 +642,7 @@ function buildSkillContext(runSkill, token = null, actionMessage = null) {
     isNearDanger,
     escapeEnvironment,
     blockIsWater,
-    swimToShore: (reason, timeoutMs, radius) => swimToShore(reason, token, timeoutMs, radius),
+    swimToShore: (reason, timeoutMs, radius, connected) => swimToShore(reason, token, timeoutMs, radius, connected),
     describeEntity,
     runSkill,
     reportProgress(phase, detail, progress, data = {}) {
@@ -679,6 +683,8 @@ async function runAction(message, token) {
     stopPathfinding();
   }
   const args = message.arguments || {};
+  token.seekingEmergencyFood = message.tool === 'hunt_animal' && args.nearby_only === true;
+  token.leavingMiningThreat = message.tool === 'explore_mining_site' && args.covered_escape === true;
   interrupted = false;
   currentTool = message.tool;
   currentActionId = message.action_id || '';
@@ -759,7 +765,12 @@ async function runAction(message, token) {
         break;
       }
       case 'goto':
-        detail = await goTo(Number(args.x), Number(args.y), Number(args.z));
+        if (args.nether_safe === true) {
+          detail = await returnToNetherWaypoint(buildSkillContext(null, token, message), vec(args.x, args.y, args.z));
+        } else {
+          const walk = () => goTo(Number(args.x), Number(args.y), Number(args.z));
+          detail = args.dry_only === true ? await withDryGroundMovement(bot, walk, true) : await walk();
+        }
         break;
       case 'break_block':
         detail = await breakBlock(args);
@@ -1683,6 +1694,21 @@ async function placeInventoryBlock(name, label, searchRadius = 1) {
     getBlock: ({ x, y, z }) => bot.blockAt(vec(x, y, z)),
   });
   const spots = scan.targets;
+  if (dryMiningFooting(bot, base) && !spots.some(({target}) => base.distanceTo(vec(target.x, target.y, target.z)) <= 4)) {
+    const alcove = dryStationAlcove(bot);
+    if (alcove) {
+      for (const point of alcove.cells) {
+        if (interrupted || executor.active?.token?.cancelled) throw new Error('工作台站位准备已取消');
+        const block = bot.blockAt(point);
+        if (block?.boundingBox === 'empty') continue;
+        if (!block || !bot.canDigBlock(block) || !dryStationAlcove(bot)?.target.equals(alcove.target)) break;
+        await equipToolFor(block);
+        if (interrupted || executor.active?.token?.cancelled) throw new Error('工作台站位准备已取消');
+        await bot.dig(block);
+      }
+      if (dryMiningFooting(bot, alcove.target)) spots.unshift({target: alcove.target});
+    }
+  }
   const supported = spots.length;
   let openSpots = 0;
   for (const { target } of spots) {
@@ -1732,6 +1758,13 @@ async function placeCraftingTable() {
 }
 
 async function recoverPlacedTable(table) {
+  const feet = bot.entity.position.floored();
+  if (!dryMiningFooting(bot, feet) || table.position.equals(feet.offset(0, -1, 0))) return;
+  const besideFluid = [[0,1,0],[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]].some(([x,y,z]) => {
+    const neighbor = bot.blockAt(table.position.offset(x,y,z));
+    return !neighbor || waterLike(neighbor) || neighbor.name === 'lava';
+  });
+  if (besideFluid) return;
   try {
     await bot.dig(table);
   } catch (error) {
@@ -2171,9 +2204,14 @@ function nearbyPlayers(radius, limit = 4) {
     .slice(0, limit);
 }
 
+function hostileBehindCover(entity, emergencyHunt = executor.active?.token?.seekingEmergencyFood) {
+  return magmaCubeBehindCover(bot, entity) || creeperBehindRock(bot, entity) || (emergencyHunt && zombieBehindFloor(bot, entity));
+}
+
 function nearbyHostiles(radius, limit = 4) {
   return assessCombatEncounter({
     entities: bot.entities,
+    behindFloor: hostileBehindCover,
     origin: bot.entity.position,
     registry: bot.registry,
     health: bot.health,
@@ -2495,7 +2533,8 @@ async function retreatFrom(target) {
   let movedAway = false;
   const movements = bot.pathfinder.movements;
   const nether = ['the_nether', 'minecraft:the_nether'].includes(bot.game.dimension);
-  const coast = ['overworld', 'minecraft:overworld'].includes(bot.game.dimension) && ['drowned', 'creeper'].includes(target.name);
+  const coast = ['overworld', 'minecraft:overworld'].includes(bot.game.dimension)
+    && (dryMiningFooting(bot, position) || ['drowned', 'creeper'].includes(target.name));
   const previous = (nether || coast) && movements && { allowParkour: movements.allowParkour, canDig: movements.canDig,
     infiniteLiquidDropdownDistance: movements.infiniteLiquidDropdownDistance,
     maxDropDown: movements.maxDropDown, exclusionAreasStep: movements.exclusionAreasStep };
@@ -2630,7 +2669,7 @@ async function shootAt(target) {
   }
 }
 
-async function attackEntity(target, { allowTargetSwitch = false, encounterRadius = 16 } = {}) {
+async function attackEntity(target, { allowTargetSwitch = false, encounterRadius = 16, emergencyHunt = false, dryDefense = false } = {}) {
   await equipWeapon();
   const requestedTarget = target;
   let activeTarget = target;
@@ -2641,6 +2680,7 @@ async function attackEntity(target, { allowTargetSwitch = false, encounterRadius
   const updateEncounter = async () => {
     const decision = await evaluateEncounterStep({
       entities: bot.entities,
+      behindFloor: entity => hostileBehindCover(entity, emergencyHunt),
       origin: bot.entity.position,
       registry: bot.registry,
       health: bot.health,
@@ -2667,7 +2707,8 @@ async function attackEntity(target, { allowTargetSwitch = false, encounterRadius
     return true;
   };
 
-  for (let index = 0; index < 20 && activeTarget.isValid !== false && bot.health > 4; index += 1) {
+  const healthFloor = emergencyHunt && !allowTargetSwitch && HUNTABLE.includes(target.name) ? 2 : 4;
+  for (let index = 0; index < 20 && activeTarget.isValid !== false && bot.health > healthFloor; index += 1) {
     if (interrupted) throw new Error('被新的指令打断');
     await updateEncounter();
     let distance = activeTarget.position
@@ -2712,8 +2753,12 @@ async function attackEntity(target, { allowTargetSwitch = false, encounterRadius
       meleeReady = true;
     }
     if (distance > 3) {
-      await approach(activeTarget);
+      const reached = await approach(activeTarget);
       if (interrupted) throw new Error('被新的指令打断');
+      if (!reached && dryDefense) {
+        const moved = await retreatFrom(activeTarget);
+        return moved ? '干地上无法接敌，已撤离' : '干地路线受阻，停止追击';
+      }
       if (await updateEncounter()) continue;
     }
     distance = activeTarget.position
@@ -2759,7 +2804,10 @@ async function defendAgainst(target) {
       if (findFood()) await eatIfPossible();
       return;
     }
-    const detail = await attackEntity(target, { allowTargetSwitch: true, encounterRadius: 16 });
+    const dryDefense = ['overworld', 'minecraft:overworld'].includes(bot.game?.dimension)
+      && bot.pathfinder?.movements && dryMiningFooting(bot, bot.entity.position);
+    const fight = () => attackEntity(target, {allowTargetSwitch: true, encounterRadius: 16, dryDefense: Boolean(dryDefense)});
+    const detail = dryDefense ? await withDryGroundMovement(bot, fight) : await fight();
     log('反击结束', detail);
   } catch (error) {
     log('反击失败', error.message);
@@ -2861,7 +2909,7 @@ function blockIsWater(block) {
 
 let waterEscapeBusy = false;
 let waterEscapeRequired = false;
-async function swimToShore(reason, token = null, timeoutMs = 25000, radius = 12) {
+async function swimToShore(reason, token = null, timeoutMs = 25000, radius = 12, connected = false) {
   if (waterEscapeBusy) return false;
   waterEscapeBusy = true;
   try {
@@ -2869,7 +2917,16 @@ async function swimToShore(reason, token = null, timeoutMs = 25000, radius = 12)
     const started = Date.now();
     if (!await escapeWater(bot, { token, timeoutMs, radius })) return false;
     const remaining = Math.max(0, timeoutMs - (Date.now() - started));
-    const landed = await reachShore(bot, { token, timeoutMs: remaining, radius });
+    const placeLanding = async p => {
+      if (!countItem('cobblestone') || token?.cancelled) return false;
+      try {
+        await placeBlock({block: 'cobblestone', x: p.x, y: p.y, z: p.z});
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const landed = await reachShore(bot, { token, timeoutMs: remaining, radius, connected, placeLanding });
     log(landed ? '水中自救已靠岸' : '已恢复呼吸但未找到安全岸边');
     return landed;
   } finally {
@@ -2886,7 +2943,8 @@ function waterTick() {
   if (breathable(eye) && eye.name !== 'bubble_column' && Number.isFinite(oxygen) && oxygen >= 19) waterEscapeRequired = false;
   const inWater = blockIsWater(feet) || blockIsWater(head) || blockIsWater(eye);
   if (!inWater) return;
-  if (Number.isFinite(oxygen) && (oxygen <= 8 || waterEscapeRequired)) {
+  const stationWork = ['craft', 'smelt', 'smelt_batch'].includes(executor.active?.tool);
+  if (Number.isFinite(oxygen) && (oxygen <= 8 || waterEscapeRequired || (stationWork && waterLike(eye) && oxygen < 19))) {
     waterEscapeRequired = true;
     reportReflexEvent('low_oxygen', { oxygen, health: bot.health, food: bot.food });
   }
@@ -3080,7 +3138,9 @@ function survivalTick() {
     reportReflexEvent('hostile_nearby', { entity_id: cloud.id, entity_name: cloud.name, health: bot.health, food: bot.food }, 1500);
     return;
   }
-  if (bot.health <= 8) {
+  const seekingFood = executor.active?.token?.seekingEmergencyFood && bot.health > 2 && !findHostile(12)
+    && !bot.entity.isInWater && !bot.entity.isInLava && (bot.entity.onGround || bot.entity.velocity.y > -0.5);
+  if (bot.health <= 8 && !seekingFood) {
     reportReflexEvent('low_health', { health: bot.health, food: bot.food, position: { x: bot.entity.position.x, y: bot.entity.position.y, z: bot.entity.position.z } }, 5000);
   }
   if (shouldInterruptForHunger(bot.food, findFood())) {
@@ -3091,6 +3151,15 @@ function survivalTick() {
     // 末地的末影人也会追打撞到它的龙。靠近已激怒的末影人时，由实际受击事件确认是否需要反击。
     if (hostile.name === 'enderman' && ['the_end', 'minecraft:the_end'].includes(bot.game.dimension)) return;
     const distance = bot.entity.position.distanceTo(hostile.position);
+    if (executor.active?.token?.leavingMiningThreat && distance <= 8) {
+      const eye = bot.entity.position.offset(0, bot.entity.eyeHeight ?? 1.62, 0);
+      const screened = [0.25, (hostile.height || 1.8) * 0.85].every(height => {
+        const ray = hostile.position.offset(0, height, 0).minus(eye);
+        const length = ray.norm();
+        return length > 0 && bot.world.raycast(eye, ray.scaled(1 / length), length);
+      });
+      if (screened) return;
+    }
     if (distance <= 8 && Date.now() - lastCreeperWarnAt > 10000) {
       lastCreeperWarnAt = Date.now();
       reportReflexEvent(
@@ -3158,6 +3227,7 @@ function resolvePlayer(name) {
 function findHostile(range) {
   return assessCombatEncounter({
     entities: bot.entities,
+    behindFloor: hostileBehindCover,
     origin: bot.entity.position,
     registry: bot.registry,
     health: bot.health,
@@ -3707,7 +3777,10 @@ function buildStateObservation() {
     ready: ordinaryActionReady(),
     executor: executor.snapshot(),
     nearbyOwnedCraftingTable: Boolean(ownedTableNearby(bot, temporaryCraftingTable)),
+    nearbyFoodAnimal: Boolean(terrainReady && bot?.health <= 10 && bot?.food < 18 && nearbyFoodAnimal(bot)),
     nearbyCraftingTable: Boolean(bot?.entity && terrainReady && nearbyBlock('crafting_table', 4)),
+    netherMiningHostiles: bot?.entity && terrainReady && String(bot.game?.dimension).endsWith('the_nether')
+      ? nearbyHostiles(8) : null,
     shelter: !bot?.entity || (rememberedShelter?.dimension && rememberedShelter.dimension !== String(bot.game?.dimension || ''))
       ? null
       : rememberedShelter,

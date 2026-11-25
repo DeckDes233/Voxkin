@@ -95,6 +95,19 @@ test('an enclosed cave at Y=62 reports the dry sunlit turf above it', () => {
   assert.deepEqual(surface_access, { sky_light: 0, exit: { x: 0, y: 79, z: 0 } });
 });
 
+test('水底洞穴的返程观察选取近岸干地，跳过亮度充足的水面', () => {
+  const {bot} = makeWorld();
+  bot.entity.position.y = 58;
+  bot.blockAt = p => {
+    if (p.y >= 63) return {name: 'air', skyLight: 15, boundingBox: 'empty'};
+    if (p.y === 62 && p.z === 8) return {name: 'sand', boundingBox: 'block'};
+    if (p.y >= 61) return {name: 'water', skyLight: 13, boundingBox: 'empty'};
+    return {name: 'air', skyLight: 11, boundingBox: 'empty'};
+  };
+  assert.deepEqual(createObservation(bot, {executor: {}}).surface_access,
+    {sky_light: 11, exit: {x: 0, y: 63, z: 8}});
+});
+
 test('副手盾计入装备持有数且不会重复统计，副手材料仍与合成库存分开', () => {
   const { bot } = makeWorld();
   const shield = { name: 'shield', count: 1, slot: 45 };

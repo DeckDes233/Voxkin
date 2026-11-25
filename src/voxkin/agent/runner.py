@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -65,6 +66,9 @@ class Verifier:
         kind = rule.get("type")
         if kind == "always":
             return True, "无需判定"
+        if kind == "inventory_free_slots":
+            free = state.get("inventory_free_slots")
+            return isinstance(free, int) and free >= rule["min"], f"背包空格 {free}，目标至少 {rule['min']}"
         if kind == "result_event":
             event = str(rule.get("event") or "")
             events = (result_data or {}).get("events") or []
@@ -87,6 +91,11 @@ class Verifier:
                 available >= required,
                 "背包满足" if available >= required else f"可用物品共 {available} 个，还差 {required - available} 个",
             )
+        if kind == "max_height":
+            y = (state.get("position") or {}).get("y")
+            dimension = str(state.get("dimension") or "").removeprefix("minecraft:")
+            reached = dimension == rule["dimension"] and type(y) in (int, float) and math.isfinite(y) and y <= rule["y"]
+            return reached, f"实际维度 {dimension}，高度 {y}"
         if kind == "min_height":
             y = (state.get("position") or {}).get("y")
             target = rule["y"]

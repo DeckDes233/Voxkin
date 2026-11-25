@@ -1,3 +1,5 @@
+import { waterLike } from './water_escape.js';
+
 export function placementOffsets(radius = 4) {
   const limit = Math.max(1, Math.floor(Number(radius) || 1));
   const offsets = [];
@@ -100,18 +102,41 @@ export function inspectSupportedPlacementTargets({
     for (const dy of heights) {
       const y = originY + dy;
       const ground = read({ x, y, z }, 'candidate_ground');
-      if (!ground || ground.boundingBox !== 'block') continue;
+      if (!ground || ground.boundingBox !== 'block' || waterLike(ground) || ['magma_block', 'campfire', 'soul_campfire', 'cactus'].includes(ground.name)) continue;
       const target = { x, y: y + 1, z };
       const above = read(target, 'candidate_above');
       const above2 = read({ ...target, y: target.y + 1 }, 'candidate_body');
-      if (above?.boundingBox === 'empty' && above2?.boundingBox === 'empty') {
+      if ([above, above2].every(cell => cell?.boundingBox === 'empty' && !waterLike(cell) && !['lava', 'fire', 'soul_fire', 'powder_snow'].includes(cell.name))) {
         targets.push({ target, ground });
       }
     }
   }
+  const distance = ({target}) => Math.hypot(target.x + 0.5 - base.x, target.y - base.y, target.z + 0.5 - base.z);
+  targets.sort((a, b) => distance(a) - distance(b));
   return { targets, diagnostics };
 }
 
 export function findSupportedPlacementTargets(options = {}) {
   return inspectSupportedPlacementTargets(options).targets;
+}
+
+export function dryStationAlcove(bot) {
+  const origin = bot.entity.position.floored();
+  const ordinary = new Set(['stone', 'andesite', 'diorite', 'granite', 'cobblestone', 'tuff', 'deepslate', 'dirt', 'grass_block']);
+  for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    const target = origin.offset(dx, 0, dz), floor = bot.blockAt(target.offset(0, -1, 0));
+    if (floor?.boundingBox !== 'block' || !ordinary.has(floor.name)) continue;
+    const cells = [target.offset(0, 1, 0), target];
+    if (!cells.every(p => {
+      const block = bot.blockAt(p);
+      if (!block || !(ordinary.has(block.name) || block.name === 'air' || block.name === 'cave_air')) return false;
+      return [[0,1,0],[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]].every(([x, y, z]) => {
+        const neighbor = bot.blockAt(p.offset(x, y, z));
+        return neighbor && !waterLike(neighbor) && neighbor.name !== 'lava'
+          && !(y && /(?:sand|gravel|anvil|concrete_powder)$/.test(neighbor.name));
+      });
+    })) continue;
+    return {target, cells};
+  }
+  return null;
 }
