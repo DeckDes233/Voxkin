@@ -1771,9 +1771,10 @@ async function recoverPlacedTable(table) {
     log('回收工作台失败', error.message);
     return;
   }
-  for (let attempt = 0; attempt < 10 && countItem('crafting_table') === 0; attempt += 1) {
+  if (countItem('crafting_table') === 0) {
     await sleep(400);
-    await collectDrops(4, 'crafting_table');
+    // collectDrops 已等待掉落物生成、尝试接近并核对库存。
+    if (!externalCancelReason() && dryMiningFooting(bot, bot.entity.position)) await collectDrops(4, 'crafting_table');
   }
 }
 
