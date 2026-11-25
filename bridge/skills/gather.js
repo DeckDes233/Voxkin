@@ -760,6 +760,9 @@ async function digAt(ctx, position, options = {}) {
       message: `目标是${isLavaBlock(block) ? '岩浆' : '水'}`,
     };
   }
+  if (options.passage && !safeStairOpening(bot, position)) {
+    return {ok: false, reason: 'hazard', position, message: '开挖会暴露流体、落块或未知地形'};
+  }
   try {
     const pick = passagePick(bot, block);
     if (pick) {
@@ -945,7 +948,7 @@ async function digForward(ctx, position, heading, state, options = {}) {
           message: `头顶遇到${isLavaBlock(block) ? '岩浆' : '水'}`,
         };
       }
-      const dug = await digAt(ctx, at);
+      const dug = await digAt(ctx, at, {passage: true});
       checkInterrupted(ctx);
       if (!dug.ok) {
         return { ok: false, reason: dug.reason, position: at, message: `头顶挖不开：${dug.message}` };
@@ -954,7 +957,7 @@ async function digForward(ctx, position, heading, state, options = {}) {
     }
   }
   if (!isPassableBlock(frontBlock)) {
-    const dug = await digAt(ctx, front);
+    const dug = await digAt(ctx, front, {passage: true});
     checkInterrupted(ctx);
     if (!dug.ok) {
       return { ok: false, reason: dug.reason, position: front, message: dug.message };

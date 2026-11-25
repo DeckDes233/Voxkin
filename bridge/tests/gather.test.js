@@ -304,6 +304,14 @@ test('徒手清普通石头能开出逃生台阶并确认高度', async () => {
   assert.ok(ctx.digs.length > 0);
 });
 
+test('水平开巷保留挡住上方含水层的顶板', async () => {
+  const ctx = makeContext({position: {x: 91, y: 52, z: 23}});
+  ctx.blocks.set('91,55,23', {name: 'water', position: new Vec3(91, 55, 23), boundingBox: 'empty'});
+  await assert.rejects(skills.strip_mine.handler({direction: 'west', length: 8, branches: 0, torchInterval: 0}, ctx), /开挖会暴露/);
+  assert.ok(!ctx.digs.some(p => p.x === 91 && p.y === 54 && p.z === 23));
+  assert.equal(ctx.bot.entity.position.y, 52);
+});
+
 test('用石镐开台阶，把唯一的铁镐留给确实需要铁镐的矿石', async () => {
   const ctx = makeContext();
   const iron = {name: 'iron_pickaxe', type: 81, slot: 36, maxDurability: 250, durabilityUsed: 127};
