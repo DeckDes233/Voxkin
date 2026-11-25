@@ -1,6 +1,6 @@
 # Bridge 技能模块
 
-更新于 2026-10-28。`bridge/skills/` 保存 46 项模块技能；加上 `minecraft_bridge.js` 的 21 项内建动作，当前清单共 67 项。用户向功能介绍、阶段目标和完整列表见 [技能总表](../../docs/SKILLS.md)。
+更新于 2026-11-25。`bridge/skills/` 保存 47 项模块技能；加上 `minecraft_bridge.js` 的 21 项内建动作，当前清单共 68 项。用户向功能介绍、阶段目标和完整列表见 [技能总表](../../docs/SKILLS.md)。
 
 ## 注册与事实来源
 
@@ -22,7 +22,7 @@
 | [movement.js](movement.js) | `safe_descend`, `swim_escape`, `safe_travel`, `parkour_safe` |
 | [nether.js](nether.js) | `make_nether_portal`, `nether_travel`, `raid_fortress`, `collect_blaze_rods` |
 | [scavenge.js](scavenge.js) | `loot_village` |
-| [storage.js](storage.js) | `store_items`, `withdraw_items`, `checkpoint_stock`, `list_chest` |
+| [storage.js](storage.js) | `store_items`, `withdraw_items`, `checkpoint_stock`, `list_chest`, `discard_rubble` |
 | [survival.js](survival.js) | `equip_armor`, `eat_if_hungry`, `make_shelter`, `sleep_safe`, `wait_for_day`, `leave_shelter`, `flee_low_health`, `swim_out` |
 
 共用机制位于上一级：`resource_search.js` 负责有界资源搜索，`resource_sites.js` 观察床、箱子、干草与铁傀儡，`combat_encounter.js` 评估群怪，`window_sync.js` 处理容器确认。阶段资源储备属于 Core `resource_policy.py`，不在每个技能内重复编排。

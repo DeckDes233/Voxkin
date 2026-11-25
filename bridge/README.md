@@ -1,6 +1,6 @@
 # Minecraft 桥接
 
-`minecraft_bridge.js` 让 Mineflayer 机器人进入 Minecraft Java 1.21.1 世界，将聊天和世界观察发送给 Voxkin Core，并执行带验收回执的动作。当前清单共 67 项技能，覆盖采集、合成、生存、群怪战斗、村庄补给、铁傀儡取铁、下界和末地；完整介绍见 [技能总表](../docs/SKILLS.md)，开发方式见 [模块说明](skills/README.md)。
+`minecraft_bridge.js` 让 Mineflayer 机器人进入 Minecraft Java 1.21.1 世界，将聊天和世界观察发送给 Voxkin Core，并执行带验收回执的动作。当前清单共 68 项技能，覆盖采集、合成、生存、群怪战斗、村庄补给、铁傀儡取铁、下界和末地；完整介绍见 [技能总表](../docs/SKILLS.md)，开发方式见 [模块说明](skills/README.md)。
 
 ## 安装与启动
 
