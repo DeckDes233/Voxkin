@@ -11,13 +11,18 @@ from voxkin.bridge.protocol import ActionResult, ActionStatusResult
 
 
 def test_s4_relocates_from_unsupported_surface_before_digging_again():
-    state = s4_state(y=74, surface_access={"sky_light": 15})
     stop = {"x": -73, "y": 74, "z": 217}
+    state = s4_state(position=dict(stop), surface_access={"sky_light": 15})
     evidence = {"position": stop, "candidates": [{"loaded": True, "reason": "unsupported"} for _ in range(4)]}
     ledger = {"s4_safe_route_fallback_pending": True, "s4_last_descent_failure": {"data": evidence}}
     step = choose_s4_resource_action(state, ledger)
     assert step.tool == "explore_mining_site" and step.arguments["avoid_positions"] == [stop]
     assert step.verify == {"type": "s4_surface_relocation", "min_distance": 12}
+    moved = s4_state(position={"x": 91.5, "y": 52, "z": 23.3})
+    after_resupply = dict(ledger)
+    assert choose_s4_resource_action(moved, after_resupply).verify["type"] == "s4_depth_reached"
+    assert not after_resupply["s4_safe_route_fallback_pending"]
+    assert after_resupply["s4_last_descent_failure"]["data"]["position"] == stop
     evidence["candidates"][0]["reason"] = "hazard"
     assert choose_s4_resource_action(state, ledger).tool == "strip_mine"
 
@@ -113,6 +118,16 @@ def test_s4_keeps_mining_in_a_confirmed_dark_shaft_above_the_shelter():
     state["surface_access"].update(sky_light=15, connected_land=True)
     _, step = choose_s4_preflight_action(state, ledger)
     assert step.tool == "mine_collect" and step.arguments["block"].endswith("_log")
+
+
+def test_s4_recounts_provisions_before_leaving_after_respawn():
+    state = s4_state(is_day=True, time=2000, food=20, inventory={"stone_pickaxe": 1},
+                     surface_access={"sky_light": 15, "connected_land": True})
+    ledger = {"s4_food_reserve_ready": True, "counters": {"actions": 59}}
+    _, step = choose_s4_preflight_action(state, ledger)
+    assert step.tool == "hunt_animal"
+    assert not ledger.get("s4_food_reserve_ready")
+    assert ledger["counters"]["actions"] == 59
 
 
 def test_s4_retraces_only_a_confirmed_nearby_stair_to_replace_its_pick():

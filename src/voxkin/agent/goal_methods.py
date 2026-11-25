@@ -1282,6 +1282,11 @@ def choose_s4_preflight_action(
         return wait("等待 Bridge 明确观察角色位于庇护所内还是室外")
 
     reserve_ready = bool(goal_state.get("s4_food_reserve_ready"))
+    if reserve_ready and needs_diamond_mining and not food_stock and (
+            shelter.get("inside") is True or (state.get("surface_access") or {}).get("connected_land") is True):
+        # 回营或来到连通地表时重新盘点，包括重生后满饥饿值但背包为空的情况。
+        goal_state.pop("s4_food_reserve_ready", None)
+        reserve_ready = False
     if needs_diamond_mining and not reserve_ready:
         if health <= S4_MIN_HEALTH:
             if food_stock > 0 and food < 20:
@@ -1449,8 +1454,16 @@ def choose_s4_resource_action(state: dict[str, Any], goal_state: dict[str, Any])
         return _s3_action("撤离有近身敌怪的矿点，到干燥新位置继续", "explore_mining_site",
                           {"min_distance": 12, "avoid_positions": [threat]},
                           {"type": "s4_threat_relocation", "min_distance": 12}, 150)
+    failure = (goal_state.get("s4_last_descent_failure") or {}).get("data") or {}
+    if goal_state.get("s4_safe_route_fallback_pending") and _s4_lacks_stair_support(failure):
+        feet = state.get("position") or {}
+        stop = failure["position"]
+        if (state.get("ready") and state.get("alive")
+                and all(type(feet.get(a)) in (int, float) and math.isfinite(feet[a]) for a in ("x", "z"))
+                and math.hypot(feet["x"] - stop["x"], feet["z"] - stop["z"]) >= 32):
+            # 补给或重生已经离开原矿区；新矿点须按脚下地形重新下探。
+            goal_state["s4_safe_route_fallback_pending"] = False
     if goal_state.get("s4_safe_route_fallback_pending") is True:
-        failure = (goal_state.get("s4_last_descent_failure") or {}).get("data") or {}
         if _s4_lacks_stair_support(failure):
             avoid = [*(goal_state.get("s4_surface_stops") or []), failure["position"]]
             return _s3_action("离开缺少阶梯支撑的矿点，再从干地开矿", "explore_mining_site",
