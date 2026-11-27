@@ -3780,6 +3780,8 @@ function buildStateObservation() {
     nearbyOwnedCraftingTable: Boolean(ownedTableNearby(bot, temporaryCraftingTable)),
     nearbyFoodAnimal: Boolean(terrainReady && bot?.health <= 10 && bot?.food < 18 && nearbyFoodAnimal(bot)),
     nearbyCraftingTable: Boolean(bot?.entity && terrainReady && nearbyBlock('crafting_table', 4)),
+    overworldMiningHostiles: bot?.entity && terrainReady && String(bot.game?.dimension).endsWith('overworld')
+      ? nearbyHostiles(8, 1) : null,
     netherMiningHostiles: bot?.entity && terrainReady && String(bot.game?.dimension).endsWith('the_nether')
       ? nearbyHostiles(8) : null,
     shelter: !bot?.entity || (rememberedShelter?.dimension && rememberedShelter.dimension !== String(bot.game?.dimension || ''))

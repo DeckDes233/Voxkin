@@ -396,11 +396,18 @@ class GoalSupervisor:
                     step = choose_s2_action(state, self.state)
                     if step is None:
                         self.state["status"] = "waiting"
-                        self.state["block_reason"] = "等待下一次夜晚或新鲜状态变化"
+                        self.state["block_reason"] = self.state.get("s2_wait_reason") or "等待下一次夜晚或新鲜状态变化"
                         self._save()
                         await self._wait_for_observation()
                         continue
                     method_key = f"s2:{step.tool}:{step.arguments.get('block') or step.arguments.get('item') or 'default'}"
+                    if method_key == "s2:mine_collect:dirt":
+                        step, method_key = self._plan_s2_dirt_collection(step, method_key, state)
+                        if step is None:
+                            self.state.update(status="waiting", block_reason="夜间取土点有敌怪，退路受阻，等待敌情、位置或天光变化")
+                            self._save()
+                            await self._wait_for_observation()
+                            continue
                     if step.tool == "make_shelter":
                         site = (state.get("shelter") or {}).get("position") or state.get("position")
                         if self._finite_position(site):
@@ -423,6 +430,9 @@ class GoalSupervisor:
                                             {"type": "s2_wool_relocation", "min_distance": 24},
                                             retries=1, timeout_s=180.0, effect_class="replan")
                             method_key = f"s2:wool_relocate:region{region}"
+                            if self._method_failure_count(method_key) and (state.get("surface_access") or {}).get("connected_land"):
+                                step = replace(step, arguments={**step.arguments, "connected_route": True})
+                                method_key += ":connected"
                     step_index: int | None = None
                 elif self.goal.stage == "S3":
                     relocation_required = bool(self.state.get("s3_low_oxygen_relocation_required"))
@@ -720,8 +730,9 @@ class GoalSupervisor:
                         step = StepSpec("从已观察的浅水出口上浮并靠岸", "swim_out", {"shallow_exit": True},
                                         {"type": "min_height", "y": water_y}, retries=1, timeout_s=55, effect_class="replan")
                         method_key += ":shore"
-                if (self.goal.stage in {"S3", "S4", "S5", "S6"} and (state.get("surface_access") or {}).get("in_water") is True
-                        and step.tool in {"strip_mine", "goto", "mine_collect", "explore_mining_site", "collect_obsidian", "safe_descend"}):
+                if (self.goal.stage in {"S2", "S3", "S4", "S5", "S6"} and (state.get("surface_access") or {}).get("in_water") is True
+                        and (step.tool in {"strip_mine", "goto", "mine_collect", "explore_mining_site", "collect_obsidian", "safe_descend"}
+                             or self.goal.stage == "S2" and step.tool in {"hunt_material", "hunt_animal", "shear_sheep", "make_shelter"})):
                     open_water = state["surface_access"].get("open_water") is True
                     step = StepSpec("先游到干地，再继续补给或采矿", "swim_out", {"shallow_exit": open_water},
                                     {"type": "result_event", "event": "connected_bank_reached" if open_water else "dry_bank_reached"},
@@ -1040,7 +1051,7 @@ class GoalSupervisor:
         if (self._method_stage, condition.get("type")) in {
             ("S3", "s3_mining_relocation"), ("S3", "s3_wood_relocation"), ("S2", "s2_wool_relocation"), ("S2", "s3_wood_relocation"),
             ("S4", "s3_wood_relocation"), ("S5", "s3_wood_relocation"), ("S6", "s3_wood_relocation"),
-            ("S4", "s4_water_relocation"), ("S4", "s4_surface_relocation"), ("S4", "s4_threat_relocation"),
+            ("S2", "s2_threat_relocation"), ("S4", "s4_water_relocation"), ("S4", "s4_surface_relocation"), ("S4", "s4_threat_relocation"),
             ("S5", "s5_obsidian_relocation"), ("S5", "s5_portal_relocation"),
             ("S5", "late_threat_relocation"), ("S6", "late_threat_relocation"),
         }:
@@ -2353,6 +2364,59 @@ class GoalSupervisor:
         return (StepSpec("沿安全台阶分段返回地表", "strip_mine", args,
                          {"type": "min_height", "y": start_y + args["rise"]}, retries=1, timeout_s=160,
                          effect_class="replan"), key)
+
+    def _plan_s2_dirt_collection(self, step: StepSpec, key: str, state: dict) -> tuple[StepSpec | None, str]:
+        history = self.state.get("action_history", [])
+        failure_count = self._method_failure_count(key)
+        if failure_count and self._finite_number(state.get("health")) and float(state["health"]) > 10:
+            failures = [row for row in history if row.get("method_key") == key and row.get("receipt_confirmed")
+                        and row.get("status") in {"blocked", "failed"}]
+            if (len(failures) >= failure_count and all("血量不足" in str(row.get("result_detail") or "")
+                    and self._finite_number(hp := (row.get("terminal_observation") or {}).get("health"))
+                    and float(hp) <= 8 for row in failures)):
+                key += ":healthy"
+        feet = state.get("position")
+        if not self._finite_position(feet):
+            return step, key
+        for row in reversed(history):
+            data = row.get("result_data") or {}
+            if (row.get("tool") != "mine_collect" or (row.get("arguments") or {}).get("block") != "dirt"
+                    or row.get("status") not in {"blocked", "failed"} or row.get("receipt_confirmed") is not True
+                    or data.get("reason") != "nearby_hostiles"):
+                continue
+            terminal = _fresh_terminal_observation(row, data) or {}
+            hazard = terminal.get("position")
+            if terminal.get("dimension") != state.get("dimension") or not self._finite_position(hazard):
+                continue
+            site = f"{math.floor(hazard['x'] / 8)}:{math.floor(hazard['z'] / 8)}"
+            if math.hypot(feet["x"] - hazard["x"], feet["z"] - hazard["z"]) < 8:
+                if state.get("overworld_mining_hostiles") == []:
+                    return step, f"{key}:clear:{site}"
+                retreat_key = f"s2:shelter_retreat:{site}"
+                args = {"min_distance": 12, "avoid_positions": [hazard], "connected_route": True}
+                if self._method_failure_count(retreat_key):
+                    args["covered_escape"] = True
+                    retreat_key += ":covered"
+                    if any(r.get("method_key") == retreat_key and r.get("receipt_confirmed") is True
+                           and r.get("status") in {"failed", "blocked"}
+                           and ((r.get("result_data") or {}).get("relocation") or {}).get("attempted_positions") == []
+                           and "干燥矿道未能通到" in str(r.get("result_detail") or "") for r in history):
+                        args["connected_route"] = False
+                        retreat_key += ":dig"
+                        if self._method_failure_count(retreat_key):
+                            if state.get("is_day") is False:
+                                return None, retreat_key
+                            if state.get("is_day") is True and any(r.get("method_key") == retreat_key
+                                    and r.get("receipt_confirmed") is True
+                                    and (r.get("terminal_observation") or {}).get("is_day") is False for r in history):
+                                args = {"min_distance": 12, "avoid_positions": [hazard], "connected_route": True}
+                                retreat_key += ":daylight"
+                retreat = StepSpec("离开有敌怪的取土点，再补建棚材料", "explore_mining_site",
+                                   args,
+                                   {"type": "s2_threat_relocation", "min_distance": 12}, timeout_s=150, effect_class="replan")
+                return retreat, retreat_key
+            return replace(step, arguments={**step.arguments, "avoid_positions": [hazard]}), f"{key}:away_from:{site}"
+        return step, key
 
     def _expand_wood_search(self, step: StepSpec, state: dict, local_key: str) -> tuple[StepSpec, str]:
         wide_key = f"{local_key}:wide"

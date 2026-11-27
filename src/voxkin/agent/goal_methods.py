@@ -357,6 +357,16 @@ def choose_s2_action(state: dict[str, Any], goal_state: dict[str, Any]) -> StepS
     def planks(count: int, label: str) -> StepSpec:
         return early_planks(inventory, count, label)
 
+    goal_state.pop("s2_wait_reason", None)
+    health = state.get("health")
+    if isinstance(health, (int, float)) and 0 < health <= 10 and not (state.get("surface_access") or {}).get("in_water"):
+        if food >= 18:
+            goal_state["s2_wait_reason"] = "等待生命恢复到可采集范围"
+            return None
+        if any(inventory_count(inventory, item) > 0 for item in FOOD_ITEMS):
+            return action("进食以恢复生命", "eat_if_hungry", {"threshold": 18, "count": 0},
+                          {"type": "food", "min": min(18, math.floor(food) + 1)}, 60)
+
     # 危险或已入夜时先补足封闭体；材料不足时先采集可用方块。
     if urgent and not shelter_ready:
         missing_blocks = _shelter_missing_blocks(state, inventory)

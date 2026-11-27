@@ -49,6 +49,14 @@ function makeWorld() {
   };
 }
 
+test('主世界取土威胁区分现场敌怪、确认安全和未观察', () => {
+  const {bot} = makeWorld();
+  for (const hostiles of [[], [{name: '苦力怕', distance: 5.2}]]) {
+    assert.deepEqual(createObservation(bot, {executor: {}, overworldMiningHostiles: hostiles}).overworld_mining_hostiles, hostiles);
+  }
+  assert.equal(createObservation(bot, {executor: {}}).overworld_mining_hostiles, undefined);
+});
+
 test('observation carries session revision and actual executor state', () => {
   const world = makeWorld();
   const state = createObservation(world.bot, {

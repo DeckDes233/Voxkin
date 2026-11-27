@@ -246,6 +246,7 @@ export function createObservation(bot, options) {
     nearby_food_animal: Boolean(nearbyFoodAnimal),
     nearby_crafting_table: Boolean(nearbyCraftingTable || nearbyOwnedCraftingTable),
     surface_access: observeSurfaceAccess(bot, makeVec),
+    ...(Array.isArray(options.overworldMiningHostiles) ? {overworld_mining_hostiles: options.overworldMiningHostiles} : {}),
     nether_portal_bank: observePortalBank(bot, makeVec),
     ...(Array.isArray(options.netherMiningHostiles) ? {nether_mining_hostiles: options.netherMiningHostiles} : {}),
     end_portal_room: observePortalRoom(bot),

@@ -56,6 +56,8 @@ def batch_resource_step(stage: str, step: StepSpec, state: dict) -> StepSpec:
 def choose_supply_opportunity(stage: str, state: dict, ledger: dict) -> tuple[StepSpec, str] | None:
     if not supports_resource_policy(state):
         return None
+    if stage == "S2" and isinstance(state.get("health"), (int, float)) and state["health"] <= 10:
+        return None
     inventory = state.get("inventory") or {}
     slots = state.get("inventory_free_slots")
     dimension = str(state.get("dimension") or "").removeprefix("minecraft:")

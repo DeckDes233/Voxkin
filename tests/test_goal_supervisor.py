@@ -825,6 +825,50 @@ def test_s2_empty_inventory_and_partial_iron_choose_wool_without_mining_prerequi
     assert step.tool == "craft" and step.arguments["item"] == "shears"
 
 
+def test_s2_waits_for_health_observation_before_spending_gathering_budget():
+    ledger = {}
+    state = modern_state(health=4.4, food=20, inventory={"white_wool": 2, "mutton": 6})
+    assert choose_s2_action(state, ledger) is None
+    assert ledger["s2_wait_reason"]
+    state["food"] = 17
+    step = choose_s2_action(state, ledger)
+    assert step.tool == "eat_if_hungry" and step.arguments["threshold"] == 18
+    state.update(health=12, food=18)
+    assert choose_s2_action(state, ledger).arguments["item"] == "wool"
+    assert "s2_wait_reason" not in ledger
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_health, expected_calls", [(4.4, 1), (None, 0), (20, 0)])
+async def test_s2_resumes_dirt_only_after_confirmed_low_health_failures(tmp_path, failure_health, expected_calls):
+    store = TaskStore(tmp_path / "shelter.db")
+    store.initialize()
+    task = store.create_task("S2", "S2")
+    state = modern_state(is_day=False, health=20, food=18)
+    calls = []
+
+    async def dispatch(tool, arguments, timeout_s=0, *, action_id="", **kwargs):
+        calls.append(tool)
+        state["revision"] += 1
+        state["inventory"]["dirt"] = arguments["count"]
+        return ActionResult(action_id, True, status="succeeded", data={"observation": dict(state)})
+
+    goal = replace(GOALS["S2"], budget=replace(GOALS["S2"].budget, max_actions=4))
+    supervisor = GoalSupervisor(goal, store, dispatch, lambda: state)
+    saved = supervisor._new_state()
+    key = "s2:mine_collect:dirt"
+    saved["counters"]["actions"] = 3
+    saved["counters"]["method_failures"][key] = 3
+    saved["action_history"] = [{"method_key": key, "status": "failed", "receipt_confirmed": True,
+                                "result_detail": "血量不足", "terminal_observation": {"health": failure_health}}
+                               for _ in range(3)]
+    store.save_goal_state(task.id, saved)
+    await supervisor.run(task.id, resume=True)
+    assert calls == ["mine_collect"] * expected_calls
+    assert supervisor.state["counters"]["method_failures"][key] == 3
+    store.close()
+
+
 def test_s2_climbs_out_of_the_dirt_pit_before_choosing_a_new_shelter_site():
     state = modern_state(inventory={"white_bed": 1, "cobblestone": 18, "dirt": 22})
     exit_pos = {"x": 7, "y": 69, "z": 136}
@@ -834,6 +878,43 @@ def test_s2_climbs_out_of_the_dirt_pit_before_choosing_a_new_shelter_site():
     assert step.tool == "goto" and step.verify["target"] == exit_pos
     state.update(position=exit_pos, surface_access={"sky_light": 15, "exit": None})
     assert choose_s2_action(state, {}).tool == "make_shelter"
+
+
+def test_s2_leaves_a_confirmed_hostile_dirt_site_then_excludes_it(tmp_path):
+    hazard = {"x": -44, "y": 63, "z": 5}
+    state = modern_state(position=hazard, revision=2)
+    supervisor = GoalSupervisor(GOALS["S2"], TaskStore(tmp_path / "threat.db"), None, lambda: state)
+    row = {"tool": "mine_collect", "arguments": {"block": "dirt"}, "status": "failed", "receipt_confirmed": True,
+           "session_id": state["session_id"], "revision": 1,
+           "result_data": {"reason": "nearby_hostiles", "observation": dict(state)}}
+    supervisor.state = {"action_history": [row], "counters": {"method_failures": {}}}
+    key = "s2:mine_collect:dirt"
+    step = StepSpec("采集建材", "mine_collect", {"block": "dirt", "count": 40}, {})
+    retreat, retreat_key = supervisor._plan_s2_dirt_collection(step, key, state)
+    assert retreat.tool == "explore_mining_site" and retreat.arguments["avoid_positions"] == [hazard]
+    supervisor.state["counters"]["method_failures"][retreat_key] = 1
+    retreat, next_key = supervisor._plan_s2_dirt_collection(step, key, state)
+    assert next_key != retreat_key and retreat.arguments["covered_escape"]
+    supervisor.state["action_history"].append({"method_key": next_key, "status": "failed", "receipt_confirmed": True,
+        "result_data": {"relocation": {"attempted_positions": []}}, "result_detail": "已观察的干燥矿道未能通到足够远的安全位置"})
+    retreat, dig_key = supervisor._plan_s2_dirt_collection(step, key, state)
+    assert retreat.arguments["covered_escape"] and not retreat.arguments["connected_route"]
+    supervisor.state["counters"]["method_failures"][dig_key] = 1
+    supervisor.state["action_history"].append({"method_key": dig_key, "status": "failed", "receipt_confirmed": True,
+                                              "terminal_observation": {"is_day": False}})
+    state["is_day"] = False
+    assert supervisor._plan_s2_dirt_collection(step, key, state)[0] is None
+    state["overworld_mining_hostiles"] = []
+    assert supervisor._plan_s2_dirt_collection(step, key, state)[0].tool == "mine_collect"
+    del state["overworld_mining_hostiles"]
+    state["is_day"] = True
+    retreat, daylight_key = supervisor._plan_s2_dirt_collection(step, key, state)
+    assert daylight_key != dig_key and retreat.arguments["connected_route"]
+    state["position"] = {**hazard, "x": -25}
+    collect, _ = supervisor._plan_s2_dirt_collection(step, key, state)
+    assert collect.tool == "mine_collect" and collect.arguments["avoid_positions"] == [hazard]
+    row["receipt_confirmed"] = False
+    assert supervisor._plan_s2_dirt_collection(step, key, state) == (step, key)
 
 
 def test_s2_uses_bridge_missing_block_count_and_night_shelter_priority():
@@ -3460,16 +3541,25 @@ async def test_s2_supervisor_reconciles_material_collection_then_builds(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_s2_exhausted_sheep_search_relocates_before_new_region_retry(tmp_path):
+@pytest.mark.parametrize("in_water", [False, True])
+async def test_s2_exhausted_sheep_search_relocates_before_new_region_retry(tmp_path, in_water):
     store = TaskStore(tmp_path / "sheep-relocation.db")
     store.initialize()
     task = store.create_task("S2", "S2")
     state = modern_state(food=20, inventory={"white_wool": 2})
+    if in_water:
+        state["surface_access"] = {"in_water": True, "open_water": True}
     calls = []
 
     async def dispatch(tool, arguments, timeout_s=0, action_id="", **kwargs):
         calls.append((tool, dict(arguments)))
+        if tool == "swim_out":
+            state.update(surface_access={"connected_land": True}, position={"x": -8, "y": 64, "z": 0})
+            state["revision"] += 1
+            return ActionResult(action_id, True, status="succeeded", data={
+                "events": ["connected_bank_reached"], "observation": dict(state)})
         if tool == "explore_mining_site":
+            assert bool(arguments.get("connected_route")) == in_water
             origin = dict(state["position"])
             state["position"] = {"x": 25, "y": 64, "z": 0}
             state["revision"] += 1
@@ -3479,17 +3569,19 @@ async def test_s2_exhausted_sheep_search_relocates_before_new_region_retry(tmp_p
             })
         raise ActionError("测试停止", status="failed", action_id=action_id)
 
-    goal = replace(GOALS["S2"], budget=GoalBudget(max_actions=2, max_elapsed_s=60, max_attempts_per_method=3))
+    goal = replace(GOALS["S2"], budget=GoalBudget(max_actions=3 if in_water else 2, max_elapsed_s=60, max_attempts_per_method=3))
     supervisor = GoalSupervisor(goal, store, dispatch, lambda: state)
     saved = supervisor._new_state()
     saved["status"] = "blocked"
     saved["counters"]["attempts"]["s2:hunt_material:wool"] = 3
     saved["counters"]["method_failures"]["s2:hunt_material:wool"] = 3
+    if in_water:
+        saved["counters"]["method_failures"]["s2:wool_relocate:region0"] = 3
     store.save_goal_state(task.id, saved)
     store.set_status(task.id, "blocked")
     await supervisor.run(task.id, resume=True)
-    assert calls[0][0] == "explore_mining_site"
-    assert calls[1][0] == "hunt_material"
+    expected = ["explore_mining_site", "hunt_material"]
+    assert [tool for tool, _ in calls] == (["swim_out", *expected] if in_water else expected)
     persisted = store.load_goal_state(task.id)
     assert persisted["s2_wool_search_region"] == 1
     assert persisted["counters"]["method_failures"]["s2:hunt_material:wool"] == 3
