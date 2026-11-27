@@ -1681,7 +1681,7 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
     checkHealth(ctx);
     checkNearbyHostiles(ctx);
     const feet = floorPos(bot.entity.position);
-    if ((localVein || /(?:iron|diamond)_ore$/.test(block.name)) && !safeStairOpening(bot, position)) {
+    if ((localVein || PASSAGE_STONE.has(block.name) || /(?:iron|diamond)_ore$/.test(block.name)) && !safeStairOpening(bot, position)) {
       failures.push(`${formatPosition(position)} 邻接流体、未知空间或不稳定顶板，保留矿壁`);
       continue;
     }

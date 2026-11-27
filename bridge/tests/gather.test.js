@@ -367,6 +367,17 @@ test('分两段下矿，转身后仍能沿有净空的原台阶步行返回', as
   assert.ok(points.some(p => p.equals(start)));
 });
 
+test('补圆石时保留支撑沙砾的普通石头', async () => {
+  const ctx = makeContext();
+  const stone = new Vec3(1, 10, 0);
+  ctx.registry.blocksByName.stone = {id: 9, drops: [10]};
+  ctx.registry.items[10] = {id: 10, name: 'cobblestone'};
+  ctx.blocks.set('1,11,0', {name: 'gravel', position: stone.offset(0, 1, 0), boundingBox: 'block'});
+  ctx.bot.findBlocks = () => [stone];
+  await assert.rejects(skills.mine_collect.handler({block: 'stone', count: 3}, ctx), /不稳定顶板/);
+  assert.deepEqual(ctx.digs, []);
+});
+
 test('采矿不挖悬空的脚下支撑，结束后还原寻路落差设置', async () => {
   const ctx = makeContext();
   const ore = new Vec3(0, 9, 0);
