@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from voxkin.agent.plans import AUX_PLANS, PLANS
+from voxkin.agent.decision_brain import DecisionBrain
 from voxkin.agent.goal_supervisor import GoalSupervisor
 from voxkin.agent.goals import (
     GOAL_AUTO_TERMINAL_STATES,
@@ -24,6 +26,12 @@ Announce = Callable[[str], Awaitable[None]]
 StateProvider = Callable[[], dict[str, Any]]
 
 
+def _display_fields(record: dict | None, *fields: str) -> dict | None:
+    if record is None:
+        return None
+    return {field: record[field] for field in fields if field in record}
+
+
 class RunManager:
     """把 TaskRunner 接到 Core：启动、查询、取消一次阶段演练。"""
 
@@ -37,11 +45,13 @@ class RunManager:
         action_status: Callable[..., Awaitable[Any]] | None = None,
         state_age_provider: Callable[[], float] | None = None,
         cancel_actions: Callable[[str], Awaitable[list[str]]] | None = None,
+        brain_factory: Callable[[], DecisionBrain] | None = None,
     ) -> None:
         self._dispatch = dispatch
         self._action_status = action_status
         self._state_age_provider = state_age_provider
         self._cancel_actions = cancel_actions
+        self._brain_factory = brain_factory
         self._state_provider = state_provider
         self._announce = announce
         self._store = store
@@ -71,7 +81,7 @@ class RunManager:
         """返回最近持久化的庇护所锚点，只用于 Bridge 重新观察结构。"""
         return self._store.latest_shelter_hint()
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, studio: bool = False) -> dict[str, Any]:
         if self._task_id is None and self._runner is None:
             latest_task = self._store.latest_task()
             if latest_task is not None:
@@ -90,9 +100,9 @@ class RunManager:
         task_id = self._task_id or (self._runner.task_id if self._runner is not None else None)
         stage = stage_by_id(self._stage)
         stage_complete = None
-        if stage is not None:
-            state = self._state_provider()
-            goal_state = self._store.load_goal_state(task_id) if task_id is not None else None
+        state = self._state_provider() if stage is not None else {}
+        goal_state = self._store.load_goal_state(task_id) if task_id is not None else None
+        if stage is not None and not (studio and goal_state and (goal_state.get("title") or goal_state.get("goal_id"))):
             completed_events = (
                 {stage.event}
                 if task_id is not None
@@ -111,16 +121,39 @@ class RunManager:
                     "guarded_night_confirmed": bool((goal_state or {}).get("guarded_night_confirmed")),
                 },
             )
-        goal_state = self._store.load_goal_state(task_id) if task_id is not None else None
         goal_counters = (goal_state or {}).get("counters") or {}
         goal_budget = (goal_state or {}).get("budget") or {}
+        watchdog = (goal_state or {}).get("progress_watchdog") or {}
         pending_action = (goal_state or {}).get("pending_action")
-        return {
+        common = {
             "running": self.running,
             "stage": self._stage,
             "task_id": task_id,
-            "stage_complete": stage_complete,
             "cursor": self._runner.cursor if self._runner is not None else 0,
+            "action_budget": {
+                "mode": goal_budget.get("mode", "acceptance"),
+                "used": int(goal_counters.get("actions", 0)),
+                "limit": int(watchdog.get("action_limit", goal_budget.get("max_actions", 0))),
+            },
+        }
+        if studio:
+            # Studio 只展示当前目标和动作，回执、观察和历史留给完整接口。
+            goal = _display_fields(goal_state, "goal_id", "title", "status", "block_reason", "detail")
+            if goal is not None:
+                goal["recovery"] = _display_fields(goal_state.get("recovery"), "reason", "needs_reconcile")
+            if stage_complete is not None:
+                common["stage_complete"] = stage_complete
+            return {
+                **common,
+                "goal": goal,
+                "result": _display_fields(self._result, "ok", "status", "detail"),
+                "pending_action": _display_fields(pending_action, "tool", "status"),
+                "budget": _display_fields(goal_budget, "max_attempts_per_method", "max_elapsed_s"),
+            }
+        common["action_budget"]["deadline_at"] = (goal_state or {}).get("deadline_at")
+        return {
+            **common,
+            "stage_complete": stage_complete,
             "started_at": self._started_at,
             "result": self._result,
             "death": self._death_context,
@@ -134,11 +167,6 @@ class RunManager:
             "recovery_reason": ((goal_state or {}).get("recovery") or {}).get("reason", ""),
             "waiting_reason": (goal_state or {}).get("block_reason", "") if (goal_state or {}).get("status") == "waiting" else "",
             "in_flight_action": pending_action,
-            "action_budget": {
-                "used": int(goal_counters.get("actions", 0)),
-                "limit": int(goal_budget.get("max_actions", 0)),
-                "deadline_at": (goal_state or {}).get("deadline_at"),
-            },
         }
 
     def on_reflex_event(self, event: dict[str, Any]) -> bool:
@@ -148,6 +176,8 @@ class RunManager:
         payload = event.get("data")
         if not isinstance(payload, dict):
             return False
+        if self._goal_supervisor is not None:
+            self._goal_supervisor.interrupt_decision(payload)
         if self.running and self._task_id is not None:
             self._store.log_event(
                 self._task_id,
@@ -178,17 +208,22 @@ class RunManager:
             await self._task
         return self.status()
 
-    async def start(self, stage: str = "S0") -> dict[str, Any]:
+    async def start(self, stage: str = "S0", *, budget_mode: str = "acceptance") -> dict[str, Any]:
+        goal = goal_for_stage(stage, budget_mode=budget_mode)
         if self.running:
             return self.status()
-        goal = goal_for_stage(stage)
         if goal is not None:
             self._stage = stage
-            task = self._store.create_task(goal.title, stage=stage)
+            task = self._store.create_task(goal.title, stage=stage, initial_goal_state={
+                "goal_id": goal.goal_id, "stage": stage, "title": goal.title,
+                "status": "active", "budget": asdict(goal.budget),
+            })
             return await self._launch_goal(goal, task.id, resume=False)
         steps = PLANS.get(stage) or AUX_PLANS.get(stage)
         if steps is None:
             raise KeyError(f"未知阶段 {stage}")
+        if budget_mode != "acceptance":
+            raise ValueError("自主预算适用于 S0–S6 的阶段目标")
         self._stage = stage
         task = self._store.create_task(stage, stage=stage)
         return await self._launch(steps, task.id, from_checkpoint=False)
@@ -201,24 +236,21 @@ class RunManager:
             raise KeyError("没有可恢复的活动任务")
         if task.status == "done":
             raise ValueError(f"任务 {task.id} 已完成，不能恢复")
-        existing_goal_state = self._store.load_goal_state(task.id)
-        if existing_goal_state and existing_goal_state.get("status") == "done":
+        goal_state = self._store.load_goal_state(task.id) or {}
+        if goal_state.get("status") == "done":
             self._store.set_status(task.id, "done")
             self._task_id = task.id
             self._stage = task.stage
             self._result = {
                 "ok": True,
                 "status": "done",
-                "goal_id": existing_goal_state.get("goal_id"),
-                "detail": existing_goal_state.get("detail") or "持久化目标已完成",
+                "goal_id": goal_state.get("goal_id"),
+                "detail": goal_state.get("detail") or "持久化目标已完成",
             }
             return self.status()
         steps = PLANS.get(task.stage) or AUX_PLANS.get(task.stage)
         goal = goal_for_stage(task.stage)
         if goal is not None:
-            goal_state = self._store.load_goal_state(task.id)
-            if goal_state is None:
-                goal_state = {}
             # 手动 resume 是唯一清除显式 stop 的入口；仍先查 action_id 与当前世界状态。
             if goal_state.get("status") == "paused_by_user":
                 stopped = goal_state.pop("paused_at", goal_state.get("updated_at"))
@@ -247,6 +279,8 @@ class RunManager:
             return
         if lifecycle_id:
             self._last_death_lifecycle_id = lifecycle_id
+        if self._goal_supervisor is not None:
+            self._goal_supervisor.interrupt_decision(payload)
         self._death_context = dict(payload)
         task_id = self._task_id if self.running else None
         self._pending_death_task_id = task_id
@@ -259,6 +293,9 @@ class RunManager:
                 if task.status != "done":
                     self._store.complete_goal(task_id, goal_state)
             elif goal_state is not None and not goal_state_blocks_automatic_transition(goal_status):
+                goal_state["last_death_at_action"] = (goal_state.get("counters") or {}).get("actions", 0)
+                if self._goal_supervisor is not None and self._goal_supervisor.task_id == task_id:
+                    self._goal_supervisor.state["last_death_at_action"] = goal_state["last_death_at_action"]
                 recovery = goal_state.setdefault("recovery", {})
                 recovery.update(
                     {
@@ -398,6 +435,7 @@ class RunManager:
             state_age_provider=self._state_age_provider,
             observation_event=self._observation_event,
             require_protocol=True,
+            decision_brain=self._brain_factory() if self._brain_factory else None,
         )
         self._started_at = time.time()
         self._result = None
@@ -408,9 +446,10 @@ class RunManager:
         return self.status()
 
     async def _run_goal(self, task_id: int, resume: bool) -> None:
-        assert self._goal_supervisor is not None
+        supervisor = self._goal_supervisor
+        assert supervisor is not None
         try:
-            result = await self._goal_supervisor.run(task_id, resume=resume)
+            result = await supervisor.run(task_id, resume=resume)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -446,6 +485,9 @@ class RunManager:
             self._store.set_status(task_id, "failed")
             self._store.log_event(task_id, "goal_supervisor_failed", {"error": str(error)})
             return
+        finally:
+            if supervisor.decision_brain is not None:
+                await supervisor.decision_brain.close()
         steps_done = int(result.get("method_index", 0))
         steps_total = len(PLANS.get(self._stage, ()))
         if self._stage in {"S0", "S1"}:
@@ -463,6 +505,8 @@ class RunManager:
         }
 
     def on_bridge_unavailable(self, reason: str = "bridge disconnected") -> None:
+        if self._goal_supervisor is not None:
+            self._goal_supervisor.interrupt_decision({})
         self._observation_event.set()
         task_id = self._task_id if self._task_id is not None else None
         if task_id is None:
@@ -491,6 +535,8 @@ class RunManager:
     def on_state_update(self, state: dict[str, Any]) -> bool:
         """只在 ready、alive、安全动作结束且观察前进后自动恢复持久化目标。"""
         if self.running:
+            if self._goal_supervisor is not None:
+                self._goal_supervisor.observe_decision_safety(state)
             self._observation_event.set()
             return False
         task = self._store.get_task(self._task_id) if self._task_id is not None else self._store.latest_resumable()

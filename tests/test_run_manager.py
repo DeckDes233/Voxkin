@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from pathlib import Path
 
@@ -63,6 +64,48 @@ def test_run_manager_completes_s0(tmp_path: Path) -> None:
         assert messages[-1] == "目标「木头与工作台」已由当前观察验收完成。"
 
     asyncio.run(scenario())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manual_resume", [True, False])
+async def test_resume_preserves_budget_after_shutdown_at_start(tmp_path, manual_resume):
+    store = TaskStore(tmp_path / "tasks.db")
+    store.initialize()
+    state = modern_state({"wooden_pickaxe": 1, "crafting_table": 1})
+
+    def manager():
+        return RunManager(lambda *a, **kw: pytest.fail("目标已满足"), lambda: state,
+                          lambda text: asyncio.sleep(0), store, runs_dir=tmp_path / "runs")
+
+    first = manager()
+    started = await first.start("S0", budget_mode="adaptive")
+    assert started["action_budget"]["mode"] == "adaptive"
+    assert started["action_budget"]["limit"] == 24
+    await first.close()
+
+    restarted = manager()
+    if manual_resume:
+        await restarted.resume(started["task_id"])
+    else:
+        assert restarted.on_state_update(state)
+    finished = await restarted.wait()
+    assert finished["stage_complete"] and finished["result"]["ok"]
+    assert finished["action_budget"]["mode"] == "adaptive"
+    assert finished["goal"]["progress_watchdog"]["action_limit"] == finished["action_budget"]["limit"]
+
+
+def test_status_reports_absolute_adaptive_limit_after_extensions(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+    store.initialize()
+    task = store.create_task("采钻", "S4", initial_goal_state={
+        "budget": {"mode": "adaptive", "max_actions": 24},
+        "counters": {"actions": 122},
+        "progress_watchdog": {"action_limit": 143},
+    })
+    manager = RunManager(lambda *args: asyncio.sleep(0), modern_state, lambda text: asyncio.sleep(0), store)
+    status = manager.status()
+    assert status["task_id"] == task.id
+    assert status["action_budget"] == {"mode": "adaptive", "used": 122, "limit": 143, "deadline_at": None}
 
 
 def test_respawn_does_not_automatically_resume_unrelated_old_task(tmp_path: Path) -> None:
@@ -261,6 +304,30 @@ def test_run_manager_restores_completed_stage_status_after_restart(tmp_path: Pat
         "cursor": 6,
         "detail": "阶段完成",
     }
+
+
+@pytest.mark.asyncio
+async def test_resume_s6_accepts_dragon_evidence_before_recent_progress(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path / "tasks.db")
+    store.initialize()
+    task = store.create_task("S6", stage="S6")
+    store.log_event(task.id, "goal_event", {"event": "ender_dragon_killed"})
+    with sqlite3.connect(store.path) as history:
+        history.executemany(
+            "insert into events (task_id, kind, created_at) values (?, 'goal_action_progress', 0)",
+            ((task.id,) for _ in range(10001)),
+        )
+    history.close()
+
+    async def dispatch(*args, **kwargs):
+        pytest.fail("已有末影龙击杀证据，不应再派发动作")
+
+    manager = RunManager(dispatch, modern_state, lambda _: asyncio.sleep(0), store, tmp_path)
+    await manager.resume(task.id)
+    status = await manager.wait()
+    assert status["stage_complete"] is True
+    assert status["goal_status"] == "done"
+    store.close()
 
 
 def test_run_manager_resumes_latest_checkpointed_task(tmp_path: Path) -> None:

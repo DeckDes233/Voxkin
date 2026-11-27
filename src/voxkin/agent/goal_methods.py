@@ -5,6 +5,7 @@ from dataclasses import replace
 from typing import Any
 
 from voxkin.agent.goals import inventory_count
+from voxkin.agent.recovery_evidence import _fresh_terminal_observation
 from voxkin.agent.runner import StepSpec
 
 
@@ -492,34 +493,6 @@ def _s3_wood_search_context(state: dict[str, Any]) -> str:
     if access.get("connected_land") is True:
         return f"{region}:land"
     return f"{region}:surface" if dimension == "overworld" and access.get("sky_light") == 15 and not access.get("exit") else region
-
-
-def _s3_no_resource_wood_logs(goal_state: dict[str, Any], context: str) -> set[str]:
-    unavailable: set[str] = set()
-    for entry in goal_state.get("action_history") or []:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("tool") != "mine_collect" or entry.get("status") not in {"blocked", "failed"}:
-            continue
-        if entry.get("receipt_confirmed") is not True:
-            continue
-        log = str((entry.get("arguments") or {}).get("block") or "")
-        if log not in S3_OVERWORLD_WOOD_LOGS:
-            continue
-        detail = str(entry.get("result_detail") or "")
-        if "附近" not in detail or "一个都没有找到" not in detail:
-            continue
-        failed_context = str(entry.get("wood_search_context") or "")
-        if not failed_context:
-            observation = entry.get("terminal_observation")
-            if not isinstance(observation, dict):
-                result_data = entry.get("result_data") or {}
-                observation = result_data.get("observation") if isinstance(result_data, dict) else None
-            if isinstance(observation, dict):
-                failed_context = _s3_wood_search_context(observation)
-        if not failed_context or failed_context == context:
-            unavailable.add(log)
-    return unavailable
 
 
 def _local_surface_exit(state: dict[str, Any]) -> dict | None:
@@ -1148,25 +1121,6 @@ def _fresh_terminal_state(pending: dict[str, Any], status: str, state: dict[str,
     before_session = str(pending.get("session_id") or "")
     current_session = str(state.get("session_id") or "")
     return bool(before_session and current_session and before_session == current_session)
-
-
-def _fresh_terminal_observation(pending: dict[str, Any], data: dict[str, Any]) -> dict[str, Any] | None:
-    result_data = pending.get("result_data") or {}
-    if not isinstance(result_data, dict):
-        result_data = {}
-    observation = data.get("observation") or result_data.get("observation")
-    if not isinstance(observation, dict) or not isinstance(observation.get("position"), dict):
-        return None
-    try:
-        if int(observation["revision"]) <= int(pending["revision"]):
-            return None
-    except (KeyError, TypeError, ValueError):
-        return None
-    before_session = str(pending.get("session_id") or "")
-    observed_session = str(observation.get("session_id") or "")
-    if not before_session or not observed_session or before_session != observed_session:
-        return None
-    return observation
 
 
 def choose_s4_preflight_action(

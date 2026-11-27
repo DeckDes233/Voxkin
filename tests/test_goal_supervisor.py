@@ -70,6 +70,49 @@ async def test_observation_wakes_goal_and_requires_revision_progress(tmp_path):
         store.close()
 
 
+@pytest.mark.asyncio
+async def test_observation_and_night_evidence_are_checkpointed_together(tmp_path, monkeypatch):
+    store = TaskStore(tmp_path / "tasks.db")
+    store.initialize()
+    task = store.create_task("S0")
+    state = modern_state(is_day=False, inventory={"wooden_pickaxe": 1, "crafting_table": 1})
+    snapshots = []
+    save = store.save_goal_state
+
+    def record_save(task_id, payload):
+        if payload.get("last_observation"):
+            snapshots.append((payload["last_observation"]["revision"], payload["night_required"]))
+        save(task_id, payload)
+
+    monkeypatch.setattr(store, "save_goal_state", record_save)
+    supervisor = GoalSupervisor(GOALS["S0"], store, None, lambda: state)
+    assert (await supervisor.run(task.id))["status"] == "done"
+    assert snapshots == [(1, True)]
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal, expected", [("done", "done"), ("paused_by_user", "cancelled"), ("blocked", "blocked")])
+async def test_observation_honors_terminal_saved_while_waiting(tmp_path, terminal, expected):
+    store = TaskStore(tmp_path / "tasks.db")
+    store.initialize()
+    task = store.create_task("S0")
+
+    def observe():
+        saved = store.load_goal_state(task.id)
+        saved.update(status=terminal, block_reason="从另一个入口结束")
+        store.save_goal_state(task.id, saved)
+        return modern_state()
+
+    async def dispatch(*args, **kwargs):
+        pytest.fail("已持久化的终态不可派发动作")
+
+    supervisor = GoalSupervisor(GOALS["S0"], store, dispatch, observe)
+    assert (await supervisor.run(task.id))["status"] == expected
+    assert store.load_goal_state(task.id)["status"] == terminal
+    store.close()
+
+
 def test_early_survival_finds_food_instead_of_repeatedly_resuming_wood():
     hungry = modern_state(food=8, inventory={})
     step = choose_early_survival_action(hungry)
@@ -1604,6 +1647,34 @@ def test_legacy_s3_migration_requires_matching_terminal_stripmine_history():
     assert supervisor._migrate_known_s3_stripmine_terminal(unresolved) is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["paused_by_user", "done"])
+async def test_legacy_receipt_migration_honors_newer_terminal_status(tmp_path, status):
+    store = TaskStore(tmp_path / "tasks.db")
+    store.initialize()
+    task = store.create_task("S3", "S3")
+    unresolved = {"action_id": "old", "tool": "strip_mine", "status": "blocked"}
+    receipt = {
+        **unresolved, "method_id": "plan:s3", "method_key": "plan:s3:0", "step_index": 0,
+        "arguments": {"target": "iron_ore"}, "result_data": {"observation": modern_state()},
+        "receipt_confirmed": True,
+    }
+    saved = {"status": "blocked", "unresolved_action": unresolved, "action_history": [receipt]}
+    store.save_goal_state(task.id, saved)
+    expected = "cancelled" if status == "paused_by_user" else "done"
+
+    def observe():
+        store.save_goal_state(task.id, {**saved, "status": status})
+        store.set_status(task.id, expected)
+        return modern_state()
+
+    supervisor = GoalSupervisor(GOALS["S3"], store, None, observe)
+    assert (await supervisor.run(task.id, resume=True))["status"] == expected
+    assert store.load_goal_state(task.id)["status"] == status
+    assert store.get_task(task.id).status == expected
+    store.close()
+
+
 @pytest.mark.parametrize(
     "progress,result_data",
     [
@@ -1983,7 +2054,7 @@ async def test_stop_pauses_goal_and_fresh_state_does_not_auto_resume(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_stop_immediately_after_start_is_persisted_before_goal_state_exists(tmp_path):
+async def test_stop_immediately_after_start_preserves_choice_and_prevents_dispatch(tmp_path):
     store = TaskStore(tmp_path / "tasks.db")
     store.initialize()
     state = modern_state(inventory={"wooden_pickaxe": 1, "crafting_table": 1})
@@ -1994,8 +2065,8 @@ async def test_stop_immediately_after_start_is_persisted_before_goal_state_exist
         return "unexpected"
 
     manager = RunManager(dispatch, lambda: state, lambda text: asyncio.sleep(0), store, runs_dir=tmp_path / "runs")
-    started = await manager.start("S0")
-    assert store.load_goal_state(started["task_id"]) is None
+    started = await manager.start("S0", budget_mode="adaptive")
+    assert store.load_goal_state(started["task_id"])["budget"]["mode"] == "adaptive"
 
     manager.request_stop()
     await manager.wait()
@@ -2004,6 +2075,15 @@ async def test_stop_immediately_after_start_is_persisted_before_goal_state_exist
     assert store.get_task(started["task_id"]).status == "cancelled"
     assert calls == []
     await manager.close()
+
+    restarted = RunManager(dispatch, lambda: state, lambda text: asyncio.sleep(0), store, runs_dir=tmp_path / "runs")
+    assert restarted.on_state_update(state) is False
+    restored = restarted.status()
+    assert restored["goal_status"] == "paused_by_user"
+    assert restored["action_budget"]["mode"] == "adaptive"
+    assert restored["action_budget"]["used"] == 0
+    assert calls == []
+    await restarted.close()
 
 
 @pytest.mark.asyncio
@@ -2222,7 +2302,7 @@ def test_status_exposes_goal_progress_instead_of_only_legacy_cursor(tmp_path):
     assert status["waiting_reason"] == "Bridge 尚未 ready"
     assert status["recovery_reason"] == "core_restart"
     assert status["in_flight_action"]["action_id"] == "a1"
-    assert status["action_budget"] == {"used": 4, "limit": 48, "deadline_at": None}
+    assert status["action_budget"] == {"mode": "acceptance", "used": 4, "limit": 48, "deadline_at": None}
 
 
 def test_legacy_attempts_are_split_only_with_exact_transport_evidence(tmp_path):

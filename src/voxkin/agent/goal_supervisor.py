@@ -10,17 +10,22 @@ from dataclasses import asdict, replace
 from typing import Any, Awaitable, Callable
 
 from voxkin.agent.action_effects import REPLAN_EFFECT_TOOLS, action_effect_class
+from voxkin.agent.decision_brain import DecisionBrain
 from voxkin.agent.late_game_methods import choose_s5_action, choose_s6_action, late_method_key, prepare_late_action
 from voxkin.agent.plans import S6_STEPS
+from voxkin.agent.progress_budget import observe_progress, record_action_progress
+from voxkin.agent.recovery_evidence import SurfaceWoodEvidence, _fresh_terminal_observation, failure_reason, surface_wood_evidence
 from voxkin.agent.resource_policy import batch_resource_step, choose_supply_opportunity
 from voxkin.agent.goals import (
     GOAL_IMMUTABLE_STATES,
     GoalSpec,
     evaluate_condition,
+    goal_for_stage,
     goal_state_blocks_automatic_transition,
     inventory_count,
 )
 from voxkin.agent.runner import StepSpec, Verifier
+from voxkin.agent.strategy_choices import OPTIONAL_STRATEGIES, WoodPrefetch, major_fork, safe_to_deliberate
 from voxkin.agent.tasks import TaskStore
 from voxkin.bridge.protocol import ActionResult, ActionStatusResult
 
@@ -73,7 +78,6 @@ from voxkin.agent.goal_methods import (
     _bed_is_inside,
     _bed_wool_color,
     _danger_now,
-    _fresh_terminal_observation,
     _fresh_terminal_state,
     _hunt_closing,
     _is_day,
@@ -84,7 +88,6 @@ from voxkin.agent.goal_methods import (
     _s3_food_count,
     _s3_iron_ingot_requirement,
     _s3_needs_surface_route,
-    _s3_no_resource_wood_logs,
     _s3_return_to_known_surface,
     _s3_smelt_fuel_need,
     _s3_wood_search_context,
@@ -137,6 +140,7 @@ class GoalSupervisor:
         observation_event: asyncio.Event | None = None,
         require_protocol: bool = True,
         verifier: Verifier | None = None,
+        decision_brain: DecisionBrain | None = None,
     ) -> None:
         self.goal = goal
         self.store = store
@@ -148,6 +152,10 @@ class GoalSupervisor:
         self._observation_event = observation_event
         self.require_protocol = require_protocol
         self.verifier = verifier or Verifier()
+        self.decision_brain = decision_brain
+        self._deciding = False
+        self._wood_prefetch: WoodPrefetch | None = None
+        self._decision_after: tuple[str, int | None] | None = None
         self.task_id: int | None = None
         self.state: dict[str, Any] = {}
         self._stop_requested = False
@@ -160,7 +168,124 @@ class GoalSupervisor:
             return "S4"
         return self.goal.stage
 
+    def invalidate_decision(self) -> None:
+        self._wood_prefetch = None
+        if self._deciding and self.decision_brain is not None:
+            self.decision_brain.cancel()
+        self._deciding = False
+
+    def observe_decision_safety(self, world: dict) -> None:
+        if not self._deciding:
+            return
+        prefetch = self._wood_prefetch
+        if (not safe_to_deliberate(world, active_search=prefetch.action_id if prefetch else None)
+                or (prefetch is not None and not prefetch.matches_world(world))):
+            self.invalidate_decision()
+
+    def interrupt_decision(self, event: dict) -> None:
+        if self._deciding:
+            # 反射通知可以先于新世界快照到达。旧帧仍然显示安全，不可据此重新出发。
+            world = self.state_provider() or {}
+            session = str(event.get("session_id") or world.get("session_id") or "")
+            revision = self._maybe_int(event.get("state_revision"))
+            if revision is None:
+                revision = self._maybe_int(world.get("revision"))
+            if session and revision is not None:
+                self._decision_after = (session, revision)
+        self.invalidate_decision()
+
+    async def _select_strategy(
+        self, step: StepSpec, method_key: str, step_index: int | None, world: dict,
+    ) -> tuple[StepSpec, str, int | None] | None:
+        default = (step, method_key, step_index)
+        limit = self.goal.budget.max_attempts_per_method
+        exhausted = self._method_failure_count(method_key) >= limit
+        fork = major_fork(self.goal.stage, step, method_key, world, self.state, include_resolved=exhausted)
+        if fork is None:
+            self.invalidate_decision()
+            return default
+        choices = fork.choices(self._method_failure_count, method_key, limit)
+        if not choices or choices.keys() == {"continue_task"}:
+            self.invalidate_decision()
+            return default
+        prefetch = self._wood_prefetch
+        reusable = bool(prefetch and prefetch.key == fork.key and prefetch.facts == fork.facts
+                        and prefetch.choices == choices and prefetch.matches_world(world))
+        if prefetch and not reusable:
+            self.invalidate_decision()
+        brain = self.decision_brain
+        self._deciding = True
+        try:
+            selected = None
+            if brain is not None and len(choices) >= 2 and not fork.resolved(self.state):
+                selected = brain.select(fork.key, choices, fork.facts)
+                if selected is None and not reusable:
+                    selected = await brain.wait_ready(fork.key, max(0.0, self.state["deadline_at"] - time.time()))
+            if not self._deciding or self._stop_requested:
+                return None
+            fresh = self.state_provider() or {}
+            if (not self._state_usable(fresh)[0] or world.get("inventory") != fresh.get("inventory")
+                    or time.time() >= self.state["deadline_at"]):
+                return None
+            current = major_fork(self.goal.stage, step, method_key, fresh, self.state, include_resolved=exhausted)
+            if current != fork or current.choices(self._method_failure_count, method_key, limit) != choices:
+                return None
+            # 一次分叉只生效一次。超时也走原策略，避免同地再次停下等模型。
+            resolved = self.state.setdefault("resolved_strategy_forks", [])
+            if fork.key not in resolved:
+                resolved.append(fork.key)
+                del resolved[:-32]
+            if "wood_failure_action_id" in fork.facts:
+                self.state["resolved_wood_fork"] = fork.key
+            selected = selected if selected in choices else None
+            chosen = selected or next(iter(choices))
+            self.store.log_event(self.task_id, "goal_strategy_selected", {
+                "reason": fork.facts["reason"], "candidates": list(choices), "choice": chosen,
+                "source": "llm" if selected else "local", "method_key": method_key,
+                "prefetched": reusable, "wood_failure_action_id": fork.facts.get("wood_failure_action_id"),
+            })
+            if chosen != "continue_task":
+                return fork.options[chosen], f"{method_key}:{chosen}", None
+            return default
+        finally:
+            self.invalidate_decision()
+
+    def _prefetch_stalled_wood(self, pending: dict, world: dict, progress: dict) -> None:
+        args = pending.get("arguments") or {}
+        data = progress.get("data") or {}
+        if (self.decision_brain is None or self._stop_requested or self._decision_after or self._deciding
+                or pending.get("wood_prefetch_started") or pending.get("status") != "running"
+                or data.get("resource") != "wood_log" or data.get("failed_targets") != 2
+                or not isinstance(world.get("inventory"), dict)):
+            return
+        session = world.get("session_id")
+        revision = self._maybe_int(world.get("revision"))
+        progress_revision = self._maybe_int(progress.get("state_revision"))
+        baseline = self._maybe_int(pending.get("revision"))
+        age = self.state_age_provider() if self.state_age_provider is not None else 0
+        if (not session or session != pending.get("session_id") or session != progress.get("session_id")
+                or None in (baseline, revision, progress_revision) or not baseline <= revision <= progress_revision
+                or (world.get("executor") or {}).get("safety_active") is not False
+                or not self._finite_number(age) or not 0 <= float(age) <= 15
+                or time.time() >= float(self.state.get("deadline_at") or 0)):
+            return
+        # 只是预测下一次分叉；正式方法和所有动作参数仍由下一轮地形、库存和终态回执确定。
+        predicted = StepSpec("", "mine_collect", {**args, "range": 128}, pending.get("expected_condition") or {})
+        method_key = f"{pending.get('method_key')}:wide"
+        fork = major_fork(self.goal.stage, predicted, method_key, world, self.state, pending_wood=pending)
+        if fork is None:
+            return
+        choices = fork.choices(self._method_failure_count, method_key, self.goal.budget.max_attempts_per_method)
+        if len(choices) < 2:
+            return
+        self._wood_prefetch = WoodPrefetch(pending["action_id"], session, fork.key, fork.facts, choices,
+                                           dict(world["position"]), dict(world["inventory"]))
+        self._deciding = True
+        self.decision_brain.select(fork.key, choices, fork.facts)
+        pending["wood_prefetch_started"] = True
+
     def stop(self, reason: str = "user_stop") -> None:
+        self.invalidate_decision()
         persisted = self.store.load_goal_state(self.task_id) if self.task_id is not None else None
         status = str((persisted or self.state).get("status") or "")
         if status in GOAL_IMMUTABLE_STATES:
@@ -215,6 +340,8 @@ class GoalSupervisor:
             }
         )
         del entries[:-32]
+        if progress.get("phase") == "search_stalled":
+            self._prefetch_stalled_wood(pending, current, progress)
         self._save()
         if self.task_id is not None:
             self.store.log_event(
@@ -233,6 +360,12 @@ class GoalSupervisor:
             self.state = saved
             self.store.set_status(task_id, "done")
             return self._result(True, "done", str(saved.get("detail") or "持久化目标已完成"))
+        if saved:
+            mode = (saved.get("budget") or {}).get("mode", "acceptance")
+            if mode != self.goal.budget.mode:
+                original = goal_for_stage(self.goal.stage, budget_mode=mode)
+                if original is not None:
+                    self.goal = replace(self.goal, budget=original.budget)
         if saved and isinstance(saved.get("unresolved_action"), dict):
             self.state = saved
             unresolved = saved["unresolved_action"]
@@ -250,6 +383,9 @@ class GoalSupervisor:
                         break
             if self._migrate_known_s3_stripmine_terminal(saved["unresolved_action"]):
                 saved = self.state
+                terminal = self._saved_terminal_result()
+                if terminal is not None:
+                    return terminal
             elif (self._recover_s4_known_stair_stop(unresolved, current)
                   or self._recover_s4_surface_fallback(unresolved, current)
                   or self._recover_s4_interrupted_shaft(unresolved, current)
@@ -294,8 +430,10 @@ class GoalSupervisor:
         self.state.setdefault("created_at", time.time())
         self.state.setdefault("deadline_at", time.time() + self.goal.budget.max_elapsed_s)
         budget = self.state.setdefault("budget", asdict(self.goal.budget))
-        budget.setdefault("max_transport_recoveries", self.goal.budget.max_transport_recoveries)
+        for key, default in asdict(self.goal.budget).items():
+            budget.setdefault(key, default)
         counters = self.state.setdefault("counters", {"actions": 0, "attempts": {}})
+        counters.setdefault("actions", 0)
         counters.setdefault("admission_retries", {})
         counters.setdefault("admission_rejections_total", {})
         self._initialize_recovery_budgets()
@@ -320,7 +458,7 @@ class GoalSupervisor:
             has_pending_action = isinstance(pending, dict)
             expired = time.time() >= float(self.state.get("deadline_at") or 0)
             if expired and not has_pending_action:
-                return self._block("budget_elapsed", "目标执行时长预算耗尽")
+                return self._block_elapsed()
             reconciliation_baseline = (
                 self._pending_reconciliation_baseline(pending)
                 if has_pending_action
@@ -343,41 +481,52 @@ class GoalSupervisor:
                 recovered = await self._reconcile_pending(state)
                 if not recovered:
                     return self._result(False, str(self.state.get("status") or "unknown"), str(self.state.get("block_reason") or "动作结果待对账"))
+            if has_pending_action and time.time() >= float(self.state.get("deadline_at") or 0):
+                self._record_observation(state)
             if time.time() >= float(self.state.get("deadline_at") or 0):
-                if has_pending_action:
-                    self._record_observation(state)
-                return self._block("budget_elapsed", "目标执行时长预算耗尽")
+                return self._block_elapsed()
             preemptions = 0
             while True:
                 if self._stop_requested:
                     self.stop()
                     return self._result(False, "cancelled", "目标由用户停止")
                 if time.time() >= float(self.state.get("deadline_at") or 0):
-                    return self._block("budget_elapsed", "目标执行时长预算耗尽")
-                state = await self._wait_for_usable_state()
+                    return self._block_elapsed()
+                state = await self._wait_for_usable_state(after=self._decision_after)
+                self._decision_after = None
                 if state is None:
                     return self._result(False, str(self.state.get("status") or "blocked"), str(self.state.get("block_reason") or "世界未就绪"))
-                self._record_observation(state)
-                context = self._condition_context(state)
-                if self.state.get("s5_rebuild_pickaxe") and any(
-                    inventory_count(state.get("inventory") or {}, item) for item in ("diamond_pickaxe", "netherite_pickaxe")
-                ):
-                    self.state.pop("s5_rebuild_pickaxe")
-                completed_events = self._completed_events()
-                complete, reason = evaluate_condition(
-                    self.goal.acceptance,
-                    state,
-                    completed_events=completed_events,
-                    context=context,
-                )
-                self.state["night_required"] = bool(context.get("night_required"))
-                self.state["sleep_confirmed"] = bool(context.get("sleep_confirmed"))
-                self._save()
+                try:
+                    context = self._condition_context(state)
+                    if self.state.get("s5_rebuild_pickaxe") and any(
+                        inventory_count(state.get("inventory") or {}, item) for item in ("diamond_pickaxe", "netherite_pickaxe")
+                    ):
+                        self.state.pop("s5_rebuild_pickaxe")
+                    completed_events = self._completed_events()
+                    complete, reason = evaluate_condition(
+                        self.goal.acceptance,
+                        state,
+                        completed_events=completed_events,
+                        context=context,
+                    )
+                    self.state["night_required"] = bool(context.get("night_required"))
+                    self.state["sleep_confirmed"] = bool(context.get("sleep_confirmed"))
+                finally:
+                    # 同一次提交保存观察和验收上下文，验收抛错时也保留现场。
+                    self._record_observation(state)
+                terminal = self._saved_terminal_result()
+                if terminal is not None:
+                    return terminal
                 if complete and not (self.goal.stage == "S3" and self.state.get("s3_low_oxygen_relocation_required")):
                     return await self._complete(reason)
                 if self._transport_recovery_budget_exhausted():
                     return self._block_transport_recovery_budget()
-                if int((self.state.get("counters") or {}).get("actions", 0)) >= self.goal.budget.max_actions:
+                limit = budget["max_actions"]
+                if budget["mode"] == "adaptive":
+                    limit = (self.state.get("progress_watchdog") or {}).get("action_limit", limit)
+                if int(self.state["counters"]["actions"]) >= limit:
+                    if budget["mode"] == "adaptive":
+                        return self._block("budget_no_progress", f"连续 {budget['max_actions']} 个动作未取得新进展")
                     return self._block("budget_actions", "目标动作预算耗尽")
 
                 supply = (None if self.goal.stage == "S3" and self.state.get("s3_low_oxygen_relocation_required")
@@ -709,8 +858,8 @@ class GoalSupervisor:
                         step = StepSpec("先到已观察的见天出口，再找地表原木", "goto", dict(exit_point),
                                         {"type": "position", "target": dict(exit_point), "radius": 2},
                                         retries=1, timeout_s=90, effect_class="replan")
-                    elif self._method_failure_count(method_key) and self._finite_position(position):
-                        step, method_key = self._expand_wood_search(step, state, method_key)
+                    elif self._finite_position(position):
+                        step, method_key = self._plan_surface_wood_search(step, state, method_key)
                 if self._method_stage in {"S3", "S4"} and step.tool == "goto" and self._method_failure_count(method_key):
                     exit_point = (state.get("surface_access") or {}).get("exit")
                     position = state.get("position")
@@ -747,6 +896,11 @@ class GoalSupervisor:
                         step = replace(step, arguments={"block_flow": True})
                         method_key += ":upstream"
                     step_index = None
+                if self.decision_brain is not None or self._method_failure_count(method_key) >= self.goal.budget.max_attempts_per_method:
+                    selection = await self._select_strategy(step, method_key, step_index, state)
+                    if selection is None:
+                        continue
+                    step, method_key, step_index = selection
                 step = batch_resource_step(self.goal.stage, step, state)
                 outcome = await self._execute_step(step, method_key, step_index)
                 if outcome == "preempted":
@@ -841,13 +995,14 @@ class GoalSupervisor:
             "block_reason": "",
         }
 
-    def _save(self) -> None:
+    def _save(self, *, migrating_terminal_receipt: bool = False) -> None:
         if self.task_id is None:
             return
         persisted = self.store.load_goal_state(self.task_id)
         persisted_status = str((persisted or {}).get("status") or "")
         next_status = str(self.state.get("status") or "")
         explicit_resume = str((self.state.get("recovery") or {}).get("reason") or "") == "explicit_resume"
+        migrated = migrating_terminal_receipt and persisted_status in {"blocked", "failed"} and next_status == "active"
         if persisted_status in GOAL_IMMUTABLE_STATES and next_status not in GOAL_IMMUTABLE_STATES:
             self.state = dict(persisted or self.state)
             return
@@ -855,6 +1010,7 @@ class GoalSupervisor:
             goal_state_blocks_automatic_transition(persisted_status)
             and next_status != persisted_status
             and not explicit_resume
+            and not migrated
         ):
             # 保持用户暂停/blocked 作为当前状态，但仍持久化取消竞态产生的
             # pending receipt、结构化进度与恢复元数据。
@@ -863,6 +1019,14 @@ class GoalSupervisor:
                 self.state["block_reason"] = persisted.get("block_reason", self.state.get("block_reason", ""))
         self.state["updated_at"] = time.time()
         self.store.save_goal_state(self.task_id, self.state)
+
+    def _saved_terminal_result(self) -> dict[str, Any] | None:
+        status = self.state["status"]
+        if not goal_state_blocks_automatic_transition(status):
+            return None
+        result_status = "cancelled" if status == "paused_by_user" else status
+        detail = self.state.get("block_reason") or self.state.get("detail") or ""
+        return self._result(status == "done", result_status, str(detail))
 
     def _result(self, ok: bool, status: str, detail: str) -> dict[str, Any]:
         return {
@@ -875,6 +1039,11 @@ class GoalSupervisor:
             "actions": int((self.state.get("counters") or {}).get("actions", 0)),
             "block_reason": self.state.get("block_reason", ""),
         }
+
+    def _block_elapsed(self) -> dict[str, Any]:
+        if self.state["budget"].get("mode") == "adaptive":
+            return self._block("budget_no_progress", f"连续 {self.state['budget']['max_elapsed_s']:g} 秒未取得新进展")
+        return self._block("budget_elapsed", "目标执行时长预算耗尽")
 
     def _block(self, reason: str, detail: str) -> dict[str, Any]:
         self.state["status"] = "blocked"
@@ -1262,13 +1431,7 @@ class GoalSupervisor:
 
     def _completed_events(self) -> set[str]:
         assert self.task_id is not None
-        events = set()
-        for event in self.store.events(self.task_id, limit=10000):
-            if event.get("kind") == "goal_event":
-                value = str((event.get("payload") or {}).get("event") or "")
-                if value:
-                    events.add(value)
-        return events
+        return self.store.completed_goal_events(self.task_id)
 
     def _condition_context(self, state: dict[str, Any]) -> dict[str, Any]:
         day = _is_day(state)
@@ -1472,14 +1635,14 @@ class GoalSupervisor:
             }
         )
         self.state.setdefault("migrated_terminal_actions", []).append(action_id)
-        if self.task_id is not None:
+        self._save(migrating_terminal_receipt=True)
+        if self.task_id is not None and self.state["status"] == "active":
             self.store.set_status(self.task_id, "active")
             self.store.log_event(
                 self.task_id,
                 "known_terminal_s3_stripmine_migrated",
                 {"action_id": action_id, "status": terminal.get("status"), "detail": terminal.get("result_detail", "")},
             )
-        self._save()
         return True
 
     def _record_s3_ore_outcome(
@@ -1532,6 +1695,7 @@ class GoalSupervisor:
         history = self.state.setdefault("action_history", [])
         history.append(item)
         del history[:-128]
+        record_action_progress(self.state, pending, data, item["resolved_at"])
         self._record_s3_ore_outcome(pending, status, current, detail)
         if (self.goal.stage == "S3" and str(pending.get("method_key") or "").startswith("s3:ore_return_surface:")
                 and pending.get("receipt_confirmed") is True):
@@ -1574,6 +1738,7 @@ class GoalSupervisor:
 
     def _record_observation(self, state: dict[str, Any]) -> None:
         self._cached_state = dict(state)
+        observe_progress(self.state, state, time.time())
         self.state["last_observation"] = {
             key: state.get(key)
             for key in ("session_id", "revision", "ready", "alive", "health", "food", "dimension", "position", "inventory", "is_day", "shelter", "nearby_beds", "executor")
@@ -1843,7 +2008,11 @@ class GoalSupervisor:
             pass
 
     async def _wait_for_usable_state(self, *, after: tuple[str, int | None] | None = None) -> dict[str, Any] | None:
-        deadline = time.monotonic() + MAX_READY_WAIT_S
+        wait_s = MAX_READY_WAIT_S
+        adaptive_wait = (self.state.get("budget") or {}).get("mode") == "adaptive" and not self.state.get("pending_action")
+        if adaptive_wait:
+            wait_s = min(wait_s, max(0.0, self.state["deadline_at"] - time.time()))
+        deadline = time.monotonic() + wait_s
         latest: dict[str, Any] = {}
         while time.monotonic() < deadline:
             if self._stop_requested:
@@ -1866,6 +2035,11 @@ class GoalSupervisor:
             self.state["block_reason"] = reason
             self._save()
             await self._wait_for_observation(timeout=deadline - time.monotonic())
+        if self._stop_requested:
+            return None
+        if adaptive_wait and time.time() >= self.state["deadline_at"]:
+            self._block_elapsed()
+            return None
         self.state["status"] = "disconnected" if not latest else ("waiting" if after is not None else "blocked")
         self.state["block_reason"] = "等待 ready 新鲜观察超时"
         self.state.setdefault("recovery", {}).update({"needs_reconcile": True, "reason": "bridge_unavailable"})
@@ -2198,6 +2372,7 @@ class GoalSupervisor:
         del history[:-128]
 
     def _advance_after_success(self, pending: dict[str, Any], data: dict[str, Any]) -> None:
+        record_action_progress(self.state, pending, data, time.time())
         self._record_s5_portal_transition(pending, data)
         if (pending.get("expected_condition") or {}).get("type") == "s4_threat_relocation":
             self.state.pop("s4_threat_position", None)
@@ -2371,7 +2546,7 @@ class GoalSupervisor:
         if failure_count and self._finite_number(state.get("health")) and float(state["health"]) > 10:
             failures = [row for row in history if row.get("method_key") == key and row.get("receipt_confirmed")
                         and row.get("status") in {"blocked", "failed"}]
-            if (len(failures) >= failure_count and all("血量不足" in str(row.get("result_detail") or "")
+            if (len(failures) >= failure_count and all(failure_reason(row) == "low_health"
                     and self._finite_number(hp := (row.get("terminal_observation") or {}).get("health"))
                     and float(hp) <= 8 for row in failures)):
                 key += ":healthy"
@@ -2381,12 +2556,12 @@ class GoalSupervisor:
         for row in reversed(history):
             data = row.get("result_data") or {}
             if (row.get("tool") != "mine_collect" or (row.get("arguments") or {}).get("block") != "dirt"
-                    or row.get("status") not in {"blocked", "failed"} or row.get("receipt_confirmed") is not True
-                    or data.get("reason") != "nearby_hostiles"):
+                    or row.get("status") not in {"blocked", "failed"} or failure_reason(row) != "nearby_hostiles"):
                 continue
             terminal = _fresh_terminal_observation(row, data) or {}
             hazard = terminal.get("position")
-            if terminal.get("dimension") != state.get("dimension") or not self._finite_position(hazard):
+            if (terminal.get("session_id") != state.get("session_id") or terminal.get("dimension") != state.get("dimension")
+                    or not self._finite_position(hazard) or abs(hazard["y"] - feet["y"]) >= 8):
                 continue
             site = f"{math.floor(hazard['x'] / 8)}:{math.floor(hazard['z'] / 8)}"
             if math.hypot(feet["x"] - hazard["x"], feet["z"] - hazard["z"]) < 8:
@@ -2397,10 +2572,9 @@ class GoalSupervisor:
                 if self._method_failure_count(retreat_key):
                     args["covered_escape"] = True
                     retreat_key += ":covered"
-                    if any(r.get("method_key") == retreat_key and r.get("receipt_confirmed") is True
-                           and r.get("status") in {"failed", "blocked"}
+                    if any(r.get("method_key") == retreat_key and failure_reason(r) == "no_dry_retreat"
                            and ((r.get("result_data") or {}).get("relocation") or {}).get("attempted_positions") == []
-                           and "干燥矿道未能通到" in str(r.get("result_detail") or "") for r in history):
+                           for r in history):
                         args["connected_route"] = False
                         retreat_key += ":dig"
                         if self._method_failure_count(retreat_key):
@@ -2418,32 +2592,25 @@ class GoalSupervisor:
             return replace(step, arguments={**step.arguments, "avoid_positions": [hazard]}), f"{key}:away_from:{site}"
         return step, key
 
-    def _expand_wood_search(self, step: StepSpec, state: dict, local_key: str) -> tuple[StepSpec, str]:
+    def _plan_surface_wood_search(self, step: StepSpec, state: dict, local_key: str) -> tuple[StepSpec, str]:
+        evidence = surface_wood_evidence(self.state.get("action_history", []), state)
+        if (not self._method_failure_count(local_key) and not evidence.stalled_here
+                and evidence.searched_range < step.arguments.get("range", 64)):
+            return step, local_key
+        return self._expand_wood_search(step, state, local_key, evidence)
+
+    def _expand_wood_search(self, step: StepSpec, state: dict, local_key: str, evidence: SurfaceWoodEvidence | None = None) -> tuple[StepSpec, str]:
         wide_key = f"{local_key}:wide"
         position = state["position"]
         access = state.get("surface_access") or {}
-        trunks = []
-        unreachable = []
-        for entry in self.state.get("action_history", [])[-40:]:
-            if (entry.get("tool") != "mine_collect" or not entry.get("receipt_confirmed")
-                    or not (entry.get("arguments") or {}).get("surface_wood")
-                    or (entry.get("terminal_observation") or {}).get("dimension") != state.get("dimension")):
-                continue
-            trunk = (entry.get("result_data") or {}).get("surface_trunk")
-            if self._finite_position(trunk) and math.hypot(trunk["x"] - position["x"], trunk["z"] - position["z"]) <= 128:
-                trunks.append(trunk)
-                end = (entry.get("terminal_observation") or {}).get("position")
-                if (entry.get("status") == "blocked" and "太远走不过去" in str(entry.get("result_detail") or "")
-                        and self._finite_position(end) and trunk["y"] - end["y"] >= 5
-                        and math.hypot(trunk["x"] - end["x"], trunk["z"] - end["z"]) <= 12
-                        and trunk not in unreachable):
-                    unreachable.append(trunk)
+        evidence = evidence or surface_wood_evidence(self.state.get("action_history", []), state)
+        trunks, unreachable = evidence.trunks, evidence.avoid
         args = {**step.arguments, "range": 128}
         if unreachable:
             wide_key += ":other_trees"
             args["avoid_positions"] = [*(args.get("avoid_positions") or []), *unreachable][-128:]
             trunks = [p for p in trunks if all(math.hypot(p["x"] - q["x"], p["z"] - q["z"]) >= 8 for q in unreachable)]
-        if not self._method_failure_count(wide_key):
+        if evidence.searched_range < 128 and not self._method_failure_count(wide_key):
             return replace(step, arguments=args), wide_key
         nearest = min(trunks, key=lambda p: math.hypot(p["x"] - position["x"], p["z"] - position["z"]), default=None)
         sky = access.get("sky_light")
@@ -2521,10 +2688,7 @@ class GoalSupervisor:
             return False
         data = row.get("result_data") or {}
         terminal = _fresh_terminal_observation(row, data)
-        detail = str(row.get("result_detail") or "")
-        if not terminal or not (data.get("reason") == "nearby_hostiles" or (
-                "格内有敌对生物（" in detail and detail.endswith("），停止采矿")) or (
-                retreat and detail.endswith("附近有敌对生物，先处理生存恢复"))):
+        if not terminal or failure_reason(row) != "nearby_hostiles":
             return False
         if retreat:
             start = (data.get("relocation") or {}).get("origin")
@@ -2878,7 +3042,7 @@ class GoalSupervisor:
             failures = counters.setdefault("method_failures", {})
             failures[method_key] = int(failures.get(method_key, 0)) + 1
 
-    def _retry_or_block_method(self, method_key: str, detail: str) -> str:
+    def _retry_or_block_method(self, method_key: str, detail: str, step: StepSpec | None = None) -> str:
         failures = self._method_failure_count(method_key)
         latest = (self.state.get("action_history") or [{}])[-1]
         if latest.get("method_key") == method_key and self._recover_s4_mining_threat(latest):
@@ -2905,6 +3069,16 @@ class GoalSupervisor:
             self._save()
             return "retry"
         if failures >= self.goal.budget.max_attempts_per_method:
+            # 可选方法耗尽只淘汰该候选；下一轮仍对全阶段预算和每项方法的准入重新检查。
+            fork = (major_fork(self.goal.stage, step, method_key, self.state_provider() or {}, self.state, include_resolved=True)
+                    if step is not None else None)
+            has_alternative = fork is not None and bool(fork.choices(self._method_failure_count, method_key,
+                                                                     self.goal.budget.max_attempts_per_method))
+            if method_key.rsplit(":", 1)[-1] in OPTIONAL_STRATEGIES or has_alternative:
+                self.state["status"] = "active"
+                self.state["block_reason"] = detail
+                self._save()
+                return "retry"
             if self.goal.stage == "S2" and method_key.startswith("s2:hunt_material:wool"):
                 self.state["status"] = "active"
                 self.state["block_reason"] = "当前区域找羊未成功，将换区继续搜索"
@@ -3511,7 +3685,7 @@ class GoalSupervisor:
             self.state["block_reason"] = str(error)
             self._save()
             self.store.log_event(self.task_id, "goal_action_failed", {"action_id": action_id, "tool": step.tool, "status": status, "detail": str(error)[:240]})
-            return self._retry_or_block_method(method_key, str(error))
+            return self._retry_or_block_method(method_key, str(error), step)
 
         if isinstance(outcome, ActionResult):
             status = outcome.status or ("succeeded" if outcome.ok else "failed")
@@ -3590,7 +3764,7 @@ class GoalSupervisor:
             self.state["block_reason"] = f"{step.tool}:{status}:{detail[:180]}"
             self._save()
             self.store.log_event(self.task_id, "goal_action_failed", {"action_id": action_id, "tool": step.tool, "status": status})
-            return self._retry_or_block_method(method_key, self.state["block_reason"])
+            return self._retry_or_block_method(method_key, self.state["block_reason"], step)
 
         if (
             self._method_stage == "S4"
@@ -3636,7 +3810,7 @@ class GoalSupervisor:
             self.state["block_reason"] = f"动作完成但观察条件未满足：{reason}"
             self._save()
             self.store.log_event(self.task_id, "goal_method_condition_missing", {"action_id": action_id, "tool": step.tool, "reason": reason})
-            return self._retry_or_block_method(method_key, self.state["block_reason"])
+            return self._retry_or_block_method(method_key, self.state["block_reason"], step)
 
         self._record_s4_action_outcomes(pending, status, latest, data)
         self.state["pending_action"] = None

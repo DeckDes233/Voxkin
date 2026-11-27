@@ -8,6 +8,7 @@ from typing import Any, AsyncIterator, Sequence
 
 from voxkin.agent.actions import ActionDispatcher
 from voxkin.agent.arbiter import ActionArbiter, ActionTicket
+from voxkin.agent.decision_brain import DecisionBrain
 from voxkin.agent.run_manager import RunManager
 from voxkin.agent.tasks import TaskStore
 from voxkin.audio.sinks import AudioSink, build_sink
@@ -157,6 +158,8 @@ class Runtime:
             action_status=dispatcher.action_status,
             state_age_provider=dispatcher.state_age_s,
             cancel_actions=arbiter.cancel_all,
+            brain_factory=(lambda: DecisionBrain(llm, config.brain))
+            if config.brain.enabled and isinstance(llm, OpenAICompatLLM) else None,
         )
         pipeline.set_stop_handler(run_manager.request_stop)
         supervisor = ServiceSupervisor(Path("logs") / "services")
@@ -274,21 +277,26 @@ class Runtime:
             self.tts = silent
             await self.pipeline.start()
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, studio: bool = False) -> dict[str, Any]:
         cache = self.pipeline.cache
-        return {
+        engines = {
             "llm": self.llm.describe(),
             "tts": self.tts.describe(),
             "stt": self.stt.describe(),
             "audio": self.sink.describe(),
-            "metrics": self.metrics.aggregate(),
             "voice_cache": cache.describe() if cache is not None else {"enabled": False},
+            "speaking": self.pipeline.is_speaking,
+        }
+        if studio:
+            return engines
+        return {
+            **engines,
+            "metrics": self.metrics.aggregate(),
             "fast_path": {
                 "enabled": self.config.fast_path.enabled,
                 "min_confidence": self.config.fast_path.min_confidence,
                 "action_min_confidence": self.config.fast_path.action_min_confidence,
             },
-            "speaking": self.pipeline.is_speaking,
             "bridge": {
                 "connected": self.dispatcher.connected,
                 "name": self.dispatcher.bridge_name,

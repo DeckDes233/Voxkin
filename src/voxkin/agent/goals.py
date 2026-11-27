@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Any
 
@@ -23,6 +23,7 @@ class GoalBudget:
     max_elapsed_s: float = 7200.0
     max_attempts_per_method: int = 3
     max_transport_recoveries: int = 8
+    mode: str = "acceptance"
 
 
 @dataclass(frozen=True)
@@ -97,8 +98,14 @@ GOALS: dict[str, GoalSpec] = {
 }
 
 
-def goal_for_stage(stage: str) -> GoalSpec | None:
-    return GOALS.get(stage)
+def goal_for_stage(stage: str, *, budget_mode: str = "acceptance") -> GoalSpec | None:
+    if budget_mode not in {"acceptance", "adaptive"}:
+        raise ValueError(f"未知目标预算模式 {budget_mode!r}")
+    goal = GOALS.get(stage)
+    if goal is None or budget_mode == "acceptance":
+        return goal
+    # 日常运行按连续无进展的动作数和时间计量；正式阶段仍使用原来的总量。
+    return replace(goal, budget=replace(goal.budget, mode=budget_mode, max_actions=24, max_elapsed_s=1800.0))
 
 
 def method_for_goal(goal: GoalSpec) -> MethodSpec:
@@ -193,7 +200,7 @@ def _has_bed_inside(state: dict[str, Any]) -> bool:
     return False
 
 
-def _dimension_id(value: Any) -> str:
+def dimension_id(value: Any) -> str:
     dimension = str(value or "").strip()
     vanilla = {
         "overworld": "minecraft:overworld",
@@ -249,11 +256,11 @@ def evaluate_condition(
     if kind == "dimension":
         actual = str(state.get("dimension") or "")
         expected = str(condition.get("value") or "")
-        return _dimension_id(actual) == _dimension_id(expected), f"维度 {actual or '未知'}"
+        return dimension_id(actual) == dimension_id(expected), f"维度 {actual or '未知'}"
     if kind == "s2_prepared":
         reasons: list[str] = []
         dimension = str(state.get("dimension") or "")
-        if _dimension_id(dimension) != "minecraft:overworld":
+        if dimension_id(dimension) != "minecraft:overworld":
             reasons.append("不在主世界")
         if state.get("alive") is not True:
             reasons.append("角色未确认存活")

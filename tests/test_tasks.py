@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from voxkin.agent.tasks import TaskStore
@@ -45,6 +46,36 @@ def test_steps_and_events(tmp_path: Path) -> None:
     assert events[-2]["payload"] == {"stage": "S0"}
     assert store.has_event(task.id, "goal_event", "ender_dragon_killed")
     assert not store.has_event(task.id, "goal_event", "other_event")
+    store.close()
+
+
+def test_completed_goal_events_from_an_existing_database(tmp_path: Path) -> None:
+    path = tmp_path / "tasks.db"
+    with sqlite3.connect(path) as legacy:
+        legacy.execute(
+            "create table events (id integer primary key autoincrement, task_id integer not null, "
+            "kind text not null, payload text not null default '{}', created_at real not null)"
+        )
+        insert = "insert into events (task_id, kind, payload, created_at) values (?, ?, ?, 0)"
+        legacy.executemany(
+            insert,
+            [
+                (1, "goal_event", '{"event":"ender_dragon_killed","evidence":"dragon_health_zero"}'),
+                (1, "goal_event", '{"event":"ender_dragon_killed"}'),
+                (1, "goal_event", "{}"),
+                (1, "goal_action_progress", '{"event":"progress"}'),
+                (2, "goal_event", '{"event":"other_task"}'),
+            ],
+        )
+    legacy.close()
+
+    store = TaskStore(path)
+    store.initialize()
+    assert store.completed_goal_events(1) == {"ender_dragon_killed"}
+    store.log_event(1, "goal_event", {"event": "new_observation"})
+    assert store.completed_goal_events(1) == {"ender_dragon_killed", "new_observation"}
+    assert store.completed_goal_events(2) == {"other_task"}
+    assert store.completed_goal_events(3) == set()
     store.close()
 
 

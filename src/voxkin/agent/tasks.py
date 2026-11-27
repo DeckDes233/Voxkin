@@ -68,6 +68,8 @@ class TaskStore:
                 payload text not null default '{}',
                 created_at real not null
             );
+            create index if not exists events_goal_task_id on events (task_id)
+                where kind = 'goal_event';
             create table if not exists checkpoints (
                 task_id integer primary key,
                 cursor integer not null default 0,
@@ -83,14 +85,19 @@ class TaskStore:
         )
         self._connection.commit()
 
-    def create_task(self, objective: str, stage: str = "S0") -> Task:
+    def create_task(self, objective: str, stage: str = "S0", *, initial_goal_state: dict[str, Any] | None = None) -> Task:
         now = time.time()
-        cursor = self._connection.execute(
-            "insert into tasks (objective, stage, status, created_at, updated_at) "
-            "values (?, ?, 'active', ?, ?)",
-            (objective, stage, now, now),
-        )
-        self._connection.commit()
+        with self._connection:
+            cursor = self._connection.execute(
+                "insert into tasks (objective, stage, status, created_at, updated_at) "
+                "values (?, ?, 'active', ?, ?)",
+                (objective, stage, now, now),
+            )
+            if initial_goal_state is not None:
+                self._connection.execute(
+                    "insert into goal_states (task_id, payload, updated_at) values (?, ?, ?)",
+                    (cursor.lastrowid, json.dumps(initial_goal_state, ensure_ascii=False), now),
+                )
         return self.get_task(int(cursor.lastrowid))
 
     def get_task(self, task_id: int) -> Task:
@@ -353,11 +360,23 @@ class TaskStore:
             for row in reversed(rows)
         ]
 
+    def completed_goal_events(self, task_id: int) -> set[str]:
+        rows = self._connection.execute(
+            "select payload from events where task_id = ? and kind = 'goal_event'",
+            (task_id,),
+        )
+        completed = set()
+        for row in rows:
+            value = (json.loads(row["payload"]) or {}).get("event")
+            if value:
+                completed.add(str(value))
+        return completed
+
     def has_event(self, task_id: int, kind: str, event: str) -> bool:
         rows = self._connection.execute(
             "select payload from events where task_id = ? and kind = ? order by id desc",
             (task_id, kind),
-        ).fetchall()
+        )
         return any(json.loads(row["payload"]).get("event") == event for row in rows)
 
     def close(self) -> None:
