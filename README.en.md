@@ -15,6 +15,8 @@ In Studio, the Chinese command “背包里有什么” asks what Voxkin is carr
 
 Three of five empty-inventory runs on November 25 passed S0–S4 in sequence. All three used the 120-action S5 budget. In the furthest run, Voxkin mined ten obsidian, drained and lit its portal, and scouted the Nether. A fourth run was interrupted after S3. The remaining run escaped a flooded mine, later drowned, and passed S3 after rebuilding its tools and iron equipment. Gathering the required rods and pearls, killing the dragon and returning home still need an end-to-end survival pass. [November 25 survival runs](docs/evidence/NATURAL_S0_S6_20261125.md) · [Earlier End combat tests](docs/evidence/HEADLESS_S4_S6_20261123.md)
 
+On November 27 the fifth run resumed from its saved action. S4 reached its original 120-action limit before Voxkin could rebuild a diamond pickaxe. Two new empty-inventory runs passed S0 and S1. Both reached the S2 time limit, one while searching for wood from a shore and the other after a creeper cut off access to shelter materials at night. A separate test on a copy of the first save recovered an oak log. [November 27 survival results](docs/evidence/NATURAL_S0_S6_20261127.md)
+
 | Area | Evidence boundary |
 | --- | --- |
 | Conversation, TTS/STT and game bridge | Implemented; engines and models require local configuration. [Benchmarks](docs/BENCHMARK_RESULTS.md) distinguish real APIs from the local test LLM |
