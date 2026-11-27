@@ -174,6 +174,7 @@ class GoalSupervisor:
         self.state["status"] = "paused_by_user"
         self.state["block_reason"] = reason
         self.state["updated_at"] = time.time()
+        self.state.setdefault("paused_at", self.state["updated_at"])
         if self.task_id is not None:
             self.store.save_goal_state(self.task_id, self.state)
             self.store.set_status(self.task_id, "cancelled")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 import pytest
@@ -167,6 +168,29 @@ def test_run_manager_persists_forced_cancellation(tmp_path: Path) -> None:
         goal_state = store.load_goal_state(task_id)
         assert goal_state["status"] == "paused_by_user"
         assert goal_state["pending_action"]["status"] == "unknown"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("timestamp_key", ["updated_at", "paused_at"])
+def test_resume_preserves_unused_budget_after_an_overnight_pause(tmp_path, timestamp_key):
+    store = TaskStore(tmp_path / "tasks.db")
+    store.initialize()
+    task = store.create_task("S0", stage="S0")
+    paused = time.time() - 86400
+    store.save_goal_state(task.id, {"status": "paused_by_user", timestamp_key: paused, "deadline_at": paused + 45,
+                                    "counters": {"actions": 7}})
+    state = modern_state({"wooden_pickaxe": 1, "crafting_table": 1})
+    manager = RunManager(dispatch=lambda *args: pytest.fail("目标已满足"), state_provider=lambda: state,
+                         announce=lambda text: asyncio.sleep(0), store=store, runs_dir=tmp_path / "runs")
+
+    async def scenario():
+        before = time.time()
+        await manager.resume(task.id)
+        result = await manager.wait()
+        saved = store.load_goal_state(task.id)
+        assert result["stage_complete"] and saved["counters"]["actions"] == 7
+        assert before + 45 <= saved["deadline_at"] <= time.time() + 45
 
     asyncio.run(scenario())
 

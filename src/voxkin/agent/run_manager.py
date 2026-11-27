@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -219,6 +220,11 @@ class RunManager:
             if goal_state is None:
                 goal_state = {}
             # 手动 resume 是唯一清除显式 stop 的入口；仍先查 action_id 与当前世界状态。
+            if goal_state.get("status") == "paused_by_user":
+                stopped = goal_state.pop("paused_at", goal_state.get("updated_at"))
+                deadline = goal_state.get("deadline_at")
+                if all(type(v) in (int, float) and math.isfinite(v) for v in (stopped, deadline)):
+                    goal_state["deadline_at"] = deadline + max(0.0, time.time() - stopped)
             goal_state["status"] = "recovering"
             goal_state["block_reason"] = ""
             goal_state.setdefault("recovery", {})["needs_reconcile"] = True
@@ -611,6 +617,7 @@ class RunManager:
                 if self._goal_supervisor is not None and not (self._task is not None and not self._task.done()):
                     self._goal_supervisor.stop("user_stop")
                 goal_state = self._store.load_goal_state(self._task_id) or goal_state
+                goal_state.setdefault("paused_at", time.time())
                 goal_state["status"] = "paused_by_user"
                 goal_state["block_reason"] = "目标由用户停止"
                 self._store.save_goal_state(self._task_id, goal_state)
