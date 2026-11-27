@@ -1,8 +1,25 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { crystalAimPoint, skills, visibleCrystalAim } from '../skills/combat.js';
+import { crystalAimPoint, nearbyFoodAnimal, skills, visibleCrystalAim } from '../skills/combat.js';
 import { Vec3 } from 'vec3';
+
+test('a healthy respawn can observe a nearby dry food source in daylight', () => {
+  let wet = false;
+  const bot = {
+    entity: {position: new Vec3(0, 64, 0)}, health: 20, food: 20, time: {isDay: true},
+    game: {dimension: 'overworld'}, entities: {1: {name: 'sheep', position: new Vec3(10, 64, 0)}},
+    blockAt: p => p.y === 63 ? {name: 'dirt', boundingBox: 'block'} : {name: wet ? 'water' : 'air', boundingBox: 'empty'},
+  };
+  assert.equal(nearbyFoodAnimal(bot), true);
+  wet = true;
+  assert.equal(nearbyFoodAnimal(bot), false);
+  wet = false;
+  bot.time.isDay = false;
+  assert.equal(nearbyFoodAnimal(bot), false);
+  Object.assign(bot, {health: 6, food: 14});
+  assert.equal(nearbyFoodAnimal(bot), true);
+});
 
 test('a fully charged Java arrow reaches an elevated crystal at the computed angle', () => {
   const feet = new Vec3(40.5, 61, 8.5);

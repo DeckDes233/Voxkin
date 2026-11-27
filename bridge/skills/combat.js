@@ -240,7 +240,16 @@ function findHuntable(ctx, speciesList, radius, dryOnly = false, unreachable) {
 }
 
 export function nearbyFoodAnimal(bot) {
-  return Boolean(bot?.entity?.position && findHuntable({bot}, HUNTABLE, 24, true));
+  const origin = bot?.entity?.position;
+  if (!origin) return false;
+  const needsRecovery = bot.health <= 10 && bot.food < 18;
+  const canForage = bot.health > 10 && bot.food > 8 && bot.time?.isDay
+    && ['overworld', 'minecraft:overworld'].includes(bot.game?.dimension);
+  if (!needsRecovery && !canForage) return false;
+  // 快照只需要猎物是否存在，发现第一只站在干地上的动物就返回。
+  return Object.values(bot.entities || {}).some(entity =>
+    entity?.position && entity.isValid !== false && entity.type !== 'player' && HUNTABLE.includes(entity.name)
+    && origin.distanceTo(entity.position) <= 24 && dryMiningFooting(bot, entity.position));
 }
 
 function sheepWoolState(ctx, sheep) {

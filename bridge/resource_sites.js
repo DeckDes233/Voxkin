@@ -1,20 +1,20 @@
 import {dryMiningFooting} from './dry_footing.js';
 import {surfaceSkyLight} from './water_escape.js';
+import {findObservedBlocks} from './loaded_block_scan.js';
 
 const observedSites = new WeakMap();
 
 function candidatePositions(bot, origin, sessionId) {
   const now = performance.now();
   const previous = sessionId && observedSites.get(bot);
-  if (previous && previous.sessionId === sessionId && previous.dimension === bot.game.dimension
+  if (previous && previous.sessionId === sessionId && previous.dimension === bot.game.dimension && previous.world === bot.world
       && now - previous.at < 2000 && Math.hypot(origin.x - previous.x, origin.y - previous.y, origin.z - previous.z) < 4) {
     return previous.positions;
   }
-  const ids = Object.values(bot.registry?.blocksByName || {})
-    .filter(b => b.name === 'bell' || b.name === 'hay_block' || b.name === 'chest' || /_bed$/.test(b.name))
-    .map(b => b.id);
-  const positions = ids.length ? bot.findBlocks({ matching: ids, maxDistance: 32, count: 64 }) : [];
-  if (sessionId) observedSites.set(bot, { sessionId, dimension: bot.game.dimension, at: now,
+  const blocks = Object.values(bot.registry?.blocksByName || {})
+    .filter(b => b.name === 'bell' || b.name === 'hay_block' || b.name === 'chest' || /_bed$/.test(b.name));
+  const positions = findObservedBlocks(bot, blocks, 32, 64);
+  if (sessionId) observedSites.set(bot, { sessionId, dimension: bot.game.dimension, world: bot.world, at: now,
     x: origin.x, y: origin.y, z: origin.z, positions });
   return positions;
 }

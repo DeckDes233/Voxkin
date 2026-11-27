@@ -1,4 +1,5 @@
 import { inspectResourceSites } from './resource_sites.js';
+import { findObservedBlocks } from './loaded_block_scan.js';
 import { onConnectedBank, shallowSurfaceExit, shoreHeadroomBlock, surfaceSkyLight, waterLike } from './water_escape.js';
 
 const portalRooms = new WeakMap();
@@ -21,23 +22,34 @@ function observeDragon(bot) {
   return bar && Number.isFinite(bar.health) ? { health_fraction: bar.health, source: 'dragon_boss_bar' } : null;
 }
 
-function observePortalRoom(bot) {
+function observePortalRoom(bot, sessionId) {
   const p = bot?.entity?.position;
-  const id = bot?.registry?.blocksByName?.end_portal_frame?.id;
-  if (!p || id == null || !bot.findBlocks || !['overworld', 'minecraft:overworld'].includes(bot.game?.dimension)) return null;
-  const cache = portalRooms.get(bot);
-  if (cache && Date.now() - cache.time < 1000 && p.distanceTo(cache.position) < 3) return cache.room;
+  const frame = bot?.registry?.blocksByName?.end_portal_frame;
+  if (!p || frame?.id == null || !bot.findBlocks || !['overworld', 'minecraft:overworld'].includes(bot.game?.dimension)) {
+    portalRooms.delete(bot);
+    return null;
+  }
+  let cache = portalRooms.get(bot);
+  const now = performance.now();
+  if (!cache || cache.sessionId !== sessionId || cache.world !== bot.world
+      || now - cache.time >= 1000 || p.distanceTo(cache.position) >= 3) {
+    const positions = findObservedBlocks(bot, [frame], 12, 12);
+    cache = { time: now, position: p.clone(), sessionId, world: bot.world, positions };
+    portalRooms.set(bot, cache);
+  }
+  if (!cache.positions.length) return null;
+  // 技能填眼和视线遮挡都可能发生在两次坐标搜索之间。
+  const origin = p.floored();
   const frames = [];
-  for (const pos of bot.findBlocks({ matching: id, maxDistance: 12, count: 12 })) {
+  for (const pos of cache.positions) {
+    if (origin.distanceTo(pos) > 12) continue;
     const block = bot.blockAt(pos, false);
     if (block?.name !== 'end_portal_frame' || !bot.canSeeBlock?.(block)) continue;
     const eye = block.getProperties().eye;
     if (![true, false, 'true', 'false', 0, 1].includes(eye)) continue;
     frames.push({ x: pos.x, y: pos.y, z: pos.z, filled: eye === true || eye === 'true' || eye === 1 });
   }
-  const room = frames.length ? { frames } : null;
-  portalRooms.set(bot, { time: Date.now(), position: p.clone(), room });
-  return room;
+  return frames.length ? { frames } : null;
 }
 
 function observeSurfaceAccess(bot, makeVec) {
@@ -70,14 +82,25 @@ function observeSurfaceAccess(bot, makeVec) {
     const shallow = shallowSurfaceExit(bot);
     if (shallow) access.shallow_exit_y = shallow.surfaceY;
   }
+  const passable = ['air', 'short_grass', 'tall_grass'];
+  const ids = passable.map(name => bot.registry?.blocksByName?.[name]?.id);
+  // 先用区块类型索引定位可能有支撑的第一格空气，再读取碰撞和光照。
+  const isOpen = typeof bot.world?.getBlockType === 'function' && ids.every(Number.isInteger)
+    ? pos => ids.includes(bot.world.getBlockType(pos))
+    : pos => passable.includes(bot.blockAt(pos, false)?.name);
   for (const [dx, dz] of columns) {
+    let openBelow = false;
     for (let height = y + 1; height <= y + 24; height++) {
-      const feet = bot.blockAt(makeVec(x + dx, height, z + dz), false);
-      if (!['air', 'short_grass', 'tall_grass'].includes(feet?.name) || !(surfaceSkyLight(bot, makeVec(x + dx, height, z + dz)) >= 14)) continue;
+      const feet = makeVec(x + dx, height, z + dz);
+      const open = isOpen(feet);
+      const aboveSupport = open && !openBelow;
+      openBelow = open;
+      if (!aboveSupport) continue;
       const ground = bot.blockAt(makeVec(x + dx, height - 1, z + dz), false);
-      const head = bot.blockAt(makeVec(x + dx, height + 1, z + dz), false);
-      if (ground?.boundingBox !== 'block' || !['air', 'short_grass', 'tall_grass'].includes(head?.name)) continue;
+      if (ground?.boundingBox !== 'block') continue;
       if (ground.name.endsWith('_leaves') || ['magma_block', 'cactus', 'campfire', 'soul_campfire', 'powder_snow'].includes(ground.name)) continue;
+      const head = bot.blockAt(makeVec(x + dx, height + 1, z + dz), false);
+      if (!passable.includes(head?.name) || !(surfaceSkyLight(bot, feet) >= 14)) continue;
       access.exit = { x: x + dx, y: height, z: z + dz };
       return access;
     }
@@ -249,7 +272,7 @@ export function createObservation(bot, options) {
     ...(Array.isArray(options.overworldMiningHostiles) ? {overworld_mining_hostiles: options.overworldMiningHostiles} : {}),
     nether_portal_bank: observePortalBank(bot, makeVec),
     ...(Array.isArray(options.netherMiningHostiles) ? {nether_mining_hostiles: options.netherMiningHostiles} : {}),
-    end_portal_room: observePortalRoom(bot),
+    end_portal_room: observePortalRoom(bot, sessionId),
     end_dragon: observeDragon(bot),
     inventory_free_slots: typeof bot?.inventory?.emptySlotCount === 'function' ? bot.inventory.emptySlotCount() : null,
     resource_sites: inspectResourceSites(bot, shelter, sessionId),

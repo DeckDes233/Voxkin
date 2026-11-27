@@ -21,6 +21,7 @@ import { ExecutionController } from './execution_controller.js';
 import { LocalReflexScheduler, canRunLocalSafety, shouldInterruptForHunger } from './local_reflex.js';
 import { buildActionResult, mergeActionErrorData, validateActionState } from './action_response.js';
 import { createObservation } from './world_observation.js';
+import { findObservedBlocks } from './loaded_block_scan.js';
 import { HUNTABLE, nearbyFoodAnimal } from './skills/combat.js';
 import { inspectResourceSites } from './resource_sites.js';
 import { syncWindowWithLease, writeWindowClickWithLease } from './window_sync.js';
@@ -3772,14 +3773,16 @@ function acknowledgeLifecycleEvent(message) {
 
 function buildStateObservation() {
   stateRevision += 1;
+  const craftingTable = bot?.registry?.blocksByName?.crafting_table;
   return createObservation(bot, {
     sessionId,
     revision: stateRevision,
     ready: ordinaryActionReady(),
     executor: executor.snapshot(),
     nearbyOwnedCraftingTable: Boolean(ownedTableNearby(bot, temporaryCraftingTable)),
-    nearbyFoodAnimal: Boolean(terrainReady && bot?.health <= 10 && bot?.food < 18 && nearbyFoodAnimal(bot)),
-    nearbyCraftingTable: Boolean(bot?.entity && terrainReady && nearbyBlock('crafting_table', 4)),
+    nearbyFoodAnimal: Boolean(terrainReady && nearbyFoodAnimal(bot)),
+    nearbyCraftingTable: Boolean(bot?.entity && terrainReady && craftingTable &&
+      findObservedBlocks(bot, [craftingTable], 4, 1).length),
     overworldMiningHostiles: bot?.entity && terrainReady && String(bot.game?.dimension).endsWith('overworld')
       ? nearbyHostiles(8, 1) : null,
     netherMiningHostiles: bot?.entity && terrainReady && String(bot.game?.dimension).endsWith('the_nether')

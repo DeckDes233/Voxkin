@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { Vec3 } from 'vec3';
 
 import { createObservation, inspectShelter } from '../world_observation.js';
+import { findObservedBlocks } from '../loaded_block_scan.js';
 
 function makeWorld() {
   const blocks = new Map();
@@ -93,6 +95,75 @@ test('observation reports a verified owned table without inventing an inventory 
   assert.equal(nearby.inventory.crafting_table, undefined);
 });
 
+test('连续快照复用门框坐标，填眼、遮挡和换世界立即生效', () => {
+  const { bot } = makeWorld();
+  bot.entity.position = new Vec3(0.5, 62, 0.5);
+  bot.registry.blocksByName.end_portal_frame = { id: 42 };
+  const pos = new Vec3(2, 62, 0);
+  let searches = 0, filled = false, visible = true;
+  bot.findBlocks = ({ matching, maxDistance }) => {
+    assert.equal(matching, 42);
+    assert.equal(maxDistance, 12);
+    searches++;
+    return [pos];
+  };
+  bot.blockAt = p => p === pos ? { name: 'end_portal_frame', getProperties: () => ({ eye: filled }) } : null;
+  bot.canSeeBlock = () => visible;
+  const room = sessionId => createObservation(bot, { sessionId }).end_portal_room;
+  assert.equal(room('a').frames[0].filled, false);
+  filled = true;
+  assert.equal(room('a').frames[0].filled, true);
+  visible = false;
+  assert.equal(room('a'), null);
+  assert.equal(searches, 1);
+  visible = true;
+  assert.equal(room('b').frames.length, 1);
+  assert.equal(searches, 2);
+  bot.game.dimension = 'minecraft:the_nether';
+  assert.equal(room('b'), null);
+  bot.game.dimension = 'minecraft:overworld';
+  assert.equal(room('b').frames.length, 1);
+  assert.equal(searches, 3);
+});
+
+test('已加载区块的坐标查询与逐格球形查找一致，包含不同方块状态与负高度', async () => {
+  const Chunk = (await import('prismarine-chunk')).default('1.21.1');
+  const {blocksByName: blocks} = (await import('prismarine-registry')).default('1.21.1');
+  const center = new Vec3(-0.3, -1.2, -16.5), floor = center.floored();
+  const columns = new Map();
+  const entries = [blocks.end_portal_frame, blocks.red_bed, blocks.chest, blocks.crafting_table];
+  for (const [dx, dy, dz, state] of [
+    [-1, -3, -3, blocks.end_portal_frame.maxStateId], [2, 0, -1, blocks.red_bed.minStateId],
+    [12, 0, 0, blocks.chest.maxStateId], [1, 9, 9, blocks.chest.minStateId],
+    [0, 12, 1, blocks.end_portal_frame.minStateId], [-6, 1, 1, blocks.crafting_table.minStateId],
+    [1, 1, 0, blocks.white_wool.minStateId],
+  ]) {
+    const p = floor.offset(dx, dy, dz);
+    const key = `${p.x >> 4},${p.z >> 4}`;
+    if (!columns.has(key)) columns.set(key, new Chunk());
+    const chunk = columns.get(key);
+    chunk.setBlockStateId(new Vec3(p.x & 15, p.y, p.z & 15), state);
+    if (dx === 2) chunk.sections[(p.y >> 4) - (chunk.minY >> 4)].palette = null;
+  }
+  const bot = {entity: {position: center}, world: {getColumn: (cx, cz) => columns.get(`${cx},${cz}`)}};
+  for (const [radius, count] of [[4, 1], [12, 12], [32, 2]]) {
+    const expected = [];
+    for (let dx = -radius; dx <= radius; dx++) {
+      for (let dy = -radius; dy <= radius; dy++) {
+        for (let dz = -radius; dz <= radius; dz++) {
+          if (dx * dx + dy * dy + dz * dz > radius * radius) continue;
+          const p = floor.offset(dx, dy, dz);
+          const chunk = bot.world.getColumn(p.x >> 4, p.z >> 4);
+          const state = chunk?.getBlockStateId(new Vec3(p.x & 15, p.y, p.z & 15));
+          if (entries.some(b => b.minStateId <= state && state <= b.maxStateId)) expected.push(p);
+        }
+      }
+    }
+    expected.sort((a, b) => a.distanceSquared(floor) - b.distanceSquared(floor));
+    assert.deepEqual(findObservedBlocks(bot, entries, radius, count), expected.slice(0, count));
+  }
+});
+
 test('an enclosed cave at Y=62 reports the dry sunlit turf above it', () => {
   const { bot } = makeWorld();
   bot.entity.position.y = 62;
@@ -114,6 +185,35 @@ test('水底洞穴的返程观察选取近岸干地，跳过亮度充足的水�
   };
   assert.deepEqual(createObservation(bot, {executor: {}}).surface_access,
     {sky_light: 11, exit: {x: 0, y: 63, z: 8}});
+});
+
+test('地下出口先检查支撑面，同一位置的地形变化立即可见', () => {
+  const { bot } = makeWorld();
+  bot.entity.position.y = 62;
+  const blocks = bot.registry.blocksByName;
+  for (const [id, name] of ['air', 'short_grass', 'tall_grass', 'stone'].entries()) blocks[name] = { id };
+  let hasLedge = false;
+  let headLoaded = true;
+  let blockReads = 0;
+  const atLedge = p => p.x === 4 && p.z === 0;
+  const nameAt = p => hasLedge && atLedge(p) && p.y === 70 ? 'stone' : 'air';
+  bot.world = { getBlockType: p => blocks[nameAt(p)].id };
+  bot.blockAt = p => {
+    blockReads++;
+    if (!headLoaded && atLedge(p) && p.y === 72) return null;
+    const name = nameAt(p);
+    return { name, boundingBox: name === 'stone' ? 'block' : 'empty', skyLight: atLedge(p) && p.y > 70 ? 15 : 0 };
+  };
+  const exit = () => createObservation(bot, { executor: {} }).surface_access.exit;
+  assert.equal(exit(), null);
+  assert.ok(blockReads <= 10, `扫描无支撑的空气列读取了 ${blockReads} 个完整方块`);
+  hasLedge = true;
+  assert.deepEqual(exit(), { x: 4, y: 71, z: 0 });
+  headLoaded = false;
+  assert.equal(exit(), null);
+  headLoaded = true;
+  hasLedge = false;
+  assert.equal(exit(), null);
 });
 
 test('副手盾计入装备持有数且不会重复统计，副手材料仍与合成库存分开', () => {
