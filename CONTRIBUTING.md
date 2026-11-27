@@ -4,7 +4,7 @@
 
 ## 环境与检查
 
-使用 Python 3.10 和仓库 `.venv`，安装 `.[dev]`。声音、STT 和 Genie 分别按需增加 `audio`、`stt`、`tts` extras。Bridge 使用 `npm --prefix bridge install` 安装依赖，声明 Node ≥20，CI 使用 Node 20；本机快捷启动另固定 Node 22.23.4。Mod 使用 JDK 21 与 Gradle 8.12 wrapper。
+使用 Python 3.10 和仓库 `.venv`，安装 `.[dev]`。声音、STT 和 Genie 分别按需增加 `audio`、`stt`、`tts` extras。Bridge 使用 `npm --prefix bridge install` 安装依赖。当前 Mineflayer 要求 Node ≥22，CI 使用 Node 22，本机快捷启动固定 Node 22.23.4。Mod 使用 JDK 21 与 Gradle 8.12 wrapper。
 
 从仓库根目录运行：
 

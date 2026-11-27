@@ -6,7 +6,7 @@
 
 ## 1. 准备环境
 
-以下使用 Windows PowerShell，命令从仓库根目录执行，无需管理员权限。使用 Python 3.10；游戏桥接另需 Node.js ≥20，Minecraft 服务端和 Mod 构建另需 Java 21。
+以下使用 Windows PowerShell，命令从仓库根目录执行，无需管理员权限。使用 Python 3.10，游戏桥接另需 Node.js ≥22，Minecraft 服务端和 Mod 构建另需 Java 21。
 
 ```powershell
 python -m venv .venv
