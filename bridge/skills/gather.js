@@ -12,6 +12,7 @@ import { findBlocksWithExploration, resourceCandidates } from '../resource_searc
 import { besideDrop, dryMiningFooting, exposedMagmaCube, followDryGround, followNetherPath, miningRouteExclusion, netherRouteExclusion, reachableDryGround, reachableNetherGround, walkDryCell, walkNetherCell } from '../dry_footing.js';
 import { surfaceSkyLight, waterLike } from '../water_escape.js';
 import { scanSurfaceLogs } from '../surface_wood_scan.js';
+import { crossSurfaceWater, findSurfaceCrossing } from '../surface_crossing.js';
 import { forwardCell } from './movement.js';
 import { setImmediate as yieldToGame } from 'node:timers/promises';
 
@@ -1406,20 +1407,26 @@ async function walkToSurfaceLog(target, ctx) {
           remaining = d;
         }
       }
-      if (!closest) break;
-      const outcome = await followDryGround(ctx, ground.parents, closest, () => {
+      const check = () => {
         checkInterrupted(ctx);
         checkHealth(ctx);
         checkNearbyHostiles(ctx);
-      });
-      if (outcome === 'cancelled' || outcome === 'stopped') return outcome;
-      if (horizontal(bot.entity.position) > distance - 4) break;
+      };
+      if (closest) {
+        const outcome = await followDryGround(ctx, ground.parents, closest, check);
+        if (outcome === 'cancelled' || outcome === 'stopped') return outcome;
+        if (horizontal(bot.entity.position) <= distance - 4) continue;
+      }
+      const bankGround = ground.here.equals(bot.entity.position.floored()) ? ground : await reachableDryGround(ctx, 1800, 28);
+      const crossing = await findSurfaceCrossing(ctx, bankGround, target, 4, []);
+      if (!crossing || !await crossSurfaceWater(ctx, bankGround, crossing, check)) return 'unreachable';
     }
   }
   checkInterrupted(ctx);
   checkHealth(ctx);
   checkNearbyHostiles(ctx);
   if (reachableWood(bot, target)) return 'reached';
+  if (horizontal(bot.entity.position) > 24) return 'unreachable';
   // 高处残留的树干下方可能是空气。从连通地面选能看见且够得着树干的站位。
   if (bot.world?.raycast && target.y >= bot.entity.position.y + 3 && horizontal(bot.entity.position) <= 16) {
     const ground = await reachableDryGround(ctx, 480, 20);
@@ -1589,6 +1596,8 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
   const surfaceWood = blockName === 'wood_log' && args.surface_wood === true;
   const startY = bot.entity.position.y;
   const failedTrunks = new Set();
+  let stalledAt = null;
+  let stalledWalks = 0;
   const surfacePaths = new WeakMap();
   // 只在地表补木时筛选；在区块扫描阶段就排除深处构件，避免它们占满最近候选。
   const surfaceLog = (position) => position.y >= startY - 16 && position.y <= startY + 32 &&
@@ -1675,6 +1684,15 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
       if (outcome !== 'reached') {
         if (surfaceWood) failedTrunks.add(`${position.x},${position.z}`);
         failures.push(`${formatPosition(position)} 距离 ${distance.toFixed(1)} 格，太远走不过去`);
+        if (surfaceWood && Math.hypot(position.x - bot.entity.position.x, position.z - bot.entity.position.z) > 24) {
+          const here = bot.entity.position;
+          if (!stalledAt || here.distanceTo(stalledAt) >= 4) {
+            stalledAt = here.clone();
+            stalledWalks = 0;
+          }
+          // 从同一岸边连续走不到远树时，把控制交回调度器，及时进食或另选搜索区域。
+          if (++stalledWalks >= 3) break;
+        }
         continue;
       }
     }

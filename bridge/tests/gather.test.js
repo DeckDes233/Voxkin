@@ -216,6 +216,22 @@ test('脚底五格以上的近处树干可从眼高触及，不为采木寻找�
   assert.deepEqual(ctx.digs, [{x: 0, y: 70, z: 0}]);
 });
 
+test('岸边没有可行路线时，三次远树尝试后交回控制', async () => {
+  const ctx = makeContext({position: {x: 0.5, y: 64, z: 0.5}});
+  ctx.registry.blocksByName.oak_log = {id: 20, name: 'oak_log', drops: [40]};
+  ctx.registry.items[40] = {id: 40, name: 'oak_log'};
+  const trees = Array.from({length: 8}, (_, i) => new Vec3(30 + i, 64, 0));
+  for (const p of trees) {
+    ctx.blocks.set([p.x,p.y,p.z].join(','), {name: 'oak_log', position: p, boundingBox: 'block', skyLight: 15});
+    ctx.blocks.set([p.x,p.y,p.z + 1].join(','), {name: 'air', boundingBox: 'empty', skyLight: 15});
+  }
+  ctx.bot.findBlocks = () => trees;
+  ctx.travelToBlock = async () => assert.fail('干路已确认不通，不应再长途直走');
+  await assert.rejects(skills.mine_collect.handler({block: 'wood_log', count: 1, range: 128, surface_wood: true}, ctx),
+    /试了 3 个目标/);
+  assert.deepEqual(ctx.digs, []);
+});
+
 test('地表补木先过滤深层和无天空光的原木，同一不可达树干只走一次', async () => {
   const ctx = makeContext({ position: { x: 0, y: 68, z: 0 } });
   ctx.registry.blocksByName.oak_log = { id: 20, name: 'oak_log', drops: [40] };
