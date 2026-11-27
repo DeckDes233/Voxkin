@@ -9,7 +9,9 @@ A real-time voice companion and autonomous-action prototype for Minecraft Java 1
 - **G1 — autonomous completion:** start with an empty inventory, plan, act and recover independently, and defeat the Ender Dragon. S0–S6 belong to this acceptance track.
 - **G2 — player interaction:** understand and execute player goals, accept changes, interruption and cancellation, and report actual progress. This requires separate acceptance.
 
-A persistent `GoalSupervisor` selects actions using inventory, environment and dimension observations and reconciles action receipts. Current stage policies are rule based, with resource reserves, village supplies, iron-golem harvesting and group-threat assessment implemented.
+A persistent `GoalSupervisor` plans from inventory, terrain and dimension observations. The bridge handles movement, gathering and emergency responses locally. With an LLM configured, Core can ask it to choose between feasible strategies, such as widening a surface wood search or moving to another site. Core rechecks the world before acting and uses its local plan if the reply times out or fails validation.
+
+Studio defaults to autonomous survival, which extends the action budget when Voxkin makes measurable progress. Select stage acceptance for a fixed budget. Both modes use the same S0–S6 completion criteria. Resuming a task preserves its mode and action count. [Run settings (Chinese)](config/README.md#自主任务)
 
 In Studio, the Chinese command “背包里有什么” asks what Voxkin is carrying. In headless Paper tests, Voxkin returned its inventory during both mining and Nether scouting. The mining action went on to finish, and the scout continued pathfinding under the same action ID. A local rule handles this query. Automated tests cover microphone capture during replies and spoken interruptions. [Scheduling and interruptions](docs/ARCHITECTURE.md#任务语音与动作控制)
 
@@ -34,7 +36,7 @@ See [status and evidence](docs/STATUS.md) and [acceptance contracts](docs/MILEST
 
 ## Quick start
 
-Run from the repository root in Windows PowerShell. Use Python 3.10, Node.js ≥20 for the bridge, and Java 21 for the Minecraft server and mod build.
+Run from the repository root in Windows PowerShell. Use Python 3.10, Node.js ≥22 for the bridge, and Java 21 for the Minecraft server and mod build.
 
 ```powershell
 python -m venv .venv

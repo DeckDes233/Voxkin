@@ -36,6 +36,7 @@ flowchart LR
         ARB[ActionArbiter]
         DISP[ActionDispatcher]
         RUN[RunManager + GoalSupervisor<br/>TaskRunner 用于旧式评测任务]
+        BRAIN[DecisionBrain<br/>可选的重大策略选择]
         DB[(TaskStore SQLite<br/>tasks / checkpoints / goal_states)]
         HUB[EventHub / MetricsStore]
         SUP[ServiceSupervisor]
@@ -72,6 +73,7 @@ flowchart LR
     MF -->|WebSocket /ws/bridge| DISP
     PIPE --> ARB
     RUN --> ARB
+    RUN --> BRAIN --> LLMAD
     ARB --> DISP
     HTTP --> DISP
     RUN --> DB
@@ -81,6 +83,14 @@ flowchart LR
 ```
 
 图中外部 Minecraft 服务端与运行 Voxkin Mod 的客户端是两个不同角色。Bridge 是 mineflayer 登录服务器的客户端，不是服务器端插件；Fabric Mod 加载在 Minecraft 客户端 JVM 中，不是独立的 Voxkin 服务进程。
+
+### 自主生存的策略选择与身体反射
+
+遇到白天安全地表的采木受阻、转移矿区或重生补给，Core 会根据实际库存、已经确认的回执和可以通行的地面生成候选。有至少两条可行路线并且已配置 LLM 时，`DecisionBrain` 才向模型询问策略。模型返回本次请求的 `decision_id` 和一个 `candidate_id`。坐标、技能参数和验收条件都由本地策略生成。提交动作前，`GoalSupervisor` 再核对会话、饥饿值、生命、库存和地形。超时或无效回复走本地策略，SQLite 事件 `goal_strategy_selected` 记录决策来源。
+
+Bridge 持续处理游戏事件，查询背包可以与身体动作并行。窄范围采木连续两棵树不可达时，Core 可以提前请求下一次策略，角色同时尝试第三棵。正式分叉只消费与该搜索回执匹配的选择，预取尚未完成时直接执行本地方案。移动、挖掘与避险共享一个角色的控制权，安全反射能抢占正在执行的动作。Core 收到危险通知时会作废当前选择，等更新的世界快照再规划。每个技能的进展由库存、位移或游戏事件确认。
+
+正式验收保留确定的动作与时长预算。Studio 的自主模式使用可续期的无进展窗口，两种模式都保留累计动作数、在途动作对账和单方法失败上限。[实机验证与延迟测量](BENCHMARK_RESULTS.md)
 
 ## 一次指令的实际链路
 
@@ -117,7 +127,7 @@ sequenceDiagram
     Arb-->>Pipe: ActionResult
 ```
 
-标准 S0–S6 由 `RunManager` 管理生命周期，`GoalSupervisor` 是目标方法的唯一执行控制者，负责调度、Core 动作派发、未知结果对账、状态持久化与预算记账。`src/voxkin/agent/goals.py::GOALS` 是阶段验收条件的唯一声明来源；`src/voxkin/agent/goal_methods.py` 提供阶段策略、资源选择与验收辅助，不做外部 I/O，部分 helper 会更新传入的 `goal_state` 内存字典。`GoalSupervisor` 串行调用这些辅助，并统一负责调度、派发、action 对账、SQLite 持久化和预算；方法模块不持有持久化或执行所有权。S2、S3、S4 使用有限的观察驱动策略；Core 的部分 S6 方法可根据末影之眼 overhead 证据选择有界下探与框架扫描，Bridge `end.js` 提供相应执行路径。Combat 采用有界搜索并检查血量/取消；Nether 已有 portal 进入、到达坐标记录与有界巡逻策略。上述方法已进入生产代码和自动化回归，但 S4–S6 均无 Minecraft 实机阶段通过；S6 最终仍须满足末影龙击杀事件与返回主世界的验收条件。S5 已确认过门回执中的 source portal 与 arrival checkpoint 进入 SQLite goal state；换 Bridge session 后恢复为寻路线索，并在穿门前重新读取实际 portal block。刚到达且地形未 ready 时也可保存已确认坐标，但动作准入仍需 ready。普通维度 respawn 包保留 session/revision，死亡和断线才轮换生命周期；此链路已过自动化回归，尚未实机验收。动作描述、函数无异常或进度游标都不能替代目标验收。
+标准 S0–S6 由 `RunManager` 管理生命周期，`GoalSupervisor` 是目标方法的唯一执行控制者，负责调度、Core 动作派发、未知结果对账、状态持久化与预算记账。`src/voxkin/agent/goals.py::GOALS` 是阶段验收条件的唯一声明来源；`src/voxkin/agent/goal_methods.py` 提供阶段策略、资源选择与验收辅助，不做外部 I/O，部分 helper 会更新传入的 `goal_state` 内存字典。`GoalSupervisor` 串行调用这些辅助，并统一负责调度、派发、action 对账、SQLite 持久化和预算；方法模块不持有持久化或执行所有权。S2、S3、S4 使用有限的观察驱动策略；Core 的部分 S6 方法可根据末影之眼 overhead 证据选择有界下探与框架扫描，Bridge `end.js` 提供相应执行路径。Combat 采用有界搜索并检查血量/取消；Nether 已有 portal 进入、到达坐标记录与有界巡逻策略。上述方法已进入生产代码和自动化回归。S4 已从自然存档续跑取得钻石镐，S5–S6 的连续自然通关仍待验证；S6 最终仍须满足末影龙击杀事件与返回主世界的验收条件。S5 已确认过门回执中的 source portal 与 arrival checkpoint 进入 SQLite goal state；换 Bridge session 后恢复为寻路线索，并在穿门前重新读取实际 portal block。刚到达且地形未 ready 时也可保存已确认坐标，但动作准入仍需 ready。普通维度 respawn 包保留 session/revision，死亡和断线才轮换生命周期；此链路已过自动化回归，尚未实机验收。动作描述、函数无异常或进度游标都不能替代目标验收。
 
 `TaskStore` 在 `data/tasks.db` 保存任务、旧式 steps/checkpoints、事件和版本为 2 的 `goal_states` 快照。`goal_states` 保存当前目标状态、方法位置、最后观察、动作预算/计数、恢复原因以及 `pending_action`（含 action ID、会话/观察版本、参数和预期条件）。标准 S0–S6 的恢复以该快照为准；旧 `TaskRunner` checkpoint 仍用于兼容的线性评测任务，不是 GoalSupervisor 的恢复权威。
 
@@ -143,7 +153,7 @@ Bridge 通过 `bridge/skills/registry.js` 在进程启动时扫描 JS 模块并�
 | Core 动作准入、请求关联与取消请求 | Python `ActionArbiter` + `ActionDispatcher` | 正式 Runtime 要求有新鲜 ready 状态、Bridge session 与 revision 才发送；按 `action_id` 配对结果/状态回查，拒绝旧 session/revision 覆盖当前观察 | 已实现；Core 保存请求侧状态，不拥有实际游戏执行权 |
 | 实际游戏操作、队列、交接与安全抢占 | Node `ExecutionController` | 管理 Core 请求、跟随/闲逛、护甲维护和本地安全动作；维护有界 action ledger；安全动作可优先接管 | 已实现；Bridge 账本不是持久数据库，游戏世界状态仍由服务端拥有 |
 | 世界真实状态 | Minecraft 服务端 | 服务端是游戏状态权威；mineflayer 的 bot 状态与 Core 的快照是观察/缓存，不是权威数据库 | 外部权威 |
-| 标准 S0–S6 目标/方法/在途动作/预算/恢复 | Core `RunManager` + `GoalSupervisor` + SQLite `goal_states` | `goals.py` 单一声明验收；`goal_methods.py` 提供阶段策略、资源选择与验收辅助（无外部 I/O；部分 helper 更新入参 `goal_state` 内存字典）；GoalSupervisor 串行调用并独占调度、Core 派发、action 对账、SQLite 持久化及预算。S2/S3/S4 与部分 S6 使用有界观察驱动策略；Combat 与 Nether 路径也有受限方法 | 生产代码与自动化回归已覆盖新增路径；S3–S6 没有完整实机阶段通过，S6 仍需 `ender_dragon_killed` 事件与主世界返回验收，S5 portal hint 的持久化与跨 session 消费已有自动化覆盖，穿门仍需 fresh blockAt 验证，尚未实机验收 |
+| 标准 S0–S6 目标/方法/在途动作/预算/恢复 | Core `RunManager` + `GoalSupervisor` + SQLite `goal_states` | `goals.py` 单一声明验收；`goal_methods.py` 提供阶段策略、资源选择与验收辅助（无外部 I/O；部分 helper 更新入参 `goal_state` 内存字典）；GoalSupervisor 串行调用并独占调度、Core 派发、action 对账、SQLite 持久化及预算。S2/S3/S4 与部分 S6 使用有界观察驱动策略；Combat 与 Nether 路径也有受限方法 | 生产代码与自动化回归已覆盖新增路径；S4 已从自然存档续跑完成，S5–S6 的连续自然通关仍待验证，S6 仍需 `ender_dragon_killed` 事件与主世界返回验收，S5 portal hint 的持久化与跨 session 消费已有自动化覆盖，穿门仍需 fresh blockAt 验证，尚未实机验收 |
 | 旧式线性任务步骤/游标/检查点 | Core `TaskRunner` + SQLite `checkpoints` | 兼容评测任务按预定义顺序推进并保存旧式检查点 | 保留；不是标准 S0–S6 的状态权威 |
 | 对话原文与摘要 | Core `MemoryStore`（可配置 SQLite） | 持久化对话上下文，不是任务检查点，也不等于技能经验库 | 已实现 |
 | 临时事件与指标 | Core `EventHub` / `MetricsStore` | EventHub 为内存异步队列订阅者广播；MetricsStore 聚合有限数量的回合数据 | 已实现，非持久事件总线 |
@@ -178,7 +188,7 @@ Python package 间调用、Node 内各 JS 技能模块间调用都属于**同进
 - **语音打断**：取消当前回合及音频输出，但不自动撤销已经进入 Arbiter/Bridge 的世界动作。要停止动作，走 stop/cancel 控制路径。
 - **安全抢占与世界状态变化**：Bridge 本地安全动作可抢占普通动作；`preempted` 不等于无副作用。目标层等待本地安全执行结束，读取新鲜状态并核对已有后置条件，再决定继续或重选方法。
 - **Fabric 客户端断开**：`/ws/audio` 客户端会自行重连；真实客户端中的播放、重连与游戏效果仍需实机验证。
-- **通用动态规划与全流程验收**：S2 与 S3 分别按观察选择受限方法；其他阶段使用预定义方法。任意任务图规划、技能在线热更新、版本固定、回滚与自动能力生成都未实现，S3–S6 仍需实机验收。
+- **通用动态规划与全流程验收**：S0–S6 按阶段前置与实际观察选择方法；安全的补给和换区分叉可调用策略模型。S4 已取得实机钻石镐，S5–S6 的连续自然通关仍待验收。
 
 没有通过只读代码核验确认的事项：部署时 Minecraft 服务端、Core、客户端是否同机；具体 LLM URL 对应的服务商/进程位置；配置的 WAV 消费者；所有 mineflayer 版本/服务器组合下的协议兼容性。拓扑中的网络连线不代表部署网络一定是本机回环。
 
@@ -189,6 +199,7 @@ Python package 间调用、Node 内各 JS 技能模块间调用都属于**同进
 - 阶段计划：[ROADMAP.md](ROADMAP.md)、[plans/INDEPENDENT_RUN_ROADMAP.md](plans/INDEPENDENT_RUN_ROADMAP.md)
 - 自主运行目标设计（计划，不代表现状）：[plans/AUTONOMOUS_RUN_ARCHITECTURE.md](plans/AUTONOMOUS_RUN_ARCHITECTURE.md)
 - 技能清单与验收：[SKILLS.md](SKILLS.md)、[plans/SKILL_MODULE_CONTRACT.md](plans/SKILL_MODULE_CONTRACT.md)
+- 近期自然存档与阶段验收：[11 月 23 日 S4 钻石镐](evidence/SURVIVAL_RERUN_20261123.md)、[11 月 27 日 S0–S6 复测记录](evidence/NATURAL_S0_S6_20261127.md)
 - 实机证据：[evidence/GOAL_REFACTOR_20261026.md](evidence/GOAL_REFACTOR_20261026.md)、[evidence/S0_NORMAL_20261022.md](evidence/S0_NORMAL_20261022.md)、[evidence/S1_NORMAL_20261022.md](evidence/S1_NORMAL_20261022.md)
 - 评测策略：[plans/EVALUATION.md](plans/EVALUATION.md)、[BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md)
 - 仓库审计与引擎证据：[REPO_AUDIT.md](REPO_AUDIT.md)、[TECH_EVALUATION.md](TECH_EVALUATION.md)

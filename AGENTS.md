@@ -27,6 +27,8 @@
 | `src/voxkin/agent/late_game_methods.py` | S5/S6 的库存、维度与生存前置规划；不做外部 I/O，沿用 `GoalSupervisor` 的派发与持久化所有权 |
 | `src/voxkin/agent/resource_policy.py` | 阶段储备软目标、村庄与铁傀儡机会补给；只规划和更新目标内存账本，执行与对账由 `GoalSupervisor` 负责 |
 | `src/voxkin/agent/goal_supervisor.py` | 标准阶段目标的调度、派发、对账、持久化与预算所有权 |
+| `src/voxkin/agent/strategy_choices.py`、`decision_brain.py` | 前者从世界观察生成可行策略，后者向已配置的 LLM 异步询问候选 ID，由调度器核验并派发 |
+| `src/voxkin/agent/recovery_evidence.py`、`progress_budget.py` | 从已确认的动作回执和世界状态提取恢复证据，计算自主模式的无进展窗口 |
 | `src/voxkin/bridge/protocol.py` | 桥接消息结构 |
 | `src/voxkin/server.py` | Studio HTTP/WebSocket 服务与桥接入口 |
 | `src/voxkin/services.py` | 外部引擎进程的启停、重启与健康检查 |
