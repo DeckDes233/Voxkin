@@ -3497,6 +3497,35 @@ async def test_s2_exhausted_sheep_search_relocates_before_new_region_retry(tmp_p
     store.close()
 
 
+@pytest.mark.asyncio
+async def test_s2_relocates_for_bed_wood_after_surface_search(tmp_path):
+    store = TaskStore(tmp_path / "bed-wood.db")
+    store.initialize()
+    task = store.create_task("S2", "S2")
+    state = modern_state(food=20, inventory={"white_wool": 3, "mutton": 4})
+    calls = []
+
+    async def dispatch(tool, arguments, timeout_s=0, *, action_id="", **kwargs):
+        calls.append((tool, arguments))
+        state["revision"] += 1
+        if tool == "mine_collect":
+            assert arguments["surface_wood"]
+            raise ActionError("当前区域缺木", status="blocked", receipt_confirmed=True, action_id=action_id,
+                              data={"observation": dict(state)})
+        assert tool == "explore_mining_site"
+        origin = state["position"]
+        state["position"] = {**origin, "x": origin["x"] + arguments["min_distance"]}
+        return ActionResult(action_id, True, status="succeeded", data={
+            "observation": dict(state), "relocation": {"origin": origin, "destination": state["position"]}})
+
+    goal = replace(GOALS["S2"], budget=replace(GOALS["S2"].budget, max_actions=4))
+    supervisor = GoalSupervisor(goal, store, dispatch, lambda: state)
+    await supervisor.run(task.id)
+    assert [args.get("range") for _, args in calls] == [64, 128, None, 64]
+    assert supervisor.state["counters"]["actions"] == 4
+    store.close()
+
+
 def test_s3_uses_available_fuel_before_seeking_extra_coal():
     state = modern_state(resource_sites={}, inventory={"stone_pickaxe": 1, "furnace": 1,
         "raw_iron": 9, "oak_planks": 12, "coal": 2})

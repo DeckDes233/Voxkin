@@ -681,10 +681,10 @@ class GoalSupervisor:
                     if (len(failures) >= self._method_failure_count(method_key) and not _hunt_closing(state)
                             and all(_hunt_closing(e.get("terminal_observation") or {}) for e in failures)):
                         method_key += ":daylight"
-                if (self.goal.stage in {"S3", "S4", "S5", "S6"} and step.tool == "mine_collect"
+                if (self.goal.stage in {"S2", "S3", "S4", "S5", "S6"} and step.tool == "mine_collect"
                         and step.arguments.get("block") == "wood_log" and not step.arguments.get("within_reach")):
                     step = replace(step, arguments={**step.arguments, "surface_wood": True})
-                    if self.goal.stage in {"S5", "S6"}:
+                    if self.goal.stage in {"S2", "S5", "S6"}:
                         method_key += f":{_s3_wood_search_context(state) or 'unknown'}"
                         step_index = None
                     access = state.get("surface_access") or {}
@@ -1038,7 +1038,7 @@ class GoalSupervisor:
                     return False, "尚未在离进水点足够远的干地确认新矿道"
             return status == "succeeded" and distance >= 4, f"已观察到水平位移 {distance:.1f} 格"
         if (self._method_stage, condition.get("type")) in {
-            ("S3", "s3_mining_relocation"), ("S3", "s3_wood_relocation"), ("S2", "s2_wool_relocation"),
+            ("S3", "s3_mining_relocation"), ("S3", "s3_wood_relocation"), ("S2", "s2_wool_relocation"), ("S2", "s3_wood_relocation"),
             ("S4", "s3_wood_relocation"), ("S5", "s3_wood_relocation"), ("S6", "s3_wood_relocation"),
             ("S4", "s4_water_relocation"), ("S4", "s4_surface_relocation"), ("S4", "s4_threat_relocation"),
             ("S5", "s5_obsidian_relocation"), ("S5", "s5_portal_relocation"),
