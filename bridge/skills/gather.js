@@ -1420,6 +1420,27 @@ async function walkToSurfaceLog(target, ctx) {
   checkHealth(ctx);
   checkNearbyHostiles(ctx);
   if (reachableWood(bot, target)) return 'reached';
+  // 高处残留的树干下方可能是空气。从连通地面选能看见且够得着树干的站位。
+  if (bot.world?.raycast && target.y >= bot.entity.position.y + 3 && horizontal(bot.entity.position) <= 16) {
+    const ground = await reachableDryGround(ctx, 480, 20);
+    const center = target.offset(0.5, 0.5, 0.5);
+    const stand = ground.points.find(p => {
+      const eye = p.offset(0.5, bot.entity.eyeHeight ?? 1.62, 0.5);
+      const ray = center.minus(eye), length = ray.norm();
+      return length > 0 && length <= MINE_REACH && bot.world.raycast(eye, ray.scaled(1 / length), length)?.position.equals(target);
+    });
+    if (!stand) return 'unreachable';
+    const path = [];
+    for (let p = stand; ground.parents.has(p.toString()); p = ground.parents.get(p.toString())) path.push(p);
+    for (const step of path.reverse()) {
+      checkHealth(ctx);
+      checkNearbyHostiles(ctx);
+      const outcome = await walkDryCell(ctx, step, 'overworld');
+      if (outcome !== 'reached') return outcome;
+      if (reachableWood(bot, target)) return 'reached';
+    }
+    return 'unreachable';
+  }
   const outcome = await ctx.travelToBlock(target, 30000);
   if (outcome === 'unreachable' && reachableWood(bot, target)) return 'reached';
   return outcome;

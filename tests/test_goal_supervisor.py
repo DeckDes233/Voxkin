@@ -3666,6 +3666,16 @@ def test_wood_relocation_at_attempt_limit_replans_toward_observed_tree(tmp_path)
     state["position"] = {**position, "y": 68}
     step, new_key = supervisor._expand_wood_search(request, state, key)
     assert step.tool == "explore_mining_site" and new_key == connected + ":site:-31:68:91"
+    supervisor.state["action_history"][-1]["status"] = "failed"
+    assert supervisor._expand_wood_search(request, state, key)[1] == new_key
+    tree_attempt = supervisor.state["action_history"][0]
+    tree_attempt.update(status="blocked", result_detail="距离 8.9 格，太远走不过去")
+    tree_attempt["terminal_observation"]["position"] = {**trunk, "y": trunk["y"] - 7}
+    step, other_trees = supervisor._expand_wood_search(request, state, key)
+    assert step.tool == "mine_collect" and step.arguments["avoid_positions"] == [trunk]
+    supervisor.state["counters"]["method_failures"][other_trees] = 1
+    step, _ = supervisor._expand_wood_search(request, state, key)
+    assert step.tool == "explore_mining_site" and "toward" not in step.arguments
 
 
 def test_s5_fortress_scout_can_exit_a_portal_in_a_rock_wall(tmp_path):

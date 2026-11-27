@@ -2356,12 +2356,11 @@ class GoalSupervisor:
 
     def _expand_wood_search(self, step: StepSpec, state: dict, local_key: str) -> tuple[StepSpec, str]:
         wide_key = f"{local_key}:wide"
-        if not self._method_failure_count(wide_key):
-            return replace(step, arguments={**step.arguments, "range": 128}), wide_key
         position = state["position"]
         access = state.get("surface_access") or {}
         trunks = []
-        for entry in self.state.get("action_history", []):
+        unreachable = []
+        for entry in self.state.get("action_history", [])[-40:]:
             if (entry.get("tool") != "mine_collect" or not entry.get("receipt_confirmed")
                     or not (entry.get("arguments") or {}).get("surface_wood")
                     or (entry.get("terminal_observation") or {}).get("dimension") != state.get("dimension")):
@@ -2369,6 +2368,19 @@ class GoalSupervisor:
             trunk = (entry.get("result_data") or {}).get("surface_trunk")
             if self._finite_position(trunk) and math.hypot(trunk["x"] - position["x"], trunk["z"] - position["z"]) <= 128:
                 trunks.append(trunk)
+                end = (entry.get("terminal_observation") or {}).get("position")
+                if (entry.get("status") == "blocked" and "太远走不过去" in str(entry.get("result_detail") or "")
+                        and self._finite_position(end) and trunk["y"] - end["y"] >= 5
+                        and math.hypot(trunk["x"] - end["x"], trunk["z"] - end["z"]) <= 12
+                        and trunk not in unreachable):
+                    unreachable.append(trunk)
+        args = {**step.arguments, "range": 128}
+        if unreachable:
+            wide_key += ":other_trees"
+            args["avoid_positions"] = [*(args.get("avoid_positions") or []), *unreachable][-128:]
+            trunks = [p for p in trunks if all(math.hypot(p["x"] - q["x"], p["z"] - q["z"]) >= 8 for q in unreachable)]
+        if not self._method_failure_count(wide_key):
+            return replace(step, arguments=args), wide_key
         nearest = min(trunks, key=lambda p: math.hypot(p["x"] - position["x"], p["z"] - position["z"]), default=None)
         sky = access.get("sky_light")
         exit_point = access.get("exit")
@@ -2384,7 +2396,7 @@ class GoalSupervisor:
                 continue
             measured = (entry.get("result_data") or {}).get("relocation") or {}
             start = measured.get("origin")
-            if entry.get("status") != "blocked" or not self._finite_position(start):
+            if entry.get("status") not in {"blocked", "failed"} or not self._finite_position(start):
                 continue
             seen_site = True
             if abs(position["y"] - start["y"]) < 3 and math.hypot(position["x"] - start["x"], position["z"] - start["z"]) < 8:
@@ -2438,8 +2450,9 @@ class GoalSupervisor:
         return handled
 
     def _recover_s4_mining_threat(self, row: dict) -> bool:
-        retreat = row.get("tool") == "explore_mining_site" and (row.get("expected_condition") or {}).get("type") == "s4_threat_relocation"
-        if (self._method_stage != "S4" or (row.get("tool") not in {"strip_mine", "mine_collect"} and not retreat)
+        relocation = (row.get("expected_condition") or {}).get("type") if row.get("tool") == "explore_mining_site" else None
+        retreat = relocation == "s4_threat_relocation"
+        if (self._method_stage != "S4" or (row.get("tool") not in {"strip_mine", "mine_collect"} and relocation not in {"s4_threat_relocation", "s3_wood_relocation"})
                 or row.get("status") not in {"blocked", "failed"} or row.get("receipt_confirmed") is not True):
             return False
         data = row.get("result_data") or {}

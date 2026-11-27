@@ -5,14 +5,14 @@ import blockFactory from 'prismarine-block';
 import physicsModule from 'prismarine-physics';
 import { Vec3 } from 'vec3';
 import { walkDryCell } from '../dry_footing.js';
-import { leaveCoveredMiningSite } from '../skills/gather.js';
+import { leaveCoveredMiningSite, skills } from '../skills/gather.js';
 
-function stairWorld() {
+function stairWorld(blockAt) {
   const data = minecraftData('1.21.1'), Block = blockFactory('1.21.1');
   const controls = {forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false};
   const world = {getBlock(point) {
     const p = point.floored(), floor = 60 + Math.max(0, Math.min(2, p.x));
-    const name = p.z !== 0 || p.y <= floor || p.y > floor + 3 ? 'stone' : 'air';
+    const name = blockAt ? blockAt(p) : (p.z !== 0 || p.y <= floor || p.y > floor + 3 ? 'stone' : 'air');
     const b = Block.fromStateId(data.blocksByName[name].defaultState, 0);
     b.position = p;
     return b;
@@ -37,6 +37,30 @@ test('主世界矿道逐格上下台阶，使用 Java 1.21.1 方块和 Prismarin
     assert.ok(bot.entity.onGround);
     assert.ok(Object.values(controls).every(value => !value));
   }
+});
+
+test('高处原木旁有一级台阶，角色实走到能采到原木的站位', async () => {
+  const target = new Vec3(1, 67, 0);
+  let mined = false, logs = 0;
+  const {ctx, bot} = stairWorld(p => {
+    if (!mined && p.equals(target)) return 'oak_log';
+    return p.y <= 60 || p.equals(new Vec3(1, 61, 0)) ? 'dirt' : 'air';
+  });
+  ctx.registry = minecraftData('1.21.1');
+  bot.world = {raycast: () => bot.blockAt(target)};
+  bot.findBlocks = () => mined ? [] : [target];
+  bot.canSeeBlock = () => true;
+  bot.dig = async () => {
+    assert.ok(bot.entity.onGround);
+    assert.equal(bot.entity.position.y, 62);
+    mined = true;
+  };
+  ctx.countItem = name => name === 'oak_log' ? logs : 0;
+  ctx.equipToolFor = async () => {};
+  ctx.collectDrops = async () => { logs = 1; };
+  ctx.travelToBlock = () => assert.fail('不应向悬空树干寻路');
+  assert.equal((await skills.mine_collect.handler({block: 'wood_log', count: 1, surface_wood: true}, ctx)).status, 'succeeded');
+  assert.ok(mined);
 });
 
 test('上方洞穴有苦力怕，先沿已打通的矿道步行撤离', async () => {
