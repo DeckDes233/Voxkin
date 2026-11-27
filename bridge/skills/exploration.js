@@ -43,7 +43,7 @@ async function exploreMiningSite(args, ctx) {
   const fail = (detail, data = {}) => { const error = new Error(detail); error.data = { relocation: relocation(), ...data }; throw error; };
   const check = () => {
     if (ctx.interrupted || !bot.entity) fail('换矿区已取消或断开连接');
-    if (bot.health <= 10) fail('血量不足，先处理生存恢复');
+    if (bot.health <= 10) fail('血量不足，先处理生存恢复', {reason: 'low_health', health: bot.health, minimum_health: 10});
     const hostiles = ctx.nearbyHostiles?.(10);
     if (hostiles?.length) fail('附近有敌对生物，先处理生存恢复', {reason: 'nearby_hostiles', hostiles});
   };
@@ -54,7 +54,7 @@ async function exploreMiningSite(args, ctx) {
     if (args.covered_escape === true) {
       try {
         await leaveCoveredMiningSite(ctx, threat, origin, minimum, attempted, args.connected_route === true);
-      } catch (error) { fail(error.message); }
+      } catch (error) { fail(error.message, error.data); }
       check();
       const actual = bot.entity.position;
       if (horizontal(actual, origin) >= minimum && dryMiningFooting(bot, actual) && avoid.every(p => horizontal(p, actual) >= 8)) {

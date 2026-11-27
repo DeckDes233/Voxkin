@@ -216,20 +216,52 @@ test('脚底五格以上的近处树干可从眼高触及，不为采木寻找�
   assert.deepEqual(ctx.digs, [{x: 0, y: 70, z: 0}]);
 });
 
-test('岸边没有可行路线时，三次远树尝试后交回控制', async () => {
+for (const [firstX, range] of [[6, 64], [6, 128], [30, 128]]) test(`地表原木搜索 ${range} 格，起点距树 ${firstX} 格时三次无进展只扫描一次`, async () => {
   const ctx = makeContext({position: {x: 0.5, y: 64, z: 0.5}});
   ctx.registry.blocksByName.oak_log = {id: 20, name: 'oak_log', drops: [40]};
   ctx.registry.items[40] = {id: 40, name: 'oak_log'};
-  const trees = Array.from({length: 8}, (_, i) => new Vec3(30 + i, 64, 0));
+  const trees = Array.from({length: 8}, (_, i) => new Vec3(firstX + i, 64, 0));
   for (const p of trees) {
     ctx.blocks.set([p.x,p.y,p.z].join(','), {name: 'oak_log', position: p, boundingBox: 'block', skyLight: 15});
     ctx.blocks.set([p.x,p.y,p.z + 1].join(','), {name: 'air', boundingBox: 'empty', skyLight: 15});
   }
-  ctx.bot.findBlocks = () => trees;
-  ctx.travelToBlock = async () => assert.fail('干路已确认不通，不应再长途直走');
-  await assert.rejects(skills.mine_collect.handler({block: 'wood_log', count: 1, range: 128, surface_wood: true}, ctx),
-    /试了 3 个目标/);
+  let scans = 0;
+  ctx.bot.findBlocks = () => { scans++; return trees; };
+  const progress = [];
+  ctx.reportProgress = (phase, detail, value, data) => progress.push({phase, data});
+  ctx.travelToBlock = async () => {
+    assert.ok(firstX < 24, '远处干路已确认不通，不应再长途直走');
+    return 'unreachable';
+  };
+  await assert.rejects(skills.mine_collect.handler({block: 'wood_log', count: 1, range, surface_wood: true}, ctx),
+    error => {
+      assert.match(error.message, /试了 3 个目标/);
+      assert.equal(error.data.reason, 'surface_route_stalled');
+      const failed = trees.slice(0, 3).map(({x, y, z}) => ({x, y, z}));
+      assert.deepEqual(error.data.resource_search, {resource: 'wood_log', origin: {x: 0.5, y: 64, z: 0.5},
+        range, attempted: 3, failed_positions: failed, inventory_count: 0});
+      assert.deepEqual(error.data.surface_trunk, failed.at(-1));
+      return true;
+    });
+  assert.equal(scans, 1);
+  const stalled = progress.filter(e => e.phase === 'search_stalled');
+  assert.deepEqual(stalled.map(e => e.data), range === 64 ? [{resource:'wood_log', failed_targets:2}] : []);
+  if (stalled.length) assert.equal(progress.slice(0, progress.indexOf(stalled[0])).filter(e => e.phase === 'searching').length, 2);
   assert.deepEqual(ctx.digs, []);
+});
+
+test('无地表候选时回报本次搜索范围与原点', async () => {
+  const origin = {x: 9.5, y: 64, z: 18.5};
+  const ctx = makeContext({position: origin});
+  ctx.registry.blocksByName.oak_log = {id: 20, name: 'oak_log', drops: [40]};
+  ctx.registry.items[40] = {id: 40, name: 'oak_log'};
+  await assert.rejects(skills.mine_collect.handler({block: 'wood_log', count: 1, range: 64, surface_wood: true}, ctx),
+    error => {
+      assert.deepEqual(error.data, {reason: 'resource_not_found', resource_search: {
+        resource: 'wood_log', origin, range: 64, attempted: 0, failed_positions: [], inventory_count: 0,
+      }});
+      return true;
+    });
 });
 
 test('地表补木先过滤深层和无天空光的原木，同一不可达树干只走一次', async () => {
@@ -271,6 +303,33 @@ test('地表补木先过滤深层和无天空光的原木，同一不可达树�
   assert.equal(ctx.inventory.oak_log, 1);
 });
 
+test('移动后重新扫描原木，在同一立足点跳过批次里已经消失的原木', async () => {
+  const ctx = makeContext({position: {x: 0.5, y: 64, z: 0.5}});
+  ctx.registry.blocksByName.oak_log = {id: 20, name: 'oak_log', drops: [40]};
+  ctx.registry.items[40] = {id: 40, name: 'oak_log'};
+  const logs = [1, 2, 41, 42, 43].map(x => new Vec3(x, 64, 0));
+  for (const p of logs) {
+    ctx.blocks.set(`${p.x},64,0`, {name: 'oak_log', position: p, boundingBox: 'block'});
+    ctx.blocks.set(`${p.x},64,1`, {name: 'air', skyLight: 15, boundingBox: 'empty'});
+  }
+  const scans = [];
+  ctx.bot.findBlocks = () => {
+    const x = ctx.bot.entity.position.x;
+    scans.push(x);
+    return logs.filter(p => Math.abs(p.x - x) < 8 && ctx.bot.blockAt(p).name === 'oak_log');
+  };
+  ctx.collectDrops = async () => {
+    ctx.inventory.oak_log = (ctx.inventory.oak_log || 0) + 1;
+    if (ctx.inventory.oak_log === 1) ctx.bot.entity.position.x = 40.5;
+    if (ctx.inventory.oak_log === 2) ctx.blocks.set('42,64,0', {name: 'air', boundingBox: 'empty'});
+  };
+  const result = await skills.mine_collect.handler({block: 'wood_log', count: 3, range: 128, surface_wood: true}, ctx);
+  assert.equal(result.status, 'succeeded');
+  assert.deepEqual(scans, [0.5, 40.5]);
+  assert.deepEqual(ctx.digs.map(p => p.x), [1, 41, 43]);
+  assert.equal(ctx.inventory.oak_log, 3);
+});
+
 test('分批搜索只从已加载区块取符合半径与高度的原木', async () => {
   const Chunk = (await import('prismarine-chunk')).default('1.21.1');
   const registry = (await import('prismarine-registry')).default('1.21.1');
@@ -287,6 +346,22 @@ test('分批搜索只从已加载区块取符合半径与高度的原木', async
   ]);
 });
 
+test('128 格扫描找到足量原木后只访问仍可能有更近原木的区块', async () => {
+  const Chunk = (await import('prismarine-chunk')).default('1.21.1');
+  const oak = (await import('prismarine-registry')).default('1.21.1').blocksByName.oak_log;
+  const column = new Chunk();
+  const nearby = new Vec3(8, 64, 9);
+  column.setBlockStateId(nearby, oak.minStateId);
+  const seen = [];
+  const bot = {entity: {position: new Vec3(8, 64, 8)}, world: {getColumn(x, z) {
+    seen.push([x, z]);
+    return x === 0 && z === 0 ? column : null;
+  }}};
+  const logs = await scanSurfaceLogs(bot, [oak], 128, 1, 64, () => true, () => {});
+  assert.deepEqual(logs, [nearby]);
+  assert.deepEqual(seen, [[0, 0]]);
+});
+
 test('密集原木搜索期间事件循环可接收取消', async () => {
   const section = { palette: [1], get: () => 1 };
   const column = { minY: -64, sections: Array(24).fill(section) };
@@ -299,6 +374,24 @@ test('密集原木搜索期间事件循环可接收取消', async () => {
     await assert.rejects(search, /已取消/);
   } finally {
     clearImmediate(cancel);
+  }
+});
+
+test('无原木的已加载区块和空区块扫描期间也能处理事件，并返回完整空结果', async () => {
+  const section = {palette:[0], get() { assert.fail('无匹配调色板无需逐块解码'); }};
+  const column = {minY:-64, sections:Array(24).fill(section)};
+  let firstQueryAt = null, visited = 0;
+  const bot = {entity:{position:new Vec3(8, 64, 8)}, world:{getColumn(x, z) {
+    visited++;
+    return (x + z) % 2 === 0 ? column : null;
+  }}};
+  const query = setImmediate(() => { firstQueryAt = visited; });
+  try {
+    const found = await scanSurfaceLogs(bot, [{minStateId:1,maxStateId:1}], 64, 128, 64, () => true, () => {});
+    assert.deepEqual(found, []);
+    assert.ok(firstQueryAt > 0 && firstQueryAt <= 16 && firstQueryAt < visited);
+  } finally {
+    clearImmediate(query);
   }
 });
 

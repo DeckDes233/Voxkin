@@ -97,7 +97,17 @@ test('敌怪撤离方向没有地面支撑时保留起点', async () => {
   const ctx = context(), original = ctx.bot.blockAt;
   ctx.findHostile = () => ({position: new Vec3(0.5, 64, 3.5)});
   ctx.bot.blockAt = p => p.y === 63 ? {name: 'air', boundingBox: 'empty'} : original(p);
-  await assert.rejects(skills.explore_mining_site.handler({min_distance: 12, covered_escape: true}, ctx), /可安全开挖/);
+  await assert.rejects(skills.explore_mining_site.handler({min_distance: 12, covered_escape: true}, ctx), e => {
+    assert.match(e.message, /可安全开挖/);
+    assert.equal(e.data.reason, 'no_safe_excavation');
+    assert.deepEqual(e.data.relocation.attempted_positions, []);
+    return true;
+  });
+  await assert.rejects(skills.explore_mining_site.handler({min_distance: 12, covered_escape: true, connected_route: true}, ctx),
+    e => e.data.reason === 'no_dry_retreat' && e.data.relocation.attempted_positions.length === 0);
+  ctx.bot.health = 6;
+  await assert.rejects(skills.explore_mining_site.handler({min_distance: 12}, ctx),
+    e => e.data.reason === 'low_health' && e.data.health === 6 && e.data.minimum_health === 10);
   assert.deepEqual(ctx.bot.entity.position, new Vec3(0.5, 64, 0.5));
 });
 

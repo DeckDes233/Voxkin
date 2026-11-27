@@ -300,7 +300,11 @@ function checkInterrupted(ctx) {
 function checkHealth(ctx, limit = LOW_HEALTH) {
   const health = Number(ctx.bot?.health);
   if (!Number.isFinite(health)) return;
-  if (health <= limit) throw new Error(`血量不足（血量 ${health}），已中止采集`);
+  if (health <= limit) {
+    const error = new Error(`血量不足（血量 ${health}），已中止采集`);
+    error.data = {reason: 'low_health', health, minimum_health: limit};
+    throw error;
+  }
 }
 
 function checkNearbyHostiles(ctx) {
@@ -1370,8 +1374,9 @@ function woodReach(bot, position) {
 }
 
 function reachableWood(bot, position) {
+  if (woodReach(bot, position) > MINE_REACH) return false;
   const block = bot.blockAt(position);
-  return block && woodReach(bot, position) <= MINE_REACH && (!bot.canSeeBlock || bot.canSeeBlock(block));
+  return block && (!bot.canSeeBlock || bot.canSeeBlock(block));
 }
 
 async function walkToSurfaceLog(target, ctx) {
@@ -1594,30 +1599,41 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
   const reserveOnly = () => minimum < want && countOwned() >= minimum;
   const withinReach = () => args.within_reach === true || reserveOnly();
   const surfaceWood = blockName === 'wood_log' && args.surface_wood === true;
-  const startY = bot.entity.position.y;
+  const {x, y: startY, z} = bot.entity.position;
+  const searchOrigin = {x, y: startY, z};
   const failedTrunks = new Set();
-  let stalledAt = null;
-  let stalledWalks = 0;
+  let failedApproaches = [];
+  let lastFailedAt = null;
+  let reportedStall = false;
+  let surfaceBatch = null;
   const surfacePaths = new WeakMap();
   // 只在地表补木时筛选；在区块扫描阶段就排除深处构件，避免它们占满最近候选。
   const surfaceLog = (position) => position.y >= startY - 16 && position.y <= startY + 32 &&
     !failedTrunks.has(`${position.x},${position.z}`) &&
     CARDINAL_HEADINGS.some(({ x, z }) =>
       surfaceSkyLight(bot, position.offset(x, 0, z)) > 0);
-  const scan = async (excludedCount) => {
+  const allowedSite = p => !avoided.some(danger => Math.hypot(p.x - danger.x, p.z - danger.z) < 8);
+  const scan = async (excludedCount, excluded) => {
     const nearby = withinReach();
+    // 同一立足点只扫描一批树干。地形可能发生变化，使用前仍检查实际方块和天空光。
+    const origin = bot.entity.position;
+    const batchOrigin = surfaceWood && !nearby ? origin.floored() : null;
+    if (batchOrigin && surfaceBatch?.origin.equals(batchOrigin)) {
+      const remaining = surfaceBatch.positions.filter(p => !excluded.has(`${p.x},${p.y},${p.z}`) && surfaceLog(p));
+      if (remaining.length) return remaining;
+    }
     const count = avoided.length ? 512 : Math.max(need * 4, surfaceWood && !nearby ? 128 : 8) + excludedCount;
     const matches = surfaceWood && !nearby && bot.world?.getColumn
-      ? await scanSurfaceLogs(bot, targetEntries, range, count, startY, surfaceLog, () => checkInterrupted(ctx))
+      ? await scanSurfaceLogs(bot, targetEntries, range, count, startY, p => allowedSite(p) && surfaceLog(p), () => checkInterrupted(ctx))
       : bot.findBlocks({ matching: ids, maxDistance: nearby ? Math.ceil(MINE_REACH) : range, count,
-        ...(surfaceWood ? { useExtraInfo: block => surfaceLog(block.position) } : {}) });
+        ...(surfaceWood ? { useExtraInfo: block => allowedSite(block.position) && surfaceLog(block.position) } : {}) });
     const positions = matches
       .filter(p => !nearby || (surfaceWood ? woodReach(bot, p) : distanceBetween(bot.entity.position, p)) <= MINE_REACH)
-      .filter(p => !avoided.some(danger => Math.hypot(p.x - danger.x, p.z - danger.z) < 8));
+      .filter(allowedSite);
     if (blockName.endsWith('_log') || blockName.endsWith('_stem')) {
-      const origin = bot.entity.position;
       positions.sort((a, b) => Math.hypot(a.x - origin.x, a.z - origin.z) - Math.hypot(b.x - origin.x, b.z - origin.z) || a.y - b.y);
     }
+    if (batchOrigin) surfaceBatch = {origin: batchOrigin, positions};
     return positions;
   };
   const chooseCandidate = (positions) => {
@@ -1682,16 +1698,17 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
       if (outcome === 'cancelled' || outcome === 'stopped') throw new Error('采集被取消：收到新的指令或连接断开');
       if (outcome === 'low_health') throw new Error(`血量不足，撤退中止采集（血量 ${bot.health}）`);
       if (outcome !== 'reached') {
-        if (surfaceWood) failedTrunks.add(`${position.x},${position.z}`);
         failures.push(`${formatPosition(position)} 距离 ${distance.toFixed(1)} 格，太远走不过去`);
-        if (surfaceWood && Math.hypot(position.x - bot.entity.position.x, position.z - bot.entity.position.z) > 24) {
-          const here = bot.entity.position;
-          if (!stalledAt || here.distanceTo(stalledAt) >= 4) {
-            stalledAt = here.clone();
-            stalledWalks = 0;
+        if (surfaceWood) {
+          failedTrunks.add(`${position.x},${position.z}`);
+          failedApproaches.push({x: position.x, y: position.y, z: position.z});
+          const feet = bot.entity.position;
+          if (!reportedStall && range <= 64 && failedApproaches.length === 2 && feet.distanceTo(lastFailedAt) <= 4) {
+            reportedStall = true;
+            ctx.reportProgress?.('search_stalled', '此处连续两棵树无法抵达', 0, {resource: blockName, failed_targets: 2});
           }
-          // 从同一岸边连续走不到远树时，把控制交回调度器，及时进食或另选搜索区域。
-          if (++stalledWalks >= 3) break;
+          lastFailedAt = feet.clone();
+          if (failedApproaches.length >= 3) break;
         }
         continue;
       }
@@ -1726,14 +1743,28 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
       item: itemName, collected, target: need,
     });
     if (collected >= need) break;
-    if (dropped.gained > 0) continue;
+    if (dropped.gained > 0) {
+      failedApproaches = [];
+      lastFailedAt = null;
+      continue;
+    }
     const state = dropFailureState(ctx, position);
     failures.push(`${formatPosition(position)} ${classifyDropOutcome(state)}`);
   }
-  if (tried === 0 && !reserveOnly()) throw new Error(`附近 ${withinReach() ? MINE_REACH : range} 格内没有${blockLabel}，一个都没有找到`);
+  const searchFailure = (reason, detail) => {
+    const error = new Error(detail);
+    if (surfaceWood) {
+      error.data = {reason, resource_search: {resource: blockName, origin: searchOrigin,
+        range: withinReach() ? MINE_REACH : range, attempted: tried, failed_positions: failedApproaches,
+        inventory_count: countOwned()}};
+      if (failedApproaches.length) error.data.surface_trunk = failedApproaches.at(-1);
+    }
+    return error;
+  };
+  if (tried === 0 && !reserveOnly()) throw searchFailure('resource_not_found', `附近 ${withinReach() ? MINE_REACH : range} 格内没有${blockLabel}，一个都没有找到`);
   const gained = countOwned() - owned;
   if (gained <= 0 && !reserveOnly()) {
-    throw new Error(
+    throw searchFailure(failedApproaches.length ? 'surface_route_stalled' : 'resource_uncollected',
       `试了 ${tried} 个目标，没有拿到${label}${failures.length ? `：${failures.join('；')}` : ''}`,
     );
   }
@@ -1745,7 +1776,7 @@ async function mineCollect(args, ctx, knownBlocksOnly = false) {
         data: { minimum_met: true, reserve_met: false, inventory_count: countOwned(), reserve_target: want },
       };
     }
-    throw new Error(
+    throw searchFailure(failedApproaches.length ? 'surface_route_stalled' : 'resource_uncollected',
       `${summarizeShortage(gained, need, label)}（挖了 ${mined} 个，失败 ${failures.length} 次：${failures.join('；')}）`,
     );
   }
@@ -1800,7 +1831,9 @@ export async function leaveCoveredMiningSite(ctx, threat, origin, minimum, attem
   }
   if (walkOnly) {
     if (distance(bot.entity.position, origin) >= minimum && !ctx.nearbyHostiles(10).length) return;
-    throw new Error('已观察的干燥矿道未能通到足够远的安全位置');
+    const error = new Error('已观察的干燥矿道未能通到足够远的安全位置');
+    error.data = {reason: 'no_dry_retreat'};
+    throw error;
   }
   for (let i = 0; i < minimum + 8; i++) {
     checkInterrupted(ctx);
@@ -1829,7 +1862,11 @@ export async function leaveCoveredMiningSite(ctx, threat, origin, minimum, attem
       moved = true;
       break;
     }
-    if (!moved) throw new Error('远离敌怪的方向缺少可安全开挖的通道');
+    if (!moved) {
+      const error = new Error('远离敌怪的方向缺少可安全开挖的通道');
+      error.data = {reason: 'no_safe_excavation'};
+      throw error;
+    }
   }
 }
 

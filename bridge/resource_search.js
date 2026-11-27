@@ -9,7 +9,7 @@ export async function findBlocksWithExploration(ctx, ids, range, count, scanOver
   const wait = ctx.actionToken?.wait ?? (ms => ctx.sleep(ms));
   const scan = async () => {
     const positions = scanOverride
-      ? await scanOverride(state.excluded.size)
+      ? await scanOverride(state.excluded.size, state.excluded)
       : bot.findBlocks({ matching: ids, maxDistance: range, count: count + state.excluded.size });
     return positions.filter((p) => !state.excluded.has(`${p.x},${p.y},${p.z}`));
   };
@@ -65,18 +65,17 @@ export async function* resourceCandidates(ctx, ids, range, count, scanOverride =
   while (state.excluded.size < 512) {
     const positions = await findBlocksWithExploration(ctx, ids, range, count, scanOverride, state, localOnly);
     if (!positions.length) return;
-    const candidates = positions.filter((position) => !state.excluded.has(`${position.x},${position.y},${position.z}`));
-    if (!candidates.length) return;
     if (selectPosition) {
-      const position = await selectPosition(candidates);
+      const position = await selectPosition(positions);
       const key = `${position.x},${position.y},${position.z}`;
       if (state.excluded.size >= 512) return;
       state.excluded.add(key);
       yield position;
       continue;
     }
-    for (const position of candidates) {
+    for (const position of positions) {
       const key = `${position.x},${position.y},${position.z}`;
+      if (state.excluded.has(key)) continue;
       if (state.excluded.size >= 512) return;
       state.excluded.add(key);
       yield position;
