@@ -140,6 +140,8 @@ class StudioServer:
         return web.FileResponse(target)
 
     async def status(self, request: web.Request) -> web.Response:
+        if request.query.get("view") == "studio":
+            return web.json_response(self.runtime.status(studio=True))
         payload = self.runtime.status()
         payload["uptime_s"] = round(time.time() - self.started_at, 1)
         payload["config_path"] = str(self.config_path)
@@ -246,22 +248,34 @@ class StudioServer:
 
     async def run_status(self, request: web.Request) -> web.Response:
         manager = self.runtime.run_manager
-        return web.json_response(manager.status() if manager is not None else {"running": False})
+        if manager is None:
+            return web.json_response({"running": False})
+        if request.query.get("view") == "studio":
+            return web.json_response(manager.status(studio=True))
+        return web.json_response(manager.status())
 
     async def run_start(self, request: web.Request) -> web.Response:
         manager = self.runtime.run_manager
         if manager is None:
             raise web.HTTPServiceUnavailable(text="没有可用的任务执行器")
         try:
-            body = await request.json()
-        except Exception:
-            body = {}
+            body = await request.json() if request.can_read_body else {}
+        except ValueError as error:
+            raise web.HTTPBadRequest(text="启动参数必须是有效的 JSON") from error
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text="启动参数必须是 JSON 对象")
         stage = str(body.get("stage") or "S0")
         try:
-            await manager.start(stage)
-        except KeyError as error:
+            if "budget_mode" in body:
+                mode = body["budget_mode"]
+                if mode not in ("acceptance", "adaptive"):
+                    raise ValueError("budget_mode 必须是 acceptance 或 adaptive")
+                status = await manager.start(stage, budget_mode=mode)
+            else:
+                status = await manager.start(stage)
+        except (KeyError, ValueError) as error:
             raise web.HTTPBadRequest(text=str(error)) from error
-        return web.json_response(manager.status())
+        return web.json_response(status)
 
     async def run_resume(self, request: web.Request) -> web.Response:
         manager = self.runtime.run_manager

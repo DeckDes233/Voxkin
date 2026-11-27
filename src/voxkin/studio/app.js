@@ -34,7 +34,7 @@ function renderPills(status) {
 }
 
 async function loadStatus() {
-  const response = await fetch("/api/status");
+  const response = await fetch("/api/status?view=studio");
   const status = await response.json();
   state.status = status;
   renderPills(status);
@@ -329,6 +329,7 @@ const RECOVERY_REASON_LABELS = {
 
 const BLOCK_REASON_LABELS = {
   budget_actions: "目标动作次数已达到上限",
+  budget_no_progress: "已用尽无进展预算",
   budget_elapsed: "目标执行时间已达到上限",
   budget_method_attempts: "一种执行方式已达到尝试上限",
   method_exhausted: "当前执行方式已用完，目标条件仍未满足",
@@ -427,21 +428,22 @@ function formatGoalStatus(data) {
   const actionBudget = data.action_budget || {};
   const used = actionBudget.used ?? counters.actions ?? 0;
   const limit = actionBudget.limit ?? budget.max_actions;
+  const adaptive = (actionBudget.mode ?? budget.mode) === "adaptive";
   const budgetParts = [];
   if (limit !== null && limit !== undefined && Number(limit) > 0) {
-    budgetParts.push(`${used} / ${limit} 次动作`);
+    budgetParts.push(adaptive ? `已用 ${used} 次，当前上限 ${limit} 次` : `${used} / ${limit} 次动作`);
   }
   if (Number(budget.max_attempts_per_method) > 0) {
     budgetParts.push(`单种方式最多尝试 ${budget.max_attempts_per_method} 次`);
   }
   const elapsedLimit = formatDuration(budget.max_elapsed_s);
-  if (elapsedLimit !== "-") budgetParts.push(`最长 ${elapsedLimit}`);
+  if (elapsedLimit !== "-") budgetParts.push(adaptive ? `无进展时限 ${elapsedLimit}` : `最长 ${elapsedLimit}`);
 
   const lines = [
     `目标：${title}`,
     `状态：${statusLabel}`,
     `当前动作：${actionLabel}${pendingNote}`,
-    `动作预算：${budgetParts.length ? budgetParts.join(" · ") : "未提供"}`,
+    `${adaptive ? "自主预算" : "动作预算"}：${budgetParts.length ? budgetParts.join(" · ") : "未提供"}`,
   ];
 
   const waitingReason = safeReason(
@@ -492,7 +494,7 @@ function updateRunControls(data) {
 }
 
 async function loadRunStatus() {
-  const response = await fetch("/api/run/status");
+  const response = await fetch("/api/run/status?view=studio");
   const data = await response.json();
   $("runStatus").textContent = formatGoalStatus(data);
   updateRunControls(data);
@@ -591,7 +593,7 @@ $("testLlm").addEventListener("click", testLlm);
 $("micStart").addEventListener("click", () => micAction("start"));
 $("micStop").addEventListener("click", () => micAction("stop"));
 $("runStart").addEventListener("click", () =>
-  runAction("start", { stage: $("runStage").value }),
+  runAction("start", { stage: $("runStage").value, budget_mode: $("runBudgetMode").value }),
 );
 $("runResume").addEventListener("click", () => runAction("resume"));
 $("runStop").addEventListener("click", () => runAction("stop"));
