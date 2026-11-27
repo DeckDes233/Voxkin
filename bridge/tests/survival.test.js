@@ -168,6 +168,27 @@ test('make_shelter tries the next safe footprint when pathfinding cannot reach t
   assertShelterStructure(world, { x: 4, y: 0, z: 0 }, 4);
 });
 
+test('地表建棚优先平地，确认属于自己的地下半成品仍可续建', async () => {
+  const cave = {x: 10, y: -6, z: 0};
+  const surface = {x: 0, y: 0, z: 0};
+  for (const repair of [false, true]) {
+    const world = makeWorld({inventory: 64});
+    const plan = shelterPlan(3);
+    for (const p of plan.footprintCells) {
+      world.blocks.set(`${cave.x + p.x},${cave.y},${p.z}`, makeBlock('stone'));
+    }
+    const wall = plan.blocks[0];
+    world.blocks.set(`${cave.x + wall.x},${cave.y + wall.y},${wall.z}`, makeBlock('stone'));
+    world.blocks.set('0,2,0', {...makeBlock('air'), skyLight: 15});
+    world.blocks.set('10,-2,0', {...makeBlock('air'), skyLight: 0});
+    world.bot.findBlocks = () => [cave, surface];
+    world.ctx.getRememberedShelter = () => repair ? {position: cave, size: 3} : null;
+    const result = await skills.make_shelter.handler({size: 3}, world.ctx);
+    assert.deepEqual(result.data.shelter.position, repair ? cave : surface);
+    assert.equal(result.data.sealed, true);
+  }
+});
+
 test('make_shelter resumes a partial build using only the remaining inventory', async () => {
   const world = makeWorld({ inventory: 64 });
   let stock = 64;

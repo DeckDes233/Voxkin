@@ -623,7 +623,7 @@ function footprintOk(ctx, plan, center) {
 }
 
 // 选庇护所中心：先扫描已加载地面，再试脚下与四周偏移。
-function findShelterCenters(ctx, plan) {
+async function findShelterCenters(ctx, plan) {
   const base = botPosition(ctx);
   if (!base) return [];
   const bot = ctx.bot;
@@ -643,7 +643,13 @@ function findShelterCenters(ctx, plan) {
     }
     const centers = [];
     const seen = new Set();
-    for (const support of supports || []) {
+    const startLight = blockAt(bot, base.x, base.y + 1, base.z)?.skyLight;
+    const previous = ctx.getRememberedShelter?.();
+    for (const [index, support] of (supports || []).entries()) {
+      if (index % 32 === 0) {
+        await new Promise(resolve => setImmediate(resolve));
+        assertNotInterrupted(ctx, '寻找庇护所平地');
+      }
       const position = support?.position || support;
       if (!position || ![position.x, position.y, position.z].every(Number.isFinite)) continue;
       const center = {
@@ -655,23 +661,20 @@ function findShelterCenters(ctx, plan) {
       const key = `${center.x},${center.y},${center.z}`;
       if (seen.has(key) || !footprintOk(ctx, plan, center)) continue;
       seen.add(key);
-      centers.push(center);
+      const reused = plan.blocks.reduce((count, cell) => {
+        const block = blockAt(bot, center.x + cell.x, center.y + cell.y, center.z + cell.z);
+        return count + Number(isSolidBlock(block) && !DANGER_BLOCKS.has(block.name));
+      }, 0);
+      const roofLight = blockAt(bot, center.x, center.y + 4, center.z)?.skyLight;
+      const darkDescent = startLight >= 12 && base.y - 1 - center.y >= 4 && Number.isFinite(roofLight) && roofLight < 8;
+      const repair = reused > 0 && previous?.size === plan.size && previous.position?.x === center.x &&
+        previous.position.y === center.y && previous.position.z === center.z;
+      const distance = Math.hypot(center.x - base.x, center.z - base.z) + Math.abs(center.y - (base.y - 1)) * 1.5;
+      centers.push({center, repair, darkDescent, reused, distance});
     }
-    centers.sort((left, right) => {
-      const leftReused = plan.blocks.reduce((count, cell) => {
-        const block = blockAt(bot, left.x + cell.x, left.y + cell.y, left.z + cell.z);
-        return count + Number(isSolidBlock(block) && !DANGER_BLOCKS.has(block.name));
-      }, 0);
-      const rightReused = plan.blocks.reduce((count, cell) => {
-        const block = blockAt(bot, right.x + cell.x, right.y + cell.y, right.z + cell.z);
-        return count + Number(isSolidBlock(block) && !DANGER_BLOCKS.has(block.name));
-      }, 0);
-      if (leftReused !== rightReused) return rightReused - leftReused;
-      const leftDistance = Math.hypot(left.x - base.x, left.z - base.z) + Math.abs(left.y - (base.y - 1)) * 1.5;
-      const rightDistance = Math.hypot(right.x - base.x, right.z - base.z) + Math.abs(right.y - (base.y - 1)) * 1.5;
-      return leftDistance - rightDistance;
-    });
-    if (centers.length) return centers;
+    // 从地表选址时，先修自己的棚屋，再看附近平地；地下天然石壁不能只靠省材料排在前面。
+    centers.sort((a, b) => b.repair - a.repair || a.darkDescent - b.darkDescent || b.reused - a.reused || a.distance - b.distance);
+    if (centers.length) return centers.map(site => site.center);
   }
   const groundY = base.y - 1;
   const offsets = [[0, 0]];
@@ -1116,7 +1119,7 @@ export const skills = {
       }
       const size = requestedSize;
       const plan = shelterPlan(size);
-      const centers = findShelterCenters(ctx, plan);
+      const centers = await findShelterCenters(ctx, plan);
       if (centers.length === 0) throw new Error(`附近没有 ${size}×${size} 的平地，缺少可以搭庇护所的地面`);
       assertNotInterrupted(ctx, '搭建庇护所');
       const requestedBlock = String(args.block || '').trim();
