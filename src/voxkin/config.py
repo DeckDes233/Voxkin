@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -134,6 +135,13 @@ class FastPathConfig:
 
 
 @dataclass
+class BrainConfig:
+    enabled: bool = True
+    timeout_s: float = 4.0
+    result_ttl_s: float = 60.0
+
+
+@dataclass
 class VoxkinConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
@@ -144,6 +152,7 @@ class VoxkinConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     voice_cache: VoiceCacheConfig = field(default_factory=VoiceCacheConfig)
     fast_path: FastPathConfig = field(default_factory=FastPathConfig)
+    brain: BrainConfig = field(default_factory=BrainConfig)
 
     def validate(self) -> None:
         if self.llm.provider not in {"openai_compat", "scripted"}:
@@ -164,6 +173,12 @@ class VoxkinConfig:
             raise ValueError("voice_cache.ack_deadline_ms 必须为正数")
         if self.fast_path.min_confidence <= 0 or self.fast_path.action_min_confidence <= 0:
             raise ValueError("fast_path 的置信度阈值必须为正数")
+        if type(self.brain.enabled) is not bool:
+            raise ValueError("brain.enabled 必须是布尔值")
+        for name in ("timeout_s", "result_ttl_s"):
+            value = getattr(self.brain, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"brain.{name} 必须为有限正数")
 
 
 def _build(cls: type, data: Any) -> Any:
@@ -222,6 +237,7 @@ def save_config(config: VoxkinConfig, path: Path | str | None = None) -> Path:
         "memory": config.memory.__dict__,
         "voice_cache": config.voice_cache.__dict__,
         "fast_path": config.fast_path.__dict__,
+        "brain": config.brain.__dict__,
     }
     target.write_text(
         yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8"

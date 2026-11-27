@@ -8,6 +8,11 @@ llm:
   timeout_s: 60
   stream: true
 
+brain:
+  enabled: true
+  timeout_s: 4
+  result_ttl_s: 60
+
 tts:
   engine: "gpt_sovits"
   character: "Theresa"
